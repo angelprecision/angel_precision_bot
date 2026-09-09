@@ -1031,6 +1031,42 @@ class APEntryWatcher(_BaseAPEntryWatcher):
         opposite is terminalized with cancellation proof.
         """
         completed = list(completed or [])
+        recovery_filtered = []
+        for action, watched in completed:
+            signal = getattr(watched, "signal", {}) or {}
+            if action != "trigger" or not bool(signal.get("__recovery_rearm")):
+                recovery_filtered.append((action, watched))
+                continue
+            final_ok, final_reason, _row = self._recovery_final_durable_authority(
+                watched
+            )
+            if final_ok:
+                recovery_filtered.append((action, watched))
+                continue
+
+            # A durable broker/materializer owner that wins after the
+            # admission lock releases must suppress the recovered callback.
+            # Retain the exact lifecycle/registry pair in explicit quarantine:
+            # no callback, no second economic attempt, and no invented cancel.
+            watched._ownership_quarantine = True
+            watched._quarantine_reason = (
+                f"recovery_post_admission_hold:{final_reason}"
+            )
+            watched.state = WatchState.PENDING
+            self._record_call_result(
+                "recovery_post_admission_owner_hold",
+                final_reason,
+                local_order_id=signal.get("local_order_id"),
+                signal_id=signal.get("signal_id"),
+            )
+            self._direction_event_audit(
+                watched,
+                "recovery_post_admission_owner_hold",
+                final_reason,
+                no_broker_submit=True,
+                no_broker_cancel=True,
+            )
+        completed = recovery_filtered
         trigger_groups: dict[tuple[str, str, str], list] = {}
         invalid_triggers = []
         retained = []

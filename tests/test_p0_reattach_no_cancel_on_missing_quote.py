@@ -74,6 +74,7 @@ def _make_watcher_for_reattach(monkeypatch, *, quote_bid=0, quote_ask=0):
     w.broker = SimpleNamespace(session=None)
     w._last_quote_fetch_proof = {}
     w.owner_token = "test-owner"
+    w._test_only_allow_recovery_without_row_lock = True
     w.core = None
 
     # Spy on the OSM cancel_pending_entry call — must be 0 for the fix.
@@ -91,6 +92,8 @@ def _make_watcher_for_reattach(monkeypatch, *, quote_bid=0, quote_ask=0):
             "meta":               {"watcher_audit": {}},
             "client_id":          "jason@example.com",
             "execution_mode":     "live",
+            "ticker":             "SPY",
+            "side":               "CALL",
             "watcher_token":      "test-owner",
             "trigger_generation": 1,
         }
@@ -126,6 +129,8 @@ def _reattach_plan(*, local_order_id="local-existing-1", confirmed=False):
         "late_attachment_policy_eligible":  True,
         "execution_mode":                   "live",
         "client_id":                        "jason@example.com",
+        "watcher_token":                    "test-owner",
+        "trigger_generation":               1,
     }
     if confirmed:
         # Durable first-breach evidence — always present in a real rearmed

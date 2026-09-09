@@ -1405,6 +1405,7 @@ def test_recovery_rearm_coarms_healthy_prebreach_opposite_without_cancel():
         cancel_results={"old-lo": False},
     )
     watcher = AuditWatcher(DummyBroker(), order_state_machine=osm)
+    watcher._test_only_allow_recovery_without_row_lock = True
     existing = seed(watcher, old)
 
     assert watcher.add_signal(dict(new)) is True

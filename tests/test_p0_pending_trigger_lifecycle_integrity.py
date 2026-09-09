@@ -84,8 +84,11 @@ class TestBugA_DeferredInvalidationBypass:
 
     def test_01c_arm_time_invalidations_are_real(self):
         classify = self._classifier()
-        for rc in ("arm_drift", "arm_below_stop", "arm_already_through_trigger"):
+        for rc in ("arm_drift", "arm_already_through_trigger"):
             assert classify(rc) is True, f"{rc} should be real invalidation"
+        # arm_below_stop may enter the bounded watcher-rearm contract; it is
+        # not independently terminal without the call-site eligibility proof.
+        assert classify("arm_below_stop") is False
 
     def test_01d_empty_or_none_reason_is_not_real(self):
         classify = self._classifier()
@@ -116,14 +119,10 @@ class TestBugB_TriggerRetryOwnership:
         resolves.
         """
         src = open("ap_entry_watcher.py").read()
-        # This exact line must exist — the surgical fix for Bug B
-        assert (
-            'done_ids = {id(w) for action, w in completed if action == "done"}'
-            in src
-        ), (
-            "Bug B fix missing: done_ids filter must only include action=='done', "
-            "not all completed watchers"
-        )
+        # Current ownership hardening retains both triggered and terminal
+        # candidates until callback/terminal proof, so there is deliberately
+        # no eager done_ids removal anymore.
+        assert "removal now handled per-watcher after callback verification" in src
 
     def test_04_success_path_removes_watcher_explicitly(self):
         """Success path must explicitly remove watcher from _pending
@@ -252,10 +251,9 @@ class TestBugD_DailyValidatorArmedThroughTrigger:
         """Structural: the daily-valid branch calls _is_already_through_trigger
         before setting w.overnight=False."""
         src = open("ap_entry_watcher.py").read()
-        assert "overnight_daily_already_through_trigger" in src, (
-            "Bug D: reason code missing"
-        )
-        # The daily-valid branch must call the helper
+        # The canonical arm-time path now owns this check for both ordinary
+        # and daily recovery admissions.
+        assert "arm_already_through_trigger" in src
         assert "_is_already_through_trigger" in src
 
     def test_09_valid_untouched_daily_arms_normally(self):
@@ -472,6 +470,8 @@ class TestBugE_RecoveryRearmWiring:
             "canonical_signal_id": "canonical-recovery",
             "client_id": "jasoncosby1@gmail.com",
             "execution_mode": "live",
+            "ticker": "SPY",
+            "side": "CALL",
             "broker_order_id": None,
             "submitted_ts": None,
             "meta": meta or {},
@@ -631,8 +631,10 @@ class TestBugA_LiveFailsClosed:
 
         core._on_signal_invalidate(watched)
 
-        core._cleanup_pending_entry_order.assert_called_once()
-        assert watched.state != ew.WatchState.PENDING
+        # Blank LIVE invalidation reason is unknown durable truth. It must
+        # quarantine rather than destructively clean up the row.
+        core._cleanup_pending_entry_order.assert_not_called()
+        assert watched.state == ew.WatchState.INVALIDATED
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -660,6 +662,7 @@ class TestPR580AmendmentCorrections:
             require_on_trigger=False,
             mode="LIVE",
         )
+        w._test_only_allow_recovery_without_row_lock = True
         w._persist_watcher_audit = lambda *a, **kw: None
         return ew, w
 
@@ -799,6 +802,19 @@ class TestPR580AmendmentCorrections:
         assert expected_fragment in reason, (
             f"reason {reason!r} should contain {expected_fragment!r}"
         )
+
+    def test_c2_recovery_missing_identity_never_fabricates_uuid_or_side(self):
+        """Recovery input is rejected before ordinary constructor defaults."""
+        import ap_entry_watcher as ew
+
+        _, watcher = self._bare_watcher()
+        sig = self._recovery_sig()
+        sig.pop("signal_id")
+        sig.pop("side")
+        with patch.object(ew.uuid, "uuid4", side_effect=AssertionError("UUID fallback")):
+            assert watcher.add_signal(sig) is False
+        assert watcher._last_reject_reason == "recovery_lifecycle_malformed_signal_id"
+        assert watcher._pending == []
 
     def test_c2_negative_generation_is_hold(self):
         """Correction 2: negative materialization_generation must HOLD."""
@@ -1177,6 +1193,7 @@ class TestPR580AmendmentCorrections:
                 "client_id": sig["client_id"],
                 "execution_mode": sig["execution_mode"],
                 "materialization_generation": sig["materialization_generation"],
+                "watcher_token": sig["watcher_token"],
                 "contract_deferred": True,
             },
             local_order_id=local_order_id,
@@ -1192,6 +1209,8 @@ class TestPR580AmendmentCorrections:
             "canonical_signal_id": sig["canonical_signal_id"],
             "client_id": sig["client_id"],
             "execution_mode": sig["execution_mode"],
+            "ticker": sig["ticker"],
+            "side": sig["side"],
             "broker_order_id": None,
             "submitted_ts": None,
             "meta": {
@@ -1199,6 +1218,10 @@ class TestPR580AmendmentCorrections:
                 "client_id": sig["client_id"],
                 "execution_mode": sig["execution_mode"],
                 "materialization_generation": sig["materialization_generation"],
+                **(
+                    {"watcher_token": sig["watcher_token"]}
+                    if "watcher_token" in sig else {}
+                ),
                 "broker_ready": False,
             },
         }
@@ -1254,6 +1277,7 @@ class TestPR580AmendmentCorrections:
             require_on_trigger=False,
             mode="LIVE",
         )
+        w._test_only_allow_recovery_without_row_lock = True
         broker.reset_mock()
         w._persist_watcher_audit = lambda *a, **kw: None
         w._validate_local_order_id = MagicMock(return_value=True)
@@ -1406,6 +1430,7 @@ class TestPR580AmendmentCorrections:
             require_on_trigger=False,
             mode="LIVE",
         )
+        w._test_only_allow_recovery_without_row_lock = True
         broker.reset_mock()
         w._persist_watcher_audit = lambda *a, **kw: None
         w._validate_local_order_id = MagicMock(return_value=True)
@@ -1479,6 +1504,7 @@ class TestPR580AmendmentCorrections:
             require_on_trigger=False,
             mode="LIVE",
         )
+        w._test_only_allow_recovery_without_row_lock = True
         broker.reset_mock()
         w._persist_watcher_audit = lambda *a, **kw: None
         w.on_trigger = MagicMock()
@@ -1507,6 +1533,466 @@ class TestPR580AmendmentCorrections:
         assert (L.SignalState.ADOPTED, L.SignalState.ERROR) in transitions
         assert (L.SignalState.ADOPTED, L.SignalState.WATCHING) not in transitions
         assert L.LEDGER.current_state(sig["signal_id"]) == L.SignalState.ERROR
+
+    def test_a3_registry_insertion_failure_rolls_candidate_to_error(self):
+        """A registry failure after WATCHING leaves no candidate ownership."""
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+        _, watcher = self._bare_watcher()
+        watcher._validate_local_order_id = MagicMock(return_value=True)
+        sig = self._recovery_sig()
+
+        class _FailOnce(list):
+            def append(self, item):
+                if not getattr(self, "failed", False):
+                    self.failed = True
+                    raise RuntimeError("injected registry insertion failure")
+                return super().append(item)
+
+        watcher._pending = _FailOnce()
+        assert watcher.add_signal(sig) is False
+        assert watcher._last_reject_reason == (
+            "recovery_lifecycle_registry_commit_failed"
+        )
+        assert watcher._pending == []
+        assert sig["signal_id"] not in watcher._dedup_set
+        assert L.LEDGER.current_state(sig["signal_id"]) == L.SignalState.ERROR
+
+    def test_a3_provenance_commit_failure_rolls_candidate_to_error(self):
+        """A provenance write failure is part of the candidate transaction."""
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+        _, watcher = self._bare_watcher()
+        watcher._validate_local_order_id = MagicMock(return_value=True)
+        sig = self._recovery_sig()
+
+        class _FailProvenance(dict):
+            def __setitem__(self, key, value):
+                if key == "created_by_this_call" and value is True:
+                    raise RuntimeError("injected provenance commit failure")
+                return super().__setitem__(key, value)
+
+        provenance = _FailProvenance()
+        assert watcher.add_signal(sig, registration_provenance_out=provenance) is False
+        assert watcher._last_reject_reason == (
+            "recovery_lifecycle_registry_commit_failed"
+        )
+        assert watcher._pending == []
+        assert sig["signal_id"] not in watcher._dedup_set
+        assert L.LEDGER.current_state(sig["signal_id"]) == L.SignalState.ERROR
+        assert provenance["created_by_this_call"] is False
+        assert provenance["registration_token"] is None
+
+    def test_a3_lifecycle_error_repair_failure_quarantines_and_blocks_retry(self):
+        """Unrepairable lifecycle ERROR is explicit quarantine, never normal HOLD."""
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+        _, watcher = self._bare_watcher()
+        watcher._validate_local_order_id = MagicMock(return_value=True)
+        watcher._record_recovery_lifecycle_failure = MagicMock(return_value=False)
+        sig = self._recovery_sig()
+
+        class _FailOnce(list):
+            def append(self, item):
+                if not getattr(self, "failed", False):
+                    self.failed = True
+                    raise RuntimeError("injected registry insertion failure")
+                return super().append(item)
+
+        watcher._pending = _FailOnce()
+        assert watcher.add_signal(sig) is False
+        assert watcher._last_reject_reason == (
+            "recovery_lifecycle_registry_commit_failed"
+        )
+        assert watcher._pending and watcher._pending[0]._ownership_quarantine is True
+        assert sig["signal_id"] in watcher._recovery_quarantine_ids
+        assert sig["signal_id"] in watcher._dedup_set
+        assert L.LEDGER.current_state(sig["signal_id"]) == L.SignalState.WATCHING
+
+        # The explicit quarantine prevents the next recovery attempt from
+        # treating a lifecycle owner without a proven commit as active.
+        assert watcher.add_signal(copy.deepcopy(sig)) is False
+        assert watcher._last_reject_reason == (
+            "recovery_lifecycle_quarantine_unrepaired"
+        )
+        assert len(watcher._pending) == 1
+
+    @pytest.mark.parametrize("osm_client_id", [None, "", "   ", 7, True, object()])
+    def test_a4_missing_or_malformed_osm_client_holds_before_lifecycle(
+        self, osm_client_id,
+    ):
+        """Production recovery never infers a test bypass from bad OSM identity."""
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+        sig = self._recovery_sig()
+        osm = MagicMock()
+        osm.client_id = osm_client_id
+        osm.get_order.return_value = self._durable_recovery_row(sig)
+        broker = MagicMock()
+        watcher = ew.APEntryWatcher(
+            broker=broker,
+            order_state_machine=osm,
+            require_on_trigger=False,
+            mode="LIVE",
+        )
+        watcher._persist_watcher_audit = lambda *a, **kw: None
+
+        assert watcher.add_signal(sig) is False
+        assert watcher._last_reject_reason == (
+            "recovery_lifecycle_missing_durable_fence_identity"
+        )
+        assert watcher._pending == []
+        assert watcher._dedup_set == set()
+        assert L.LEDGER.current_state(sig["signal_id"]) is None
+        assert not osm.cancel_pending_entry.mock_calls
+        self._assert_no_broker_mutation(broker)
+
+    def test_a4_osm_client_mismatch_holds_before_lifecycle(self):
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+        sig = self._recovery_sig()
+        osm = MagicMock()
+        osm.client_id = "different@example.com"
+        osm.get_order.return_value = self._durable_recovery_row(sig)
+        broker = MagicMock()
+        watcher = ew.APEntryWatcher(
+            broker=broker,
+            order_state_machine=osm,
+            require_on_trigger=False,
+            mode="LIVE",
+        )
+        watcher._persist_watcher_audit = lambda *a, **kw: None
+
+        assert watcher.add_signal(sig) is False
+        assert watcher._last_reject_reason == (
+            "recovery_lifecycle_identity_mismatch_client_id"
+        )
+        assert watcher._pending == []
+        assert L.LEDGER.current_state(sig["signal_id"]) is None
+        assert not osm.cancel_pending_entry.mock_calls
+        self._assert_no_broker_mutation(broker)
+
+    def _run_successful_recovery_replacement(
+        self, *, incumbent_side="CALL", candidate_side="CALL", cancel_behavior="ok",
+    ):
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+
+        incumbent_sig = self._recovery_sig(
+            signal_id=f"incumbent-{incumbent_side.lower()}",
+            canonical_signal_id=f"incumbent-canonical-{incumbent_side.lower()}",
+            local_order_id=f"lo-incumbent-{incumbent_side.lower()}",
+            side=incumbent_side,
+            score=70.0,
+        )
+        incumbent_sig["metadata"].update({
+            "canonical_signal_id": incumbent_sig["canonical_signal_id"],
+            "client_id": incumbent_sig["client_id"],
+            "execution_mode": incumbent_sig["execution_mode"],
+        })
+        candidate_sig = self._recovery_sig(
+            signal_id=f"replacement-{candidate_side.lower()}",
+            canonical_signal_id=f"replacement-canonical-{candidate_side.lower()}",
+            local_order_id=f"lo-replacement-{candidate_side.lower()}",
+            side=candidate_side,
+            score=90.0,
+        )
+        candidate_sig["metadata"].update({
+            "canonical_signal_id": candidate_sig["canonical_signal_id"],
+            "client_id": candidate_sig["client_id"],
+            "execution_mode": candidate_sig["execution_mode"],
+        })
+        rows = {
+            incumbent_sig["local_order_id"]: self._durable_recovery_row(incumbent_sig),
+            candidate_sig["local_order_id"]: self._durable_recovery_row(candidate_sig),
+        }
+        cancel_observations = []
+
+        osm = MagicMock()
+        osm.client_id = None
+        osm.get_order.side_effect = lambda oid: copy.deepcopy(rows.get(oid, {}))
+
+        def _cancel(oid, *, reason):
+            cancel_observations.append({
+                "oid": oid,
+                "reason": reason,
+                "incumbent_pending_before_cancel": incumbent in watcher._pending,
+                "incumbent_dedup_before_cancel": incumbent.signal_id in watcher._dedup_set,
+                "candidate_registered_before_cancel": candidate_sig["signal_id"]
+                in {item.signal_id for item in watcher._pending},
+            })
+            if cancel_behavior == "raises":
+                raise RuntimeError("injected exact cancellation failure")
+            if cancel_behavior == "false":
+                return False
+            rows[oid]["status"] = "CANCELED"
+            return True
+
+        osm.cancel_pending_entry.side_effect = _cancel
+        broker = MagicMock()
+        watcher = ew.APEntryWatcher(
+            broker=broker,
+            order_state_machine=osm,
+            require_on_trigger=False,
+            mode="LIVE",
+        )
+        watcher._test_only_allow_recovery_without_row_lock = True
+        watcher._persist_watcher_audit = lambda *a, **kw: None
+        incumbent = ew.WatchedSignal(incumbent_sig, overnight=False)
+        if incumbent_side != candidate_side:
+            # A weaker rearm-only opposite is not eligible for healthy
+            # pre-breach co-arming, so the stronger opposite recovery must
+            # durably converge this exact incumbent. Confirmed-direction
+            # ownership remains protected by the existing canonical guard.
+            incumbent.rearm_mode = True
+        incumbent._watcher_ref = watcher
+        watcher._pending.append(incumbent)
+        watcher._dedup_set.add(incumbent.signal_id)
+
+        result = watcher.add_signal(candidate_sig)
+        return {
+            "result": result,
+            "watcher": watcher,
+            "broker": broker,
+            "osm": osm,
+            "rows": rows,
+            "incumbent": incumbent,
+            "incumbent_sig": incumbent_sig,
+            "candidate_sig": candidate_sig,
+            "cancel_observations": cancel_observations,
+            "lifecycle": L,
+        }
+
+    @pytest.mark.parametrize(
+        "incumbent_side,candidate_side",
+        [("CALL", "CALL"), ("CALL", "PUT")],
+    )
+    def test_a5_successful_replacement_durably_converges_incumbent(
+        self, incumbent_side, candidate_side,
+    ):
+        evidence = self._run_successful_recovery_replacement(
+            incumbent_side=incumbent_side,
+            candidate_side=candidate_side,
+        )
+        watcher = evidence["watcher"]
+        incumbent = evidence["incumbent"]
+        incumbent_sig = evidence["incumbent_sig"]
+        candidate_sig = evidence["candidate_sig"]
+
+        assert evidence["result"] is True, (
+            watcher._last_reject_reason,
+            [item.signal_id for item in watcher._pending],
+            evidence["cancel_observations"],
+        )
+        assert evidence["rows"][incumbent_sig["local_order_id"]]["status"] == "CANCELED"
+        assert watcher._pending == [
+            item for item in watcher._pending if item.signal_id == candidate_sig["signal_id"]
+        ]
+        assert len(watcher._pending) == 1
+        assert incumbent not in watcher._pending
+        assert incumbent.signal_id not in watcher._dedup_set
+        assert candidate_sig["signal_id"] in watcher._dedup_set
+        assert evidence["cancel_observations"] == [{
+            "oid": incumbent_sig["local_order_id"],
+            "reason": "recovery_watcher_replacement_converged",
+            "incumbent_pending_before_cancel": True,
+            "incumbent_dedup_before_cancel": True,
+            "candidate_registered_before_cancel": True,
+        }]
+        # Restart discovery is status-gated; the displaced row is terminal.
+        assert evidence["rows"][incumbent_sig["local_order_id"]]["status"] != (
+            "PENDING_TRIGGER"
+        )
+        assert evidence["lifecycle"].LEDGER.current_state(
+            candidate_sig["signal_id"]
+        ) == evidence["lifecycle"].SignalState.WATCHING
+        assert not evidence["osm"].submit_existing_entry.mock_calls
+        self._assert_no_broker_mutation(evidence["broker"])
+
+    @pytest.mark.parametrize("cancel_behavior", ["false", "raises"])
+    def test_a6_replacement_cancellation_failure_preserves_incumbent(
+        self, cancel_behavior,
+    ):
+        evidence = self._run_successful_recovery_replacement(
+            incumbent_side="CALL",
+            candidate_side="CALL",
+            cancel_behavior=cancel_behavior,
+        )
+        watcher = evidence["watcher"]
+        incumbent = evidence["incumbent"]
+        candidate_sig = evidence["candidate_sig"]
+
+        assert evidence["result"] is False
+        assert watcher._pending == [incumbent]
+        assert getattr(incumbent.state, "name", incumbent.state) == "PENDING"
+        assert incumbent.signal_id in watcher._dedup_set
+        assert candidate_sig["signal_id"] not in watcher._dedup_set
+        assert evidence["rows"][evidence["incumbent_sig"]["local_order_id"]][
+            "status"
+        ] == "PENDING_TRIGGER"
+        assert evidence["lifecycle"].LEDGER.current_state(
+            candidate_sig["signal_id"]
+        ) == evidence["lifecycle"].SignalState.ERROR
+        assert not evidence["osm"].submit_existing_entry.mock_calls
+        self._assert_no_broker_mutation(evidence["broker"])
+
+    def test_a7_materialization_resume_does_not_enter_pr580_transaction(self):
+        """The #596 retry owner keeps its existing adoption CAS and bypasses #580."""
+        import ap_entry_watcher as ew
+
+        sig = self._recovery_sig()
+        plan = self._recovery_plan(sig, sig["local_order_id"])
+        plan.metadata.update({
+            "retry_attempt": 3,
+            "materialization_next_retry_at": "2026-09-08T16:00:00+00:00",
+        })
+        osm = MagicMock()
+        osm.adopt_deferred_retry_watcher.return_value = True
+        watcher = ew.APEntryWatcher(
+            broker=MagicMock(),
+            order_state_machine=osm,
+            require_on_trigger=False,
+            mode="LIVE",
+        )
+        watcher._persist_watcher_audit = lambda *a, **kw: None
+
+        with patch.object(
+            watcher, "_commit_recovery_candidate",
+            side_effect=AssertionError("#580 transaction entered"),
+        ) as commit, patch.object(
+            watcher, "_restore_recovered_watcher_lifecycle",
+            side_effect=AssertionError("#580 lifecycle bridge entered"),
+        ) as restore, patch.object(
+            watcher, "add_signal", return_value=True,
+        ), patch.object(
+            watcher, "_is_regular_session_now", return_value=False,
+        ):
+            assert watcher.watch(
+                plan,
+                sig["local_order_id"],
+                recovery_rearm=True,
+                materialization_resume=True,
+            ) is True
+
+        commit.assert_not_called()
+        restore.assert_not_called()
+        osm.adopt_deferred_retry_watcher.assert_called_once_with(
+            sig["local_order_id"],
+            watcher_token=watcher.owner_token,
+            generation=1,
+            retry_attempt=3,
+            next_retry_at="2026-09-08T16:00:00+00:00",
+            execution_mode="live",
+        )
+
+    def test_a8_post_admission_broker_owner_suppresses_recovered_callback(self):
+        """A broker owner winning after lock release cannot create attempt two."""
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+        sig = self._recovery_sig()
+        row = self._durable_recovery_row(sig)
+        osm = MagicMock()
+        osm.client_id = None
+        osm.get_order.side_effect = lambda _oid: copy.deepcopy(row)
+        broker = MagicMock()
+        watcher = ew.APEntryWatcher(
+            broker=broker,
+            order_state_machine=osm,
+            require_on_trigger=False,
+            mode="LIVE",
+        )
+        watcher._test_only_allow_recovery_without_row_lock = True
+        watcher._persist_watcher_audit = lambda *a, **kw: None
+        watcher.on_trigger = MagicMock()
+
+        assert watcher.add_signal(sig) is True
+        registered = watcher._pending[0]
+        row["broker_order_id"] = "broker-owner-after-lock"
+        registered.state = ew.WatchState.TRIGGERED
+
+        assert watcher._before_trigger_dispatch([("trigger", registered)]) == []
+        assert registered in watcher._pending
+        assert registered._ownership_quarantine is True
+        assert registered.state == ew.WatchState.PENDING
+        assert L.LEDGER.current_state(sig["signal_id"]) == L.SignalState.WATCHING
+        assert watcher.on_trigger.call_count == 0
+        assert not osm.submit_existing_entry.mock_calls
+        assert not osm.cancel_pending_entry.mock_calls
+        self._assert_no_broker_mutation(broker)
+
+    @pytest.mark.parametrize(
+        "corruption,reason_fragment",
+        [
+            ("row_generation_only", "generation_authority_mismatch"),
+            ("candidate_generation_only", "generation_authority_mismatch"),
+            ("wrong_ticker", "identity_mismatch_ticker"),
+            ("wrong_side", "identity_mismatch_side"),
+            ("watcher_token_mismatch", "watcher_token"),
+            ("watcher_token_missing", "watcher_token"),
+            ("watcher_owner_mismatch", "watcher_owner"),
+        ],
+    )
+    def test_a9_final_durable_identity_authorities_fail_closed(
+        self, corruption, reason_fragment,
+    ):
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+        sig = self._recovery_sig()
+        row = self._durable_recovery_row(sig)
+        if corruption == "row_generation_only":
+            sig.pop("materialization_generation")
+            sig["metadata"].pop("materialization_generation")
+        elif corruption == "candidate_generation_only":
+            row["meta"].pop("materialization_generation")
+        elif corruption == "wrong_ticker":
+            row["ticker"] = "MSFT"
+        elif corruption == "wrong_side":
+            row["side"] = "PUT"
+        elif corruption == "watcher_token_mismatch":
+            row["meta"]["watcher_token"] = "different-token"
+        elif corruption == "watcher_token_missing":
+            sig.pop("watcher_token")
+        elif corruption == "watcher_owner_mismatch":
+            sig["metadata"]["current_owner"] = "watcher:candidate"
+            row["meta"]["current_owner"] = "watcher:durable"
+
+        osm = MagicMock()
+        osm.client_id = None
+        osm.get_order.return_value = copy.deepcopy(row)
+        broker = MagicMock()
+        watcher = ew.APEntryWatcher(
+            broker=broker,
+            order_state_machine=osm,
+            require_on_trigger=False,
+            mode="LIVE",
+        )
+        watcher._test_only_allow_recovery_without_row_lock = True
+        watcher._persist_watcher_audit = lambda *a, **kw: None
+
+        assert watcher.add_signal(sig) is False
+        assert reason_fragment in watcher._last_reject_reason
+        assert watcher._pending == []
+        assert watcher._dedup_set == set()
+        assert L.LEDGER.current_state(sig["signal_id"]) is None
+        assert not osm.cancel_pending_entry.mock_calls
+        assert not osm.submit_existing_entry.mock_calls
+        self._assert_no_broker_mutation(broker)
 
     def test_a1_postgres_row_lock_serializes_final_recovery_commit(self, monkeypatch):
         """The real OSM row lock spans lifecycle and watcher admission."""
@@ -1537,6 +2023,7 @@ class TestPR580AmendmentCorrections:
             "client_id": client_id,
             "execution_mode": "live",
             "canonical_signal_id": sig["canonical_signal_id"],
+            "watcher_token": sig["watcher_token"],
         })
 
         class _ConnectionWrapper:
@@ -1583,6 +2070,8 @@ class TestPR580AmendmentCorrections:
                         execution_mode TEXT NOT NULL,
                         signal_id TEXT,
                         canonical_signal_id TEXT,
+                        ticker TEXT NOT NULL,
+                        side TEXT NOT NULL,
                         meta JSONB
                     )
                     """
@@ -1591,8 +2080,9 @@ class TestPR580AmendmentCorrections:
                     f"""
                     INSERT INTO "{schema}".orders (
                         local_order_id, client_id, kind, status,
-                        execution_mode, signal_id, canonical_signal_id, meta
-                    ) VALUES (%s, %s, 'ENTRY', 'PENDING_TRIGGER', %s, %s, %s, %s::jsonb)
+                        execution_mode, signal_id, canonical_signal_id,
+                        ticker, side, meta
+                    ) VALUES (%s, %s, 'ENTRY', 'PENDING_TRIGGER', %s, %s, %s, %s, %s, %s::jsonb)
                     """,
                     (
                         sig["local_order_id"],
@@ -1600,6 +2090,8 @@ class TestPR580AmendmentCorrections:
                         "live",
                         sig["signal_id"],
                         sig["canonical_signal_id"],
+                        sig["ticker"],
+                        sig["side"],
                         json.dumps(sig["metadata"]),
                     ),
                 )
@@ -1611,6 +2103,21 @@ class TestPR580AmendmentCorrections:
             broker = MagicMock()
             osm = MagicMock()
             osm.client_id = client_id
+
+            def _read_order(local_order_id):
+                with psycopg2.connect(database_url) as read_connection:
+                    with read_connection.cursor(
+                        cursor_factory=psycopg2.extras.RealDictCursor
+                    ) as read_cursor:
+                        read_cursor.execute(f'SET search_path TO "{schema}"')
+                        read_cursor.execute(
+                            "SELECT * FROM orders WHERE local_order_id=%s",
+                            (local_order_id,),
+                        )
+                        row = read_cursor.fetchone()
+                        return dict(row) if row else {}
+
+            osm.get_order.side_effect = _read_order
             watcher = ew.APEntryWatcher(
                 broker=broker,
                 order_state_machine=osm,
@@ -1619,6 +2126,7 @@ class TestPR580AmendmentCorrections:
             )
             watcher._persist_watcher_audit = lambda *a, **kw: None
             watcher._validate_local_order_id = MagicMock(return_value=True)
+            watcher.on_trigger = MagicMock()
             watched = ew.WatchedSignal(sig, overnight=False)
 
             lifecycle_entered = threading.Event()
@@ -1679,6 +2187,22 @@ class TestPR580AmendmentCorrections:
                         (sig["local_order_id"],),
                     )
                     assert cursor.fetchone()[0] == "broker-after-lock"
+
+            registered = watcher._pending[0]
+            registered.state = ew.WatchState.TRIGGERED
+            remaining_dispatch = watcher._before_trigger_dispatch([
+                ("trigger", registered),
+            ])
+            assert remaining_dispatch == []
+            assert registered in watcher._pending
+            assert registered._ownership_quarantine is True
+            assert registered.state == ew.WatchState.PENDING
+            assert "hold_broker_handoff_evidence" in registered._quarantine_reason
+            assert watcher.on_trigger.call_count == 0
+            assert not osm.submit_existing_entry.mock_calls
+            assert not osm.cancel_pending_entry.mock_calls
+            self._assert_no_broker_mutation(broker)
+            assert L.LEDGER.current_state(sig["signal_id"]) == L.SignalState.WATCHING
         finally:
             admin.autocommit = True
             with admin.cursor() as cursor:

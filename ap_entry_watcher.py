@@ -28,6 +28,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 import types
@@ -2216,8 +2217,6 @@ class APEntryWatcher:
             sources: list[dict],
             aliases: tuple[str, ...],
             field: str,
-            *,
-            lowercase: bool = False,
         ) -> tuple[Optional[str], str]:
             values: list[str] = []
             for source in sources:
@@ -2227,9 +2226,9 @@ class APEntryWatcher:
                     raw = source.get(alias)
                     if isinstance(raw, (bool, dict, list, tuple, set)):
                         return None, f"recovery_lifecycle_malformed_{field}"
-                    value = str(raw).strip()
-                    if lowercase:
-                        value = value.lower()
+                    if isinstance(raw, str) and raw != raw.strip():
+                        return None, f"recovery_lifecycle_malformed_{field}"
+                    value = str(raw) if isinstance(raw, str) else str(raw).strip()
                     values.append(value)
             if not values or not any(values):
                 return None, f"recovery_lifecycle_missing_{field}"
@@ -2238,24 +2237,26 @@ class APEntryWatcher:
             return values[0], ""
 
         fields = (
-            ("local_order_id", ("local_order_id",), False),
-            ("signal_id", ("signal_id",), False),
-            ("canonical_signal_id", ("canonical_signal_id",), False),
-            ("client_id", ("client_id", "client_email"), True),
-            ("execution_mode", ("execution_mode", "mode"), True),
+            ("local_order_id", ("local_order_id",)),
+            ("signal_id", ("signal_id",)),
+            ("canonical_signal_id", ("canonical_signal_id",)),
+            ("client_id", ("client_id", "client_email")),
+            ("execution_mode", ("execution_mode", "mode")),
+            ("ticker", ("ticker", "symbol")),
+            ("side", ("side", "direction")),
         )
         signal_sources = [signal, *signal_meta]
         row_sources = [row, *row_meta]
         incoming: dict[str, str] = {}
         durable: dict[str, str] = {}
-        for field, aliases, lowercase in fields:
+        for field, aliases in fields:
             incoming_value, incoming_error = _coherent(
-                signal_sources, aliases, field, lowercase=lowercase,
+                signal_sources, aliases, field,
             )
             if incoming_error:
                 return False, incoming_error
             durable_value, durable_error = _coherent(
-                row_sources, aliases, field, lowercase=lowercase,
+                row_sources, aliases, field,
             )
             if durable_error:
                 return False, (
@@ -2268,6 +2269,7 @@ class APEntryWatcher:
         requested_local_order_id = str(local_order_id or "").strip()
         if (
             not requested_local_order_id
+            or requested_local_order_id != str(local_order_id or "")
             or incoming["local_order_id"] != requested_local_order_id
         ):
             return False, "recovery_lifecycle_identity_mismatch_local_order_id"
@@ -2277,8 +2279,49 @@ class APEntryWatcher:
             "client_id",
             "execution_mode",
             "local_order_id",
+            "ticker",
+            "side",
         ):
             if incoming[field] != durable[field]:
+                return False, f"recovery_lifecycle_identity_mismatch_{field}"
+
+        if incoming["execution_mode"] not in {"live", "paper"}:
+            return False, "recovery_lifecycle_invalid_execution_mode"
+        if incoming["side"] not in {"CALL", "PUT"}:
+            return False, "recovery_lifecycle_invalid_side"
+
+        # Optional fenced authorities become required on both sides as soon
+        # as either the durable row or the recovery plan claims one.  Absence
+        # is not equality and aliases are never resolved by first-non-empty.
+        optional_authorities = (
+            ("watcher_token", ("watcher_token",)),
+            ("watcher_owner", ("watcher_owner", "current_owner")),
+            ("trigger_generation", ("trigger_generation",)),
+            ("trigger_cursor", ("trigger_cursor", "trigger_cursor_id")),
+        )
+        for field, aliases in optional_authorities:
+            incoming_present = any(
+                alias in source for source in signal_sources for alias in aliases
+            )
+            durable_present = any(
+                alias in source for source in row_sources for alias in aliases
+            )
+            if not incoming_present and not durable_present:
+                continue
+            incoming_value, incoming_error = _coherent(
+                signal_sources, aliases, field,
+            )
+            if incoming_error:
+                return False, incoming_error
+            durable_value, durable_error = _coherent(
+                row_sources, aliases, field,
+            )
+            if durable_error:
+                return False, (
+                    "recovery_lifecycle_durable_"
+                    f"{durable_error.removeprefix('recovery_lifecycle_')}"
+                )
+            if incoming_value != durable_value:
                 return False, f"recovery_lifecycle_identity_mismatch_{field}"
         return True, "recovery_lifecycle_durable_identity_proven"
 
@@ -2321,15 +2364,21 @@ class APEntryWatcher:
 
         parsed: list[int] = []
         for raw in authorities:
-            if isinstance(raw, bool) or not isinstance(raw, int):
+            if isinstance(raw, bool):
                 return [], "recovery_lifecycle_malformed_generation"
-            if raw <= 0:
+            if isinstance(raw, int):
+                parsed_value = raw
+            elif isinstance(raw, str) and re.fullmatch(r"[0-9]+", raw):
+                parsed_value = int(raw)
+            else:
+                return [], "recovery_lifecycle_malformed_generation"
+            if parsed_value <= 0:
                 return [], (
                     "recovery_lifecycle_zero_generation"
-                    if raw == 0
+                    if parsed_value == 0
                     else "recovery_lifecycle_negative_generation"
                 )
-            parsed.append(raw)
+            parsed.append(parsed_value)
         if parsed and any(value != parsed[0] for value in parsed[1:]):
             return [], "recovery_lifecycle_conflicting_generation"
         return parsed, None
@@ -2358,19 +2407,27 @@ class APEntryWatcher:
         if not isinstance(signal, dict):
             return False, "recovery_lifecycle_malformed_signal", {}
 
-        # Direct unit-level bridge tests intentionally have no OSM.  The caller
-        # has already proven recovery identity in that isolated path; production
-        # recovery always supplies an OSM and therefore takes the fresh reread.
         if row is None:
-            osm = getattr(self, "order_state_machine", None)
-            if osm is None or not any(
-                callable(getattr(osm, name, None))
-                for name in ("get_order", "get", "get_order_by_local_id")
-            ):
-                return True, "recovery_lifecycle_durable_fence_not_requested", {}
-            row = self._load_order_row_for_recovery_rearm(
-                signal.get("local_order_id")
-            )
+            if getattr(self, "_test_only_allow_recovery_without_row_lock", False):
+                osm = getattr(self, "order_state_machine", None)
+                if osm is None or not any(
+                    callable(getattr(osm, name, None))
+                    for name in ("get_order", "get", "get_order_by_local_id")
+                ):
+                    return True, "recovery_lifecycle_explicit_test_fence_bypass", {}
+                row = self._load_order_row_for_recovery_rearm(
+                    signal.get("local_order_id")
+                )
+            else:
+                osm = getattr(self, "order_state_machine", None)
+                if osm is None or not any(
+                    callable(getattr(osm, name, None))
+                    for name in ("get_order", "get", "get_order_by_local_id")
+                ):
+                    return False, "recovery_lifecycle_durable_fence_unavailable", {}
+                row = self._load_order_row_for_recovery_rearm(
+                    signal.get("local_order_id")
+                )
 
         if not isinstance(row, dict) or not row:
             return False, "recovery_lifecycle_durable_row_unavailable", {}
@@ -2401,11 +2458,9 @@ class APEntryWatcher:
         )
         if signal_generation_error:
             return False, signal_generation_error, row
-        if (
-            row_generations
-            and signal_generations
-            and row_generations[0] != signal_generations[0]
-        ):
+        if bool(row_generations) != bool(signal_generations):
+            return False, "recovery_lifecycle_generation_authority_mismatch", row
+        if row_generations and row_generations[0] != signal_generations[0]:
             return False, "recovery_lifecycle_conflicting_generation", row
 
         merged_meta: dict = {}
@@ -2482,28 +2537,40 @@ class APEntryWatcher:
         recovery candidate is already committed.  No broker or materializer
         authority is created here.
 
-        Test doubles and standalone watcher instances without an OSM client
-        identity yield ``(None, None)`` and use the existing fresh-read seam;
-        a real OSM connection failure yields an explicit HOLD reason.
+        Tests may bypass PostgreSQL only by setting the explicit
+        ``_test_only_allow_recovery_without_row_lock`` seam.  Missing runtime
+        identity never implies test mode.
         """
         signal = getattr(watched, "signal", {}) or {}
         osm = getattr(self, "order_state_machine", None)
         client_id = getattr(osm, "client_id", None) if osm is not None else None
         local_order_id = str(signal.get("local_order_id") or "").strip()
-        signal_client_id = str(signal.get("client_id") or "").strip()
+        signal_client_raw = signal.get("client_id")
+        signal_client_id = (
+            signal_client_raw
+            if isinstance(signal_client_raw, str)
+            else ""
+        )
 
-        # No durable OSM identity means this is an isolated/unit-level bridge
-        # invocation.  Preserve that existing no-DB contract; production OSM
-        # instances always carry a concrete client_id and take the row lock.
+        if getattr(self, "_test_only_allow_recovery_without_row_lock", False):
+            yield None, None
+            return
+
         if (
             not isinstance(client_id, str)
             or not client_id.strip()
             or not local_order_id
-            or not signal_client_id
+            or not signal_client_id.strip()
         ):
-            yield None, None
+            yield None, "recovery_lifecycle_missing_durable_fence_identity"
             return
-        if client_id.strip().lower() != signal_client_id.lower():
+        if (
+            client_id != client_id.strip()
+            or signal_client_id != signal_client_id.strip()
+        ):
+            yield None, "recovery_lifecycle_identity_mismatch_client_id"
+            return
+        if client_id != signal_client_id:
             yield None, "recovery_lifecycle_identity_mismatch_client_id"
             return
 
@@ -2530,19 +2597,8 @@ class APEntryWatcher:
             )
             _fetchone = getattr(_cursor, "fetchone", None)
             if not callable(_fetchone):
-                # Existing non-database OSM test adapters expose only their
-                # mutation/query surface and intentionally do not model a
-                # cursor row fetch.  Preserve their established fresh-reread
-                # contract; the real ap.db._ConnWrapper is required to expose
-                # fetchone(), and a real wrapper without it remains HOLD.
-                _is_ap_db_wrapper = (
-                    getattr(_connection.__class__, "__module__", "") == "ap.db"
-                )
                 _db_context.__exit__(None, None, None)
-                if _is_ap_db_wrapper:
-                    yield None, "recovery_lifecycle_durable_fence_unavailable"
-                else:
-                    yield None, None
+                yield None, "recovery_lifecycle_durable_fence_unavailable"
                 return
             _row = _fetchone()
             _row = dict(_row) if _row else None
@@ -3642,13 +3698,19 @@ class APEntryWatcher:
 
         _parsed_generations: list[int] = []
         for _authority_name, _gen_raw in _generation_authorities:
-            if isinstance(_gen_raw, bool) or not isinstance(_gen_raw, int):
+            if isinstance(_gen_raw, bool):
                 return False, "recovery_lifecycle_malformed_generation"
-            if _gen_raw < 0:
+            if isinstance(_gen_raw, int):
+                _parsed_generation = _gen_raw
+            elif isinstance(_gen_raw, str) and re.fullmatch(r"[0-9]+", _gen_raw):
+                _parsed_generation = int(_gen_raw)
+            else:
+                return False, "recovery_lifecycle_malformed_generation"
+            if _parsed_generation < 0:
                 return False, "recovery_lifecycle_negative_generation"
-            if _gen_raw == 0:
+            if _parsed_generation == 0:
                 return False, "recovery_lifecycle_zero_generation"
-            _parsed_generations.append(_gen_raw)
+            _parsed_generations.append(_parsed_generation)
 
         if _parsed_generations and any(
             _generation != _parsed_generations[0]
@@ -3720,18 +3782,22 @@ class APEntryWatcher:
                     reason="restored_to_watching_after_restart",
                 )
             except Exception:
-                self._record_recovery_lifecycle_failure(
+                _repaired = self._record_recovery_lifecycle_failure(
                     signal_id,
                     ticker,
                     "recovery_lifecycle_adopted_to_watching_raised",
                 )
+                if not _repaired:
+                    return False, "recovery_lifecycle_quarantine_unrepaired"
                 return False, "recovery_lifecycle_adopted_to_watching_raised"
             if _EW_LEDGER.current_state(signal_id) != _EW_SS.WATCHING:
-                self._record_recovery_lifecycle_failure(
+                _repaired = self._record_recovery_lifecycle_failure(
                     signal_id,
                     ticker,
                     "recovery_lifecycle_adopted_to_watching_not_applied",
                 )
+                if not _repaired:
+                    return False, "recovery_lifecycle_quarantine_unrepaired"
                 return False, "recovery_lifecycle_adopted_to_watching_not_applied"
             return True, "recovery_lifecycle_adopted_to_watching"
 
@@ -3743,18 +3809,22 @@ class APEntryWatcher:
                     reason="restart_recovery_loaded_existing_signal",
                 )
             except Exception:
-                self._record_recovery_lifecycle_failure(
+                _repaired = self._record_recovery_lifecycle_failure(
                     signal_id,
                     ticker,
                     "recovery_lifecycle_adopt_raised",
                 )
+                if not _repaired:
+                    return False, "recovery_lifecycle_quarantine_unrepaired"
                 return False, "recovery_lifecycle_adopt_raised"
             if _EW_LEDGER.current_state(signal_id) != _EW_SS.ADOPTED:
-                self._record_recovery_lifecycle_failure(
+                _repaired = self._record_recovery_lifecycle_failure(
                     signal_id,
                     ticker,
                     "recovery_lifecycle_adopt_not_applied",
                 )
+                if not _repaired:
+                    return False, "recovery_lifecycle_quarantine_unrepaired"
                 return False, "recovery_lifecycle_adopt_not_applied"
             try:
                 signal_watching(
@@ -3762,18 +3832,22 @@ class APEntryWatcher:
                     reason="restored_to_watching_after_restart",
                 )
             except Exception:
-                self._record_recovery_lifecycle_failure(
+                _repaired = self._record_recovery_lifecycle_failure(
                     signal_id,
                     ticker,
                     "recovery_lifecycle_watching_raised",
                 )
+                if not _repaired:
+                    return False, "recovery_lifecycle_quarantine_unrepaired"
                 return False, "recovery_lifecycle_watching_raised"
             if _EW_LEDGER.current_state(signal_id) != _EW_SS.WATCHING:
-                self._record_recovery_lifecycle_failure(
+                _repaired = self._record_recovery_lifecycle_failure(
                     signal_id,
                     ticker,
                     "recovery_lifecycle_watching_not_applied",
                 )
+                if not _repaired:
+                    return False, "recovery_lifecycle_quarantine_unrepaired"
                 return False, "recovery_lifecycle_watching_not_applied"
             return True, "recovery_lifecycle_none_to_watching"
 
@@ -3843,6 +3917,64 @@ class APEntryWatcher:
         """
         signal = getattr(watched, "signal", {}) or {}
 
+        def _quarantine_candidate(reason: str) -> None:
+            """Retain a non-executable owner when lifecycle repair is unproven."""
+            watched._ownership_quarantine = True
+            watched._quarantine_reason = reason
+            _quarantine_ids = getattr(self, "_recovery_quarantine_ids", None)
+            if _quarantine_ids is None:
+                _quarantine_ids = set()
+                self._recovery_quarantine_ids = _quarantine_ids
+            _quarantine_ids.add(str(signal.get("signal_id") or ""))
+            _registered = watched in self._pending
+            if not _registered:
+                try:
+                    self._pending.append(watched)
+                    _registered = True
+                except Exception:
+                    # Registry failure is itself part of the quarantine. Keep
+                    # the explicit quarantine id so a retry cannot treat this
+                    # signal as a valid active watcher.
+                    log.critical(
+                        "[%s] recovery quarantine registry insertion failed "
+                        "signal_id=%s",
+                        watched.ticker,
+                        signal.get("signal_id"),
+                    )
+            if dedup_key and _registered:
+                try:
+                    self._dedup_set.add(dedup_key)
+                except Exception:
+                    log.critical(
+                        "[%s] recovery quarantine dedup insertion failed "
+                        "signal_id=%s",
+                        watched.ticker,
+                        signal.get("signal_id"),
+                    )
+            log.critical(
+                "[%s] RECOVERY_LIFECYCLE_QUARANTINE signal_id=%s "
+                "local_order_id=%s reason=%s",
+                watched.ticker,
+                signal.get("signal_id"),
+                signal.get("local_order_id"),
+                reason,
+            )
+
+        def _rollback_candidate(reason: str) -> bool:
+            self._pending = [
+                existing for existing in self._pending if existing is not watched
+            ]
+            if dedup_key:
+                self._dedup_set.discard(dedup_key)
+            repaired = self._record_recovery_lifecycle_failure(
+                str(signal.get("signal_id") or ""),
+                str(getattr(watched, "ticker", "") or ""),
+                reason,
+            )
+            if not repaired:
+                _quarantine_candidate(reason)
+            return repaired
+
         def _hold(reason: str) -> bool:
             # The caller's ``watch()`` path persists this audit after the
             # admission context exits.  Keeping the write out of the
@@ -3889,6 +4021,8 @@ class APEntryWatcher:
 
             _rlok, _rlreason = self._restore_recovered_watcher_lifecycle(watched)
             if not _rlok:
+                if _rlreason == "recovery_lifecycle_quarantine_unrepaired":
+                    _quarantine_candidate(_rlreason)
                 return _hold(_rlreason)
 
             # Treat the registry insertion as part of the same recovery
@@ -3911,30 +4045,102 @@ class APEntryWatcher:
                         watched._registration_token
                     )
             except Exception:
-                if _candidate_registered:
-                    self._pending = [
-                        existing for existing in self._pending
-                        if existing is not watched
-                    ]
-                if _candidate_dedup_added:
-                    self._dedup_set.discard(dedup_key)
-                self._record_recovery_lifecycle_failure(
-                    str(signal.get("signal_id") or ""),
-                    str(getattr(watched, "ticker", "") or ""),
-                    "recovery_lifecycle_registry_commit_failed",
-                )
+                _rollback_candidate("recovery_lifecycle_registry_commit_failed")
                 return _hold("recovery_lifecycle_registry_commit_failed")
 
             # Destructive incumbent bookkeeping is delayed until the candidate
             # has both legal lifecycle ownership and a committed registry slot.
+            # Each displaced durable row must then converge through the existing
+            # exact OSM cancellation path and a terminal reread before its
+            # process-local registration or dedup ownership is released.
             if deferred_conflicts:
-                _deferred_incumbents = {
-                    incumbent
-                    for incumbent, *_details in deferred_conflicts
-                }
+                _deferred_incumbents = []
+                for incumbent, *_details in deferred_conflicts:
+                    if incumbent not in _deferred_incumbents:
+                        _deferred_incumbents.append(incumbent)
+                _terminal_proven: list[tuple[object, str]] = []
+                osm = getattr(self, "order_state_machine", None)
+                cancel_pending = getattr(osm, "cancel_pending_entry", None)
                 for incumbent in _deferred_incumbents:
                     if incumbent not in self._pending:
                         continue
+                    incumbent_signal = getattr(incumbent, "signal", {}) or {}
+                    incumbent_oid = str(
+                        incumbent_signal.get("local_order_id") or ""
+                    ).strip()
+                    incumbent_token = str(
+                        getattr(incumbent, "_registration_token", "") or ""
+                    )
+                    if not incumbent_oid or not callable(cancel_pending):
+                        _rollback_candidate(
+                            "recovery_incumbent_cancellation_unavailable"
+                        )
+                        return _hold("recovery_incumbent_cancellation_unavailable")
+
+                    incumbent_row = self._load_order_row_for_recovery_rearm(
+                        incumbent_oid
+                    )
+                    incumbent_identity_ok, _ = (
+                        self._recovery_identity_matches_durable_row(
+                            incumbent_signal, incumbent_row, incumbent_oid,
+                        )
+                    )
+                    if not incumbent_identity_ok:
+                        _rollback_candidate("recovery_incumbent_identity_unproven")
+                        return _hold("recovery_incumbent_identity_unproven")
+                    try:
+                        cancel_ok = bool(cancel_pending(
+                            incumbent_oid,
+                            reason="recovery_watcher_replacement_converged",
+                        ))
+                    except Exception:
+                        _rollback_candidate("recovery_incumbent_cancellation_raised")
+                        return _hold("recovery_incumbent_cancellation_raised")
+                    if not cancel_ok:
+                        _rollback_candidate("recovery_incumbent_cancellation_failed")
+                        return _hold("recovery_incumbent_cancellation_failed")
+
+                    terminal_row = self._load_order_row_for_recovery_rearm(
+                        incumbent_oid
+                    )
+                    terminal_status = str(
+                        terminal_row.get("status") or ""
+                    ).strip().upper()
+                    identity_probe = dict(terminal_row)
+                    identity_probe["status"] = "PENDING_TRIGGER"
+                    terminal_identity_ok, _ = (
+                        self._recovery_identity_matches_durable_row(
+                            incumbent_signal, identity_probe, incumbent_oid,
+                        )
+                    )
+                    if (
+                        terminal_status not in {
+                            "CANCELED", "EXPIRED", "REJECTED", "ERROR",
+                        }
+                        or not terminal_identity_ok
+                    ):
+                        _rollback_candidate(
+                            "recovery_incumbent_terminal_proof_unproven"
+                        )
+                        return _hold(
+                            "recovery_incumbent_terminal_proof_unproven"
+                        )
+                    _terminal_proven.append((incumbent, incumbent_token))
+
+                for incumbent, incumbent_token in _terminal_proven:
+                    # The outer registry lock prevents normal concurrent
+                    # replacement, but retain an exact token/object fence so a
+                    # future refactor cannot remove a newly registered object
+                    # that merely shares logical identity.
+                    if (
+                        incumbent not in self._pending
+                        or str(getattr(incumbent, "_registration_token", "") or "")
+                        != incumbent_token
+                    ):
+                        _rollback_candidate(
+                            "recovery_incumbent_registration_changed"
+                        )
+                        return _hold("recovery_incumbent_registration_changed")
                     incumbent.state = WatchState.CANCELLED
                     incumbent._release_dedup_key()
                     log.info(
@@ -3945,10 +4151,10 @@ class APEntryWatcher:
                         incumbent.signal.get("signal_id"),
                         incumbent.signal.get("local_order_id"),
                     )
+                terminal_objects = {id(item) for item, _token in _terminal_proven}
                 self._pending = [
-                    existing
-                    for existing in self._pending
-                    if existing not in _deferred_incumbents
+                    existing for existing in self._pending
+                    if id(existing) not in terminal_objects
                 ]
             return True
 
@@ -3964,6 +4170,49 @@ class APEntryWatcher:
         if registration_provenance_out is not None:
             registration_provenance_out["created_by_this_call"] = False
             registration_provenance_out["registration_token"] = None
+
+        # Recovery admission must not reach WatchedSignal's ordinary
+        # UUID/side-normalizing constructor with incomplete identity.  Those
+        # defaults are valid for legacy ordinary admissions, but would turn a
+        # malformed durable recovery plan into a different identity.
+        _strict_recovery_signal = bool(
+            isinstance(signal, dict)
+            and signal.get("__recovery_rearm")
+            and not signal.get("__materialization_resume")
+        )
+        if _strict_recovery_signal:
+            _required_recovery_fields = (
+                "signal_id",
+                "canonical_signal_id",
+                "client_id",
+                "execution_mode",
+                "ticker",
+                "side",
+                "local_order_id",
+            )
+            for _field in _required_recovery_fields:
+                _raw_value = signal.get(_field)
+                if not isinstance(_raw_value, str):
+                    self._last_reject_reason = (
+                        f"recovery_lifecycle_malformed_{_field}"
+                    )
+                    return False
+                if not _raw_value or _raw_value != _raw_value.strip():
+                    self._last_reject_reason = (
+                        f"recovery_lifecycle_missing_{_field}"
+                    )
+                    return False
+            if signal["ticker"] != signal["ticker"].upper():
+                self._last_reject_reason = "recovery_lifecycle_invalid_ticker"
+                return False
+            if signal["side"] not in {"CALL", "PUT"}:
+                self._last_reject_reason = "recovery_lifecycle_invalid_side"
+                return False
+            if signal["execution_mode"] not in {"live", "paper"}:
+                self._last_reject_reason = (
+                    "recovery_lifecycle_invalid_execution_mode"
+                )
+                return False
 
         now_et = datetime.now(ET)
         post_session = (
@@ -4030,6 +4279,16 @@ class APEntryWatcher:
             # has passed the final durable fence, lifecycle restoration, and
             # its own registry commit below.
             _deferred_recovery_conflicts = []
+
+            _quarantine_ids = getattr(self, "_recovery_quarantine_ids", set())
+            if (
+                _recovery_atomic_admission
+                and str(watched.signal.get("signal_id") or "") in _quarantine_ids
+            ):
+                self._last_reject_reason = (
+                    "recovery_lifecycle_quarantine_unrepaired"
+                )
+                return False
 
             if dedup_key and dedup_key in self._dedup_set:
                 log.info(
@@ -4600,37 +4859,93 @@ class APEntryWatcher:
         # can suppress its own cancel_pending_entry calls.
         _recovery_rearm    = bool(recovery_rearm)
         _materialization_resume = bool(materialization_resume)
+        _strict_recovery_admission = (
+            _recovery_rearm and not _materialization_resume
+        )
         _no_cancel_on_reject = bool(no_cancel_on_reject or recovery_rearm)
-        _plan_metadata = getattr(plan, "metadata", None) or {}
+        _raw_plan_metadata = getattr(plan, "metadata", None)
+        if _strict_recovery_admission and not isinstance(
+            _raw_plan_metadata, dict
+        ):
+            self._last_reject_reason = "recovery_lifecycle_malformed_plan_metadata"
+            return False
+        _plan_metadata = _raw_plan_metadata or {}
         if not isinstance(_plan_metadata, dict):
             _plan_metadata = {}
-        _plan_signal_id = str(getattr(plan, "signal_id", "") or "").strip()
-        _plan_canonical_signal_id = str(
-            getattr(plan, "canonical_signal_id", "")
-            or _plan_metadata.get("canonical_signal_id")
-            or ""
-        ).strip()
-        if not _plan_canonical_signal_id:
+        _plan_signal_raw = getattr(plan, "signal_id", "")
+        _plan_signal_id = (
+            _plan_signal_raw
+            if isinstance(_plan_signal_raw, str)
+            else str(_plan_signal_raw or "")
+        )
+        if _strict_recovery_admission:
+            _plan_canonical_signal_id = getattr(
+                plan, "canonical_signal_id", None
+            )
+        else:
+            _plan_canonical_signal_id = (
+                getattr(plan, "canonical_signal_id", "")
+                or _plan_metadata.get("canonical_signal_id")
+                or ""
+            )
+        _plan_canonical_signal_id = (
+            _plan_canonical_signal_id
+            if isinstance(_plan_canonical_signal_id, str)
+            else str(_plan_canonical_signal_id or "")
+        )
+        if not _plan_canonical_signal_id and not _strict_recovery_admission:
             _plan_canonical_signal_id = build_canonical_signal_id(
                 _plan_signal_id, _plan_metadata
             )
-        _plan_materialization_generation = getattr(
-            plan, "materialization_generation", None
+        _plan_has_generation = hasattr(plan, "materialization_generation")
+        _plan_materialization_generation = (
+            getattr(plan, "materialization_generation", None)
+            if _plan_has_generation else None
         )
-        if _plan_materialization_generation is None:
+        if (
+            not _strict_recovery_admission
+            and _plan_materialization_generation is None
+        ):
             _plan_materialization_generation = _plan_metadata.get(
                 "materialization_generation"
             )
         _plan_generation_present = (
-            _plan_materialization_generation is not None
+            (_plan_has_generation and _plan_materialization_generation is not None)
             or "materialization_generation" in _plan_metadata
         )
 
+        if _strict_recovery_admission:
+            _plan_client_id = getattr(plan, "client_id", None)
+            _plan_execution_mode = getattr(plan, "execution_mode", None)
+            _plan_side = getattr(plan, "side", None)
+            _plan_watcher_token = getattr(plan, "watcher_token", None)
+            _plan_trigger_generation = getattr(plan, "trigger_generation", None)
+        else:
+            _plan_client_id = (
+                getattr(plan, "client_id", "")
+                or _plan_metadata.get("client_id")
+                or ""
+            )
+            _plan_execution_mode = str(
+                getattr(plan, "execution_mode", "")
+                or _plan_metadata.get("execution_mode")
+                or self.mode
+            ).lower()
+            _plan_side = getattr(plan, "side", "CALL")
+            _plan_watcher_token = self.owner_token
+            _plan_trigger_generation = int(
+                _plan_materialization_generation or 1
+            )
+
         signal_dict = {
-            "signal_id": _plan_signal_id or str(uuid.uuid4()),
+            "signal_id": (
+                _plan_signal_id
+                if _strict_recovery_admission
+                else _plan_signal_id or str(uuid.uuid4())
+            ),
             "canonical_signal_id": _plan_canonical_signal_id,
             "ticker": getattr(plan, "ticker", ""),
-            "side": getattr(plan, "side", "CALL"),
+            "side": _plan_side,
             "score": getattr(plan, "score", 65.0),
             "grade": getattr(plan, "tier", "B"),
             "entry_price": getattr(plan, "trigger_price", None),
@@ -4651,20 +4966,8 @@ class APEntryWatcher:
             "local_order_id": local_order_id,
             "metadata": dict(_plan_metadata),
             "materialization_generation": _plan_materialization_generation,
-            "client_id": str(
-                getattr(plan, "client_id", "")
-                or _plan_metadata.get("client_id")
-                or ""
-            ),
-            "execution_mode": str(
-                getattr(plan, "execution_mode", "")
-                or _plan_metadata.get("execution_mode")
-                or self.mode
-            ).lower(),
-            "watcher_token": self.owner_token,
-            "trigger_generation": int(
-                _plan_materialization_generation or 1
-            ),
+            "client_id": _plan_client_id,
+            "execution_mode": _plan_execution_mode,
             "deferred_retry_not_before": (
                 _plan_metadata.get("next_retry_at")
                 or _plan_metadata.get("materialization_next_retry_at")
@@ -4706,6 +5009,20 @@ class APEntryWatcher:
         # blank/zero/invalid populated data.
         if not _plan_generation_present:
             signal_dict.pop("materialization_generation", None)
+        if _plan_watcher_token is not None:
+            signal_dict["watcher_token"] = _plan_watcher_token
+        if _plan_trigger_generation is not None:
+            signal_dict["trigger_generation"] = _plan_trigger_generation
+        if _strict_recovery_admission:
+            for _authority_field in (
+                "watcher_owner",
+                "current_owner",
+                "trigger_cursor",
+                "trigger_cursor_id",
+            ):
+                _authority_value = getattr(plan, _authority_field, None)
+                if _authority_value is not None:
+                    signal_dict[_authority_field] = _authority_value
 
         if _recovery_rearm or _materialization_resume:
             if not recovery_trigger_evidence_identity_is_proven(

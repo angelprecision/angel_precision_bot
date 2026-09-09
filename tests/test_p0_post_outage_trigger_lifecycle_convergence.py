@@ -168,6 +168,7 @@ def _bare_watcher():
         require_on_trigger=False,
         mode="LIVE",
     )
+    ew._test_only_allow_recovery_without_row_lock = True
     ew._persist_watcher_audit = lambda *a, **kw: None
     return ew
 
@@ -581,6 +582,8 @@ class TestSeptember8JasonLiveRecoveryRearm:
             "canonical_signal_id": canonical_sid,
             "client_id": TestSeptember8JasonLiveRecoveryRearm.client_id,
             "execution_mode": TestSeptember8JasonLiveRecoveryRearm.execution_mode,
+            "ticker": "TMO",
+            "side": "CALL",
             "materialization_generation": 1,
             "contract_deferred": True,
         }
@@ -647,6 +650,7 @@ class TestSeptember8JasonLiveRecoveryRearm:
             require_on_trigger=True,
             mode="LIVE",
         )
+        watcher._test_only_allow_recovery_without_row_lock = True
         watcher._persist_watcher_audit = MagicMock()
         watcher._persist_trigger_confirmation_authority = MagicMock(return_value=True)
         watcher._is_regular_session_now = lambda: True
