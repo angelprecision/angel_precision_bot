@@ -145,6 +145,7 @@ env:
     tests/test_p0_terminal_proof_lock_postgres_concurrency.py
     tests/test_p0_queue_deferral_truth.py
     tests/test_p0_manual_rescue_restart_guard_bypass.py
+    tests/test_p0_pr596_due_materialization_retry_liveness.py
 
 jobs:
   p0-tests:
