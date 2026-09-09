@@ -2164,6 +2164,12 @@ class APEntryWatcher:
                 )
             ):
                 _row_handoff = True
+            _nested_materialization = _pending_meta.get("materialization")
+            if (
+                _nested_materialization is not None
+                and not isinstance(_nested_materialization, dict)
+            ):
+                _row_handoff = True
             try:
                 from ap.pending_trigger_classifier import has_broker_handoff_evidence
 

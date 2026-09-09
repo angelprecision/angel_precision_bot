@@ -405,6 +405,46 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             row = self._read_order(expected.local_order_id)
         except Exception:
             return False
+        # The read used by the fenced CAS is also a broker-handoff fence. A
+        # submit marker that appears after the base pre-dispatch snapshot must
+        # not be treated as an ordinary pending row.
+        _raw_meta = row.get("meta") if isinstance(row, dict) else None
+        if _raw_meta is not None and not isinstance(_raw_meta, dict):
+            if isinstance(_raw_meta, str):
+                try:
+                    _raw_meta = _json.loads(_raw_meta)
+                except Exception:
+                    return False
+            if not isinstance(_raw_meta, dict):
+                return False
+        _handoff = bool(
+            isinstance(row, dict)
+            and (
+                row.get("broker_order_id")
+                or row.get("submitted_ts")
+                or row.get("submit_intent_at")
+                or row.get("broker_submit_key")
+                or row.get("broker_submit_payload_hash")
+            )
+        )
+        if isinstance(row, dict):
+            _top_ready = row.get("broker_ready")
+            if _top_ready is not None and not (
+                _top_ready is False
+                or (
+                    isinstance(_top_ready, str)
+                    and _top_ready.strip().lower() == "false"
+                )
+            ):
+                _handoff = True
+        try:
+            from ap.pending_trigger_classifier import has_broker_handoff_evidence
+
+            _handoff = _handoff or has_broker_handoff_evidence(row)
+        except Exception:
+            return False
+        if _handoff:
+            return False
         proven, _status, _reason = self._verify_row(
             row, expected, pending_only=True
         )
@@ -936,21 +976,30 @@ class APEntryWatcher(_BaseAPEntryWatcher):
         signal = getattr(watched, "signal", {}) or {}
         return str(getattr(watched, "signal_id", "") or signal.get("signal_id") or "").strip()
 
-    def _set_direction_hold(self, watched, key, reason_code: str, raw_reason: str) -> None:
+    def _set_direction_hold(
+        self,
+        watched,
+        key,
+        reason_code: str,
+        raw_reason: str,
+        *,
+        persist_audit: bool = True,
+    ) -> None:
         with self._lock:
             if any(item is watched for item in self._pending):
                 watched.state = WatchState.PENDING
                 watched.deferred_retry_not_before = (
                     _datetime.now(_timezone.utc) + _base.timedelta(seconds=5)
                 )
-        self._direction_event_audit(
-            watched,
-            reason_code,
-            raw_reason,
-            ownership_key=key,
-            held_local_order_id=self._local_order_id(watched),
-            held_signal_id=self._signal_id(watched),
-        )
+        if persist_audit:
+            self._direction_event_audit(
+                watched,
+                reason_code,
+                raw_reason,
+                ownership_key=key,
+                held_local_order_id=self._local_order_id(watched),
+                held_signal_id=self._signal_id(watched),
+            )
 
     def _preexisting_crossed_at(self, watched):
         context = self._direction_poll_context or {}
@@ -1249,6 +1298,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                         key,
                         "direction_claim_authority_unproven_hold",
                         "winner_confirmed_trigger_authority_not_durable",
+                        persist_audit=not _winner_is_deferred_pending,
                     )
                     for watched in triggered:
                         if watched is not winner:
@@ -1257,6 +1307,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                                 key,
                                 "direction_claim_authority_unproven_hold",
                                 "winner_confirmed_trigger_authority_not_durable",
+                                persist_audit=not _winner_is_deferred_pending,
                             )
                     continue
 
