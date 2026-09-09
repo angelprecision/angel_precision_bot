@@ -498,6 +498,7 @@ class TestBugE_RecoveryRearmWiring:
             w,
             _is_regular_session_now=MagicMock(return_value=False),
             _is_past_entry_cutoff_now=MagicMock(return_value=False),
+            _is_live_runtime=MagicMock(return_value=False),
         )
 
     def test_14_waiting_valid_orphan_rearmed_no_submit(self):

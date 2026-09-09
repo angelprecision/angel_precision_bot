@@ -5,10 +5,14 @@
 **AMENDED IN PLACE — HARD HOLD. DO NOT MERGE OR DEPLOY.**
 
 Base: `84d8d61278d45040d8a6830e58c0ac912d683ff2`
+Current implementation head: `2448de61e5aa6fb75abf48fa265aa82b4ed5e728`
+PR state: **Draft / open / HARD HOLD**. The implementation head above is the
+code-and-test amendment commit; the final documentation attestation commit
+will be reported in the PR body after CI completes.
 Audited deployed main: `98eeaadae05f9e4e1db624703ec1e3cd758b732c`
 Original head before amendment: `dd41efaac6db81e3762e87a05c8c90276019fe08`
 Prior amended head before live-base rebase: `bb7d2084f014ff216a7915873e34f5bbd92bf4be`
-Amendment applied: 2026-09-08
+Amendment applied: 2026-09-09
 
 Dependencies (§STATUS binding order):
 - PR #568 (deferred selector/materialization retry authority): **merged** into
@@ -25,10 +29,44 @@ Before merge:
    against the exact amended head.
 4. Full P0 regression must pass at the exact amended HEAD SHA.
 
-## AMEND PR #580 IN PLACE — Corrections applied 2026-09-08
+## AMEND PR #580 IN PLACE — Corrections applied 2026-09-09
 
-Six P0-class corrections applied surgically to `ap_entry_watcher.py` per
-the amendment specification. Scope boundary unchanged.
+The September 8/9 amendment applies the remaining recovery-admission and
+replacement-convergence corrections surgically. Scope boundary unchanged:
+PR #580 owns only recovered durable `PENDING_TRIGGER` watcher admission and
+its lifecycle/registry convergence.
+
+### Current amendment closure
+
+- Complete plan-to-row identity proof now covers local order, signal and
+  canonical signal IDs, exact client/mode, ticker, side, generation
+  authorities, watcher owner/token, and trigger generation/cursor authorities.
+  Missing, malformed, blank, conflicting, or whitespace-normalized identity
+  is HOLD. Recovery does not fabricate UUIDs, default side, or fall back to
+  `self.mode`.
+- Every generation authority (durable column, metadata/meta, and candidate)
+  is parsed independently as a strict positive integer. Zero, negative,
+  boolean, fractional, malformed, blank, row-only, candidate-only, and
+  conflicting values fail closed.
+- Production recovery requires exact OSM client identity, local order
+  identity, PostgreSQL connection, `FOR UPDATE` row lock, and an exact row.
+  Missing/non-string/blank identity or any lock/read failure is HOLD. The
+  explicit `_test_only_allow_recovery_without_row_lock` seam is test-only.
+- The lock remains held through final durable proof, canonical broker/
+  materializer handoff proof, lifecycle restoration, candidate registry/dedup
+  and per-call provenance commit. Candidate rollback is failure-atomic; an
+  unrepaired lifecycle transition is an explicit quarantine that blocks a
+  duplicate recovery attempt.
+- A replacement candidate becomes durable watcher owner first. The exact
+  displaced incumbent is then identity-reread, cancelled through the existing
+  `cancel_pending_entry` authority, reread as terminal, and only then removed
+  from `_pending` and dedup. Cancellation failure/exception/identity drift
+  preserves the incumbent byte-for-byte and returns HOLD.
+- A post-lock broker/materializer owner is reread before trigger dispatch;
+  the recovered callback is suppressed and no second economic attempt or
+  invented broker cancel is made.
+- `materialization_resume=True` remains on the existing #596 adoption-CAS
+  path and never enters the #580 transaction or lifecycle bridge.
 
 ### Correction 1 — Canonical broker handoff must block recovery before watcher admission
 
@@ -97,32 +135,35 @@ No changes made to `#568`/`#569` selector or materializer retry counters.
 `WATCHING → TRIGGER_READY` remains legal per existing `LEGAL_TRANSITIONS`.
 Recovery never creates a second broker submission attempt.
 
-## Implementation summary
+## Implementation summary (current amendment)
 
-Production files touched:
-- `ap_entry_watcher.py`: `_restore_recovered_watcher_lifecycle()` fully
-  hardened (Corrections 1-4), plus the exact durable plan/row identity fence
-  in `watch()` (Correction 6). New static method
-  `_recovery_has_broker_handoff_evidence()` is only an adapter to the existing
-  canonical broker/materialization predicates; it does not define new broker
-  evidence.
-  `add_signal()` reordered: validate → lifecycle → register.
-  Guarded by `signal["__recovery_rearm"]` — ordinary new admissions untouched.
-- `ap/pending_trigger_restart_recovery.py`: docstring only — documents
-  the recovery-provenance contract with the new bridge.
+Production files changed:
+- `ap_entry_watcher.py` — 430 insertions / 113 deletions. Changed recovery
+  identity/generation/final-authority helpers, row-lock fence, lifecycle
+  repair, candidate commit/replacement convergence, strict recovery `watch()`
+  construction, and `add_signal()`'s recovery-only constructor guard.
+- `ap_entry_watcher/__init__.py` — 36 insertions. Changed the package poll
+  dispatch seam to reread durable ownership after the admission lock.
 
-Supporting files:
-- `tests/test_p0_post_outage_trigger_lifecycle_convergence.py`: 22
-  tests. Fail-first replay for the PEP class, exact September 8 Jason LIVE
-  `watch()`/poll trace, lifecycle restoration matrix
-  (NONE/ADOPTED/WATCHING/terminal), non-recovery guard, identity gate
-  refusal, `NONE→TRIGGER_READY` invariant, and zero broker mutation.
-- `tests/test_p0_pending_trigger_lifecycle_integrity.py::TestPR580AmendmentCorrections`:
-  focused amendment-correction tests covering independent generation
-  authority and canonical broker-handoff behavior; unrelated baseline tests in that
-  historical file are not part of this PR's gate.
-- `.github/workflows/p0_regression.yml`: adds the new test to the P0
-  suite.
+Test/CI files changed:
+- `.github/workflows/p0_regression.yml` — 1 insertion / 1 deletion; exact-head
+  and merge-ref jobs run the complete lifecycle-integrity file plus the
+  canonical P0 inventory with PostgreSQL enabled.
+- `tests/test_p0_pending_trigger_lifecycle_integrity.py` — 542 insertions /
+  17 deletions; complete identity/generation/OSM-fence/lifecycle failure,
+  replacement convergence, materialization-resume isolation, and real
+  PostgreSQL lock-race coverage.
+- `tests/test_p0_post_outage_trigger_lifecycle_convergence.py` — 4 insertions;
+  explicit test-only fence seam for the September 8 Jason LIVE replay.
+- `tests/test_p0_reattach_no_cancel_on_missing_quote.py` — 5 insertions;
+  explicit test-only fence seam and complete identity fixture.
+- `tests/test_p0_seam4_e2e_deferred_lifecycle.py` — 34 insertions; preserves
+  the #596 materialization-resume argument and adoption-CAS in the harness.
+- `tests/test_p0_watcher_conflict_cancellation_proof.py` — 1 insertion;
+  explicit test-only fence seam.
+
+`ap/pending_trigger_restart_recovery.py` and all #596 production retry
+authority remain unchanged by this amendment.
 
 Files NOT touched (§4/§5 binding):
 - `ap_lifecycle.py`, `ap/order_monitor.py`, `ap/preopen_readiness.py`,
@@ -133,13 +174,13 @@ Files NOT touched (§4/§5 binding):
   schema. Zero new broker submit/cancel authority. No durable retry
   counter added.
 
-Focused status after this amendment:
-- `tests/test_p0_post_outage_trigger_lifecycle_convergence.py`: 22/22 pass
-- `tests/test_p0_pending_trigger_lifecycle_integrity.py::TestPR580AmendmentCorrections`:
-  26/26 pass
-- The full historical `tests/test_p0_pending_trigger_lifecycle_integrity.py`
-  file retains unrelated baseline failures on current main and is therefore
-  not used as the #580 gate target.
+Local status before publication: focused amendment class `83 passed, 1
+skipped`; the combined lifecycle/recovery set was green before the final
+constructor-guard test was added and is rerun for the final attestation.
+The local PostgreSQL lock-race test is skipped when
+`INTELLIGENCE_POSTGRES_TEST_URL` is absent; CI is the required PostgreSQL
+evidence. No local PostgreSQL server was available (`pg_isready` returned
+`localhost:5432 - no response`).
 
 This PR owns one failure class:
 
