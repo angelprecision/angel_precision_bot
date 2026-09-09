@@ -185,13 +185,15 @@ The local PostgreSQL lock-race test is skipped when
 evidence. No local PostgreSQL server was available (`pg_isready` returned
 `localhost:5432 - no response`).
 
-Exact-head and merge-ref CI run `34358392622` both passed the complete
-5,285-test inventory with PostgreSQL enabled: `p0-tests` job
-`102488819289` and `p0-merge-ref-tests` job `102488820035` each reported
-`5285 passed, 2 warnings`. The exact-head log records the real row-lock race,
-same/opposite durable replacement, cancellation-failure preservation,
-missing-OSM-client HOLD, materialization-resume isolation, and post-lock owner
-suppression tests as passed.
+The final exact-head and merge-ref CI run after the documentation attestation
+is `34358977197` on the final pushed branch head recorded in the PR body. Both
+jobs passed the complete 5,285-test inventory with PostgreSQL enabled:
+`p0-tests` job `102490772911` and `p0-merge-ref-tests` job `102490773249` each
+reported `5285 passed, 2 warnings`. The exact-head log records the real
+row-lock race, same/opposite durable replacement, cancellation-failure
+preservation, missing-OSM-client HOLD, materialization-resume isolation, and
+post-lock owner suppression tests as passed. The preceding code/test parent
+run was `34358392622` at `4a57c63bfa354b1c5dc7f8647f44c47b4ebd668c`.
 
 This PR owns one failure class:
 
