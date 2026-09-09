@@ -1749,11 +1749,78 @@ class APEntryWatcher:
             return bool(_collect_durable_terminal_reasons())
 
         def _terminal_reason_conflict() -> bool:
-            # Spec §8.2: multiple DISTINCT non-empty durable authorities is
-            # conflicting authority — HOLD fail-closed, never last-writer-wins.
-            # Duplicate identical reasons across fields are accepted as
-            # consistent proof.
-            return len(_collect_durable_terminal_reasons()) > 1
+            # Spec §8.2 + blocker #8: multiple DISTINCT non-empty CANONICAL
+            # durable authorities is conflicting authority — HOLD fail-closed,
+            # never last-writer-wins. Duplicate identical reasons across fields
+            # are accepted as consistent proof.
+            # meta.materialization_reason is a HISTORICAL diagnostic written
+            # by the materialization taxonomy; a later canonical terminal
+            # reason (e.g. restart_recovery_terminal_reason) on the same row
+            # is not a conflict with it. Exclude materialization_reason from
+            # the conflict count when at least one canonical terminal
+            # authority is present.
+            all_reasons = _collect_durable_terminal_reasons()
+            if len(all_reasons) <= 1:
+                return False
+            canonical: set[str] = set()
+            _canonical_fields = (
+                "last_error",  # from top-level; collector prefixes are unused
+            )
+            # Recollect distinguishing which came from which field.
+            canonical_vals: set[str] = set()
+            historical_vals: set[str] = set()
+            _le = row.get("last_error")
+            if _le:
+                canonical_vals.add(str(_le).strip())
+            for _f in (
+                "restart_recovery_terminal_reason",
+                "terminal_reason",
+                "reason_code",
+                "final_reason",
+                "watcher_invalidation_reason",
+            ):
+                _v = meta.get(_f)
+                if _v is not None and str(_v).strip():
+                    canonical_vals.add(str(_v).strip())
+            _mr = meta.get("materialization_reason")
+            if _mr is not None and str(_mr).strip():
+                historical_vals.add(str(_mr).strip())
+            canonical_vals.discard("")
+            historical_vals.discard("")
+            # If canonical authorities agree, historical diagnostic does not
+            # produce a conflict — it is legacy metadata.
+            if canonical_vals:
+                return len(canonical_vals) > 1
+            # No canonical authority — only historical. If more than one
+            # historical value exists, that is still ambiguous.
+            return len(historical_vals) > 1
+
+        def _collect_broker_handoff_markers() -> list[tuple[str, object]]:
+            # Blocker #2: canonical broker handoff evidence. Any of these on
+            # a terminal-family row means the row cannot be treated as
+            # ordinary terminal cleanup — broker ownership is still in flight
+            # or was in flight and needs reconciliation authority, not the
+            # watcher's terminal convergence path. Only pre-existing
+            # production markers are checked (no invented fields).
+            markers: list[tuple[str, object]] = []
+            _bid = row.get("broker_order_id")
+            if _bid is not None and str(_bid).strip():
+                markers.append(("broker_order_id", _bid))
+            _sts = row.get("submitted_ts")
+            if _sts is not None and str(_sts).strip():
+                markers.append(("submitted_ts", _sts))
+            for _f in (
+                "submit_intent_at",
+                "broker_submit_key",
+                "broker_submit_payload_hash",
+            ):
+                _v = meta.get(_f)
+                if _v is not None and str(_v).strip():
+                    markers.append((f"meta.{_f}", _v))
+            _br = meta.get("broker_ready")
+            if _br is True:
+                markers.append(("meta.broker_ready", True))
+            return markers
 
         def _identity_matches_watcher() -> bool:
             # Spec §9 + corrections #1/#2: prove the reread order still names the
@@ -1811,6 +1878,30 @@ class APEntryWatcher:
                 return False
             if _sig_mode and _row_mode and _sig_mode != _row_mode:
                 return False
+
+            # ── Blocker #5: signal identity. When the durable row carries a
+            # signal_id or canonical_signal_id, it must not conflict with the
+            # watcher's own signal identity. A missing durable signal_id is
+            # legacy-permissible (older rows preceded the taxonomy); a
+            # present-but-different value is a hard conflict.
+            _sig_sid = str(signal.get("signal_id") or "").strip()
+            _sig_canon = str(signal.get("canonical_signal_id") or "").strip()
+            _row_sid = str(row.get("signal_id") or "").strip()
+            _row_canon = str(row.get("canonical_signal_id") or "").strip()
+            if _row_sid and _sig_sid and _row_sid != _sig_sid:
+                return False
+            if _row_canon and _sig_canon and _row_canon != _sig_canon:
+                return False
+            # Cross-field conflict on the row itself is also a hold.
+            if _row_sid and _row_canon and _row_sid != _row_canon:
+                # Not always a conflict — canonical_signal_id may differ from
+                # per-instance signal_id when rehydrated; only conflict if
+                # both are present AND the watcher's signal identity matches
+                # neither.
+                if _sig_sid and _sig_sid not in {_row_sid, _row_canon}:
+                    return False
+                if _sig_canon and _sig_canon not in {_row_sid, _row_canon}:
+                    return False
             return True
 
         def _verify_submitted() -> tuple[str, str | None]:
@@ -1844,7 +1935,7 @@ class APEntryWatcher:
                 )
                 return "KEEP_WATCHER", None
             if _terminal_reason_conflict():
-                # Spec §8.2: conflicting durable authorities → HOLD.
+                # Spec §8.2: conflicting canonical durable authorities → HOLD.
                 log.critical(
                     "WATCHER_TERMINAL_CONVERGENCE_UNPROVEN "
                     "local_order_id=%s status=%s reason=conflicting_durable_terminal_reasons reasons=%s",
@@ -1857,10 +1948,28 @@ class APEntryWatcher:
                 # wrong row. Retain fail-closed.
                 log.critical(
                     "WATCHER_TERMINAL_CONVERGENCE_UNPROVEN "
-                    "local_order_id=%s status=%s reason=identity_mismatch_row_client_or_mode",
+                    "local_order_id=%s status=%s reason=identity_mismatch_row_client_mode_or_signal",
                     local_order_id, status,
                 )
                 return "KEEP_WATCHER", None
+            # Blocker #2: even a terminally-statused row with a valid reason
+            # and matching identity is not safe for ordinary terminal cleanup
+            # if broker ownership is still unresolved. Route to the existing
+            # RECONCILE_BROKER_INTENT authority (consumer treats it as
+            # retain), so no ordinary cleanup runs and no broker action
+            # fires. Never invent broker truth or convert unknown broker
+            # ownership into absent.
+            _bh_markers = _collect_broker_handoff_markers()
+            if _bh_markers:
+                log.critical(
+                    "WATCHER_TERMINAL_CONVERGENCE_UNPROVEN "
+                    "local_order_id=%s status=%s "
+                    "reason=broker_handoff_ambiguity_on_terminal_row "
+                    "markers=%s",
+                    local_order_id, status,
+                    [name for name, _ in _bh_markers],
+                )
+                return "RECONCILE_BROKER_INTENT", None
             return "TERMINAL_DURABLE", None
 
         def _verify_retry() -> tuple[str, str | None]:
@@ -1968,6 +2077,46 @@ class APEntryWatcher:
         if lifecycle == "MATERIALIZING":
             return "KEEP_WATCHER", meta.get("materialization_lease_until")
         return "UNKNOWN", None
+
+    def _prove_deferred_terminal_convergence(
+        self, watched
+    ) -> tuple[str, str | None]:
+        """PR #597 blocker #1: pre-dispatch convergence proof.
+
+        Called from ``_poll_active_signals`` immediately before ``on_trigger``
+        for a deferred watcher. Rereads the exact canonical order and, when
+        the reread proves TERMINAL_DURABLE (with full safety gates: reason
+        recognized, no reason conflict, exact identity match, no broker
+        handoff ambiguity), the caller MUST skip the callback entirely and
+        route to the terminal convergence cleanup path — no on_trigger,
+        no selector work, no materializer work, no broker POST/cancel.
+
+        Returns one of:
+          ``("TERMINAL_DURABLE", None)``  — safe to skip callback and clean up
+          ``("RECONCILE_BROKER_INTENT", None)`` — terminal row but broker
+                                                  ownership unresolved; caller
+                                                  retains ownership and lets
+                                                  the reconciler handle it.
+          ``("KEEP_WATCHER", None)`` — row not terminal, or terminal but a
+                                       safety gate blocks convergence.
+          ``("UNKNOWN", None)`` — reread unavailable; caller must not
+                                  skip the callback on this evidence.
+
+        Delegates to ``_resolve_trigger_callback_disposition`` with a
+        synthetic TERMINAL_DURABLE claim so the exact same vocabulary,
+        identity, conflict, and broker-handoff logic runs in both seams.
+        This is deliberate: any behavior drift between pre-dispatch and
+        post-callback would reopen the ownership-split defect this PR
+        exists to close.
+        """
+        # Only deferred watchers use the durable reread contract. Non-deferred
+        # signals have their own submit gate; do not repurpose their behavior.
+        signal = getattr(watched, "signal", {}) or {}
+        if not self._is_deferred_signal(signal):
+            return "KEEP_WATCHER", None
+        return self._resolve_trigger_callback_disposition(
+            watched, {"disposition": "TERMINAL_DURABLE"}
+        )
 
     def _dedup_key_for_signal(self, signal: dict) -> str:
         return str(signal.get("signal_id") or "").strip()
@@ -5910,12 +6059,61 @@ class APEntryWatcher:
                         )
                         continue
 
+                    # ── PR #597 blocker #1: pre-dispatch terminal convergence ──
+                    # If the canonical row is ALREADY durably terminal before
+                    # we call on_trigger — a race the Sep-8 TMO incident
+                    # showed — we must NOT enter the callback at all. Reread
+                    # right here at the dispatch boundary and, when terminal
+                    # truth is proven safe (reason + identity + no broker
+                    # handoff ambiguity), inject a synthetic TERMINAL_DURABLE
+                    # disposition and route through the exact same cleanup
+                    # path the post-callback branch uses.
+                    _pre_terminal, _ = self._prove_deferred_terminal_convergence(w)
+                    if _pre_terminal == "TERMINAL_DURABLE":
+                        # Emit the diagnostic pairing that proves callback
+                        # was intentionally skipped by pre-dispatch proof.
+                        try:
+                            _pre_sig = getattr(w, "signal", {}) or {}
+                            log.info(
+                                "WATCHER_TERMINAL_PRE_DISPATCH_SKIP "
+                                "local_order_id=%s signal_id=%s ticker=%s "
+                                "on_trigger_called=false selector_called=false "
+                                "broker_submit=NOT_ATTEMPTED "
+                                "broker_cancel=NOT_ATTEMPTED",
+                                str(_pre_sig.get("local_order_id") or "?"),
+                                _sig_id or "?",
+                                w.ticker,
+                            )
+                        except Exception:
+                            pass
+                        # Route to the shared cleanup + convergence log by
+                        # synthesizing the disposition — callback body is
+                        # deliberately not invoked. NOTE: this deliberately
+                        # bypasses w._trigger_attempts reset because the
+                        # attempt was never made.
+                        _callback_disposition = "TERMINAL_DURABLE"
+                        _callback_next_retry = None
+                        _callback_result = None
+                        _pre_dispatch_convergence = True
+                    else:
+                        _pre_dispatch_convergence = False
+
                     # ── Call the trigger callback — timestamps are now durable ──
+                    if _pre_dispatch_convergence:
+                        # Skip the try-block entirely; we already have the
+                        # synthesized disposition. Fall through to the
+                        # existing disposition consumer below by re-entering
+                        # its structure inline (mirrors the try-branch
+                        # exactly for TERMINAL_DURABLE ONLY).
+                        _skip_on_trigger = True
+                    else:
+                        _skip_on_trigger = False
                     try:
-                        _callback_result = self.on_trigger(w)
-                        _callback_disposition, _callback_next_retry = (
-                            self._resolve_trigger_callback_disposition(w, _callback_result)
-                        )
+                        if not _skip_on_trigger:
+                            _callback_result = self.on_trigger(w)
+                            _callback_disposition, _callback_next_retry = (
+                                self._resolve_trigger_callback_disposition(w, _callback_result)
+                            )
                         if _callback_disposition in {"RETRY_WAIT", "KEEP_WATCHER", "RECONCILE_BROKER_INTENT"}:
                             with self._lock:
                                 w.state = WatchState.PENDING
@@ -5962,17 +6160,44 @@ class APEntryWatcher:
                         _wid = id(w)
                         with self._lock:
                             self._pending = [_p for _p in self._pending if id(_p) != _wid]
-                        # PR #597 corrections #7/#8: track dedup outcome instead
-                        # of swallowing it, so the post-cleanup convergence log
-                        # reports truthful values rather than always
-                        # dedup_released=true.
-                        _ded_released = True
+                        # PR #597 blocker #3: real dedup POSTCONDITION proof.
+                        # WatchedSignal._release_dedup_key() swallows its own
+                        # exceptions internally, so a try/except around it is
+                        # NOT proof of successful release. Capture the signal
+                        # identity, call the helper, then verify the exact
+                        # dedup key is no longer in the actual registry.
+                        _ded_signal_id = str(getattr(w, "signal_id", "") or "").strip()
+                        _ded_pre_present = False
+                        with self._lock:
+                            if _ded_signal_id:
+                                _ded_pre_present = _ded_signal_id in self._dedup_set
                         _ded_error: str | None = None
                         try:
                             w._release_dedup_key()
                         except Exception as _dd_exc:
-                            _ded_released = False
                             _ded_error = f"{type(_dd_exc).__name__}: {str(_dd_exc)[:180]}"
+                        # Verify the postcondition against the real registry.
+                        with self._lock:
+                            _ded_post_present = (
+                                bool(_ded_signal_id)
+                                and _ded_signal_id in self._dedup_set
+                            )
+                        # dedup_released is TRUE only when we can prove the
+                        # exact key is absent from the registry. If the key
+                        # was never present (e.g. the watcher was constructed
+                        # without registering), we still record true because
+                        # there is no residue to clean; the failure mode we
+                        # care about is "we called release and the key is
+                        # still there".
+                        _ded_released = (
+                            _ded_error is None
+                            and not _ded_post_present
+                        )
+                        if not _ded_released and _ded_error is None:
+                            _ded_error = (
+                                "helper_returned_without_removing_key "
+                                f"(pre_present={_ded_pre_present}, post_present=True)"
+                            )
                         # PR #597 §14: emit the paired convergence proof only
                         # AFTER cleanup has been observed. If cleanup could not
                         # be proven, emit CONVERGENCE_UNPROVEN with the exact
@@ -6034,9 +6259,11 @@ class APEntryWatcher:
                                 pass
                         log.info(
                             "WATCHER_TRIGGER_CALLBACK_OK ticker=%s signal_id=%s "
-                            "removed_from_pending=true dedup_released=true "
+                            "removed_from_pending=true dedup_released=%s "
                             "timestamps_pre_persisted=%s",
-                            w.ticker, _sig_id or "?", _ts_pre_write_ok,
+                            w.ticker, _sig_id or "?",
+                            str(_ded_released).lower(),
+                            _ts_pre_write_ok,
                         )
                         # Post-success: log marker only — timestamps already durable.
                         log.debug(

@@ -669,3 +669,159 @@ identity, position/proof, LEGAL_TRANSITIONS, reconciler.
   pre-existing tests updated to include identity fields).
 - `test_p0_seam4_e2e_deferred_lifecycle.py`: 94 passed, no regression.
 - `test_p0_selector_cursor_strictness.py`: 191 passed, no regression.
+
+---
+
+## 21. Second-audit corrections record (2026-09-08, third pass)
+
+Head amended in place from `6dd4d25dc8f3` in response to the second-pass
+audit enumerating 11 remaining blockers. PR remains draft / HARD HOLD.
+
+### 21.1 Blocker #1 — Real terminal-before-callback race closed
+
+Added `_prove_deferred_terminal_convergence()` helper (delegates to the
+same resolver, so pre-dispatch and post-callback share vocabulary
+exactly). Wired into `_poll_active_signals()` immediately before the
+`self.on_trigger(w)` seam: if the reread proves TERMINAL_DURABLE with
+all safety gates (reason present, no conflict, exact identity, NO
+broker handoff), the callback is bypassed entirely and the same
+convergence cleanup path runs. Emits
+`WATCHER_TERMINAL_PRE_DISPATCH_SKIP` with
+`on_trigger_called=false selector_called=false broker_submit=NOT_ATTEMPTED`.
+
+Proven in `TestPollDispatchPreTerminalConvergence` via the real
+`_poll_active_signals()` — not the resolver in isolation:
+
+- terminal-before-dispatch → `on_trigger` count = 0, broker calls = 0,
+  watcher removed, dedup released, pre-dispatch skip diagnostic emitted;
+- row PENDING at dispatch → terminal AFTER callback begins → callback
+  runs once, resolver reread wins terminal, watcher removed, no second
+  callback, no second economic action;
+- unrelated watcher on the same ticker is unaffected by convergence.
+
+### 21.2 Blocker #2 — Broker-handoff fence on terminal-family rows
+
+`_verify_terminal()` now collects broker handoff evidence via
+`_collect_broker_handoff_markers()` using only existing production
+markers: `broker_order_id`, `submitted_ts`, `meta.submit_intent_at`,
+`meta.broker_submit_key`, `meta.broker_submit_payload_hash`, and
+`meta.broker_ready=True`. If any is present on a terminal-family row,
+the verifier returns `RECONCILE_BROKER_INTENT` (consumer already
+handles as retain) and emits
+`WATCHER_TERMINAL_CONVERGENCE_UNPROVEN reason=broker_handoff_ambiguity_on_terminal_row`
+with the marker names. Never invents broker truth; never converts
+UNKNOWN broker ownership into absent.
+
+Proven in `TestBrokerHandoffFence` — parametrised over all six canonical
+markers on CANCELED, plus ERROR + broker_order_id, ERROR + submitted_ts;
+regression pin for a clean terminal row still converging; and
+`broker_ready=False` is not a marker.
+
+### 21.3 Blocker #3 — Real dedup postcondition proof
+
+`_release_dedup_key()` swallows exceptions internally, so absence of an
+exception is NOT proof of release. The consumer now captures the exact
+signal_id, calls the helper, then verifies against the exact `_dedup_set`
+whether the key is truly absent post-hoc. `_ded_released=True` only when
+the postcondition holds; otherwise the log carries the real state and
+`WATCHER_TERMINAL_CONVERGENCE_UNPROVEN` is emitted.
+
+`WATCHER_TRIGGER_CALLBACK_OK` no longer hardcodes `dedup_released=true`;
+it now interpolates the verified `_ded_released` value.
+
+Proven in `TestDedupPostconditionProof` — one test drives the real
+production `_release_dedup_key` and asserts the key vanishes from
+`_dedup_set`; the second neuters the helper to a silent no-op, drives
+the poll, and asserts the diagnostic reports the true state.
+
+### 21.4 Blocker #4 — Real _direction_claims convergence
+
+`TestRealDirectionClaimConvergence::test_terminal_winner_direction_claim_pruned`
+seeds real `_direction_claims[(client, execution_mode, ticker)]` entries
+with production-shape `winner_local_order_id` / `winner_signal_id`,
+installs both a TMO terminal watcher AND an unrelated live AAPL watcher
+in real `_pending`, drives real `_poll_active_signals()`, and asserts:
+
+- TMO direction claim is pruned by the shim's existing stale-claim
+  pruning after convergence removes the TMO watcher from `_pending`;
+- AAPL direction claim survives untouched because its winner is still
+  active in `_pending`;
+- no broker action, no ticker-wide eviction.
+
+Behavior B from the audit ("shim's stale-claim pruning observes the
+winner disappeared and cleans up at the immediately expected safe
+boundary") is the actual production authority — proven end-to-end.
+
+### 21.5 Blocker #5 — Signal identity at terminal eviction
+
+`_identity_matches_watcher()` now compares `signal_id` and
+`canonical_signal_id` when durable authority carries them. Missing
+durable signal_id is legacy-permissible; present-but-different is a
+hard conflict. Proven in `TestSignalIdentityCheck`.
+
+### 21.6 Blocker #6 — Real production consumer (no replicas)
+
+Every convergence assertion now drives the actual `_poll_active_signals()`
+loop via real WatchedSignal in real `_pending` with real `_dedup_set`
+and (where applicable) real `_direction_claims`. The old
+"copy-the-block-into-the-test" pattern is retired.
+
+### 21.7 Blocker #7 — Tests 19 and 20
+
+- `TestTwoObserverIdempotency::test_two_polls_on_same_terminal_row_are_idempotent`:
+  two consecutive polls; second is a no-op; no callback resurrection;
+  no state corruption; zero broker action.
+- `TestRestartNoRehydrate::test_terminal_row_does_not_rehydrate_via_watcher`:
+  fresh watcher (simulated restart) with terminal durable row and no
+  installed WatchedSignal — `_poll_active_signals` does not manufacture
+  a behavior-active watcher for that row; `_pending` remains free of it.
+
+### 21.8 Blocker #8 — Historical vs canonical reason conflict
+
+`_terminal_reason_conflict()` distinguishes canonical authorities
+(`last_error` + 5 canonical meta fields) from the historical
+`materialization_reason` diagnostic. When at least one canonical
+authority is present, the historical diagnostic does not count in the
+conflict check. Multiple distinct canonical authorities still HOLD.
+Proven in `TestHistoricalVsCanonicalReason`.
+
+### 21.9 Blocker #9 — Money-path parametrised proof (final)
+
+`TestMoneyPathFinal` parametrises across ten fail-closed shapes
+(missing client, whitespace client, missing mode, PAPER-vs-LIVE,
+missing local_order_id, conflicting reasons, broker_order_id present,
+submit_intent_at present, broker_ready=True, signal_id conflict) and
+asserts zero broker submit, zero broker cancel, zero OSM write paths,
+zero position/proof mutation.
+
+### 21.10 Non-overlap held (blocker #10)
+
+Diff remains inside terminal watcher convergence only:
+
+- `ap_entry_watcher.py` — `_resolve_trigger_callback_disposition`
+  internals, one new helper method `_prove_deferred_terminal_convergence`,
+  the pre-dispatch check inside `_poll_active_signals`, and truthful
+  post-cleanup logging;
+- `tests/test_p0_pr597_terminal_watcher_convergence.py` — full rewrite;
+- `tests/test_p0_amendment4_watcher_callback_verification.py` — two
+  pre-existing tests updated to include the identity fields production
+  terminal rows always carry (from the previous amendment; unchanged now);
+- `docs/pr_specs/p0_terminal_watcher_convergence_20260908.md` — §21 record;
+- `.github/workflows/p0_regression.yml` — 597 test wired into CI (unchanged).
+
+Untouched: `LEGAL_TRANSITIONS`, retry taxonomy, selector scoring,
+spread/OI/volume/delta/DTE gates, earnings policy, sizing, risk,
+broker submit implementation, broker cancel implementation, positions,
+proof trades, exits, scanner behavior, sector identity.
+
+### 21.11 Test counts
+
+- PR #597 own suite (head, real poll loop): **77 passed** in ~3m44s (real
+  DB retries during audit inserts extend runtime; production semantics
+  are unchanged).
+- Fail-first on rebased base (resolver-only fast subset): **18 failed
+  / 50 passed** covering TMO replay, every authority test, broker-handoff
+  fence, signal identity, structural anchors.
+- `test_p0_amendment4_watcher_callback_verification.py`: 30/30.
+- `test_p0_seam4_e2e_deferred_lifecycle.py`: 94/94.
+- `test_p0_selector_cursor_strictness.py`: 191/191.
