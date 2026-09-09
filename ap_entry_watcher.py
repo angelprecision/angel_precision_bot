@@ -1756,35 +1756,60 @@ class APEntryWatcher:
             return len(_collect_durable_terminal_reasons()) > 1
 
         def _identity_matches_watcher() -> bool:
-            # Spec §9: prove the reread order still names the same identity
-            # the watcher owns before allowing eviction. Never let a
-            # bad/missing identity evict a different watcher.
+            # Spec §9 + corrections #1/#2: prove the reread order still names the
+            # same identity the watcher owns before allowing eviction. Runtime
+            # watcher and restart recovery must agree — recovery already fails
+            # closed on missing/blank/malformed durable identity, and the
+            # runtime verifier must not silently accept absent identity as
+            # agreement. Wrong OR missing required identity must never evict.
+
+            # ── Local order id: both sides must be present and identical.
             _sig_local = str(signal.get("local_order_id") or "").strip()
             _row_local = str(row.get("local_order_id") or "").strip()
             if not _sig_local or not _row_local or _sig_local != _row_local:
                 return False
-            # Client identity — accept client_id or legacy client_email.
+
+            # ── Client identity: durable row must carry it whenever runtime
+            # or signal advertises it. Empty/whitespace never counts as
+            # agreement.
             _sig_client = str(
                 signal.get("client_id") or signal.get("client_email") or ""
             ).strip().lower()
-            _row_client = str(
-                row.get("client_id") or row.get("client_email") or ""
-            ).strip().lower()
+            _row_client_id = str(row.get("client_id") or "").strip().lower()
+            _row_client_email = str(row.get("client_email") or "").strip().lower()
+            _row_client = _row_client_id or _row_client_email
             _runtime_client = str(getattr(self, "client_id", "") or "").strip().lower()
-            # If watcher runtime has a client, row must match it.
+            # If runtime or signal knows the client, row MUST also know it.
+            if (_runtime_client or _sig_client) and not _row_client:
+                return False
+            # If row carries both aliases, they must not conflict with each other.
+            if _row_client_id and _row_client_email and _row_client_id != _row_client_email:
+                return False
+            # If both sides are populated, they must match.
             if _runtime_client and _row_client and _runtime_client != _row_client:
                 return False
-            # If signal carries a client, row must match it.
             if _sig_client and _row_client and _sig_client != _row_client:
                 return False
-            # Execution mode identity — mirror recovery terminalizer's lower-case comparison.
+
+            # ── Execution mode: same rules. Restart recovery already treats
+            # missing/blank mode as UNRESOLVED — the runtime verifier must
+            # not treat it as tacit LIVE agreement.
             _row_mode = str(row.get("execution_mode") or "").strip().lower()
             _runtime_mode = str(
                 getattr(self, "execution_mode", "")
                 or getattr(self, "mode", "")
                 or ""
             ).strip().lower()
+            _sig_mode = str(signal.get("execution_mode") or "").strip().lower()
+            # If runtime or signal knows the mode, row MUST also know it.
+            if (_runtime_mode or _sig_mode) and not _row_mode:
+                return False
+            # Mode value must be one of the canonical two — no invented aliases.
+            if _row_mode and _row_mode not in {"live", "paper"}:
+                return False
             if _runtime_mode and _row_mode and _runtime_mode != _row_mode:
+                return False
+            if _sig_mode and _row_mode and _sig_mode != _row_mode:
                 return False
             return True
 
@@ -1893,6 +1918,17 @@ class APEntryWatcher:
             if lease <= datetime.now(timezone.utc):
                 return "KEEP_WATCHER", None
             return "OWNERSHIP_TRANSFERRED", None
+
+        # ── PR #597 §11: durable terminal truth wins over any stale claim ──
+        # When the reread canonical row is in the terminal status family, it
+        # is later authority than the in-memory callback context. Route to
+        # _verify_terminal (which enforces reason + identity + conflict
+        # safety) BEFORE the claim router so a callback that returns SUBMITTED
+        # / RETRY_WAIT / OWNERSHIP_TRANSFERRED after a concurrent recovery
+        # terminalization cannot mask the durable terminal truth. Non-terminal
+        # rereads fall through to the existing claim routing unchanged.
+        if _terminal_family():
+            return _verify_terminal()
 
         # ── Route the claim through its verifier ──────────────────────
         if claimed_disposition == "SUBMITTED":
@@ -5916,12 +5952,38 @@ class APEntryWatcher:
                             raise RuntimeError(
                                 "deferred_trigger_callback_returned_without_durable_outcome"
                             )
-                        # PR #597 §14: emit structured convergence proof when
-                        # a terminal durable reread evicts the watcher. This
-                        # is the paired-success side of the HOLD diagnostics
-                        # emitted by _verify_terminal(); together they let an
-                        # auditor prove watcher/canonical ownership never split.
+                        w._trigger_attempts = 0   # reset on success
+                        # ── P0 (PR #304) Bug B: explicit removal on SUCCESS.
+                        # Since Bug B fix stopped removing triggered watchers
+                        # upfront (they used to zombie on retry), success now
+                        # needs an explicit removal so the watcher doesn't
+                        # re-fire on the next poll cycle. Uses id-based match
+                        # to avoid mutating _pending during callback iteration.
+                        _wid = id(w)
+                        with self._lock:
+                            self._pending = [_p for _p in self._pending if id(_p) != _wid]
+                        # PR #597 corrections #7/#8: track dedup outcome instead
+                        # of swallowing it, so the post-cleanup convergence log
+                        # reports truthful values rather than always
+                        # dedup_released=true.
+                        _ded_released = True
+                        _ded_error: str | None = None
+                        try:
+                            w._release_dedup_key()
+                        except Exception as _dd_exc:
+                            _ded_released = False
+                            _ded_error = f"{type(_dd_exc).__name__}: {str(_dd_exc)[:180]}"
+                        # PR #597 §14: emit the paired convergence proof only
+                        # AFTER cleanup has been observed. If cleanup could not
+                        # be proven, emit CONVERGENCE_UNPROVEN with the exact
+                        # reason — never lie that convergence succeeded, and
+                        # never re-enter broker work over a bookkeeping failure
+                        # (the durable order remains terminal).
                         if _callback_disposition == "TERMINAL_DURABLE":
+                            with self._lock:
+                                _watcher_removed = all(
+                                    id(_p) != _wid for _p in self._pending
+                                )
                             try:
                                 _sig = getattr(w, "signal", {}) or {}
                                 _conv_local_oid = str(_sig.get("local_order_id") or "").strip()
@@ -5935,34 +5997,41 @@ class APEntryWatcher:
                                     or getattr(self, "mode", "")
                                     or ""
                                 ).strip()
-                                log.info(
-                                    "WATCHER_TERMINAL_DURABLE_CONVERGED "
-                                    "local_order_id=%s client_id=%s execution_mode=%s "
-                                    "signal_id=%s ticker=%s "
-                                    "watcher_removed=pending broker_submit=NOT_ATTEMPTED "
-                                    "broker_cancel=NOT_ATTEMPTED",
-                                    _conv_local_oid or "?",
-                                    _conv_client or "?",
-                                    _conv_mode or "?",
-                                    _sig_id or "?",
-                                    w.ticker,
-                                )
+                                if _watcher_removed and _ded_released:
+                                    log.info(
+                                        "WATCHER_TERMINAL_DURABLE_CONVERGED "
+                                        "local_order_id=%s client_id=%s execution_mode=%s "
+                                        "signal_id=%s ticker=%s "
+                                        "watcher_removed=true dedup_released=true "
+                                        "broker_submit=NOT_ATTEMPTED "
+                                        "broker_cancel=NOT_ATTEMPTED",
+                                        _conv_local_oid or "?",
+                                        _conv_client or "?",
+                                        _conv_mode or "?",
+                                        _sig_id or "?",
+                                        w.ticker,
+                                    )
+                                else:
+                                    log.critical(
+                                        "WATCHER_TERMINAL_CONVERGENCE_UNPROVEN "
+                                        "local_order_id=%s client_id=%s execution_mode=%s "
+                                        "signal_id=%s ticker=%s "
+                                        "reason=cleanup_incomplete "
+                                        "watcher_removed=%s dedup_released=%s "
+                                        "dedup_error=%s "
+                                        "broker_submit=NOT_ATTEMPTED "
+                                        "broker_cancel=NOT_ATTEMPTED",
+                                        _conv_local_oid or "?",
+                                        _conv_client or "?",
+                                        _conv_mode or "?",
+                                        _sig_id or "?",
+                                        w.ticker,
+                                        _watcher_removed,
+                                        _ded_released,
+                                        _ded_error or "none",
+                                    )
                             except Exception:
                                 pass
-                        w._trigger_attempts = 0   # reset on success
-                        # ── P0 (PR #304) Bug B: explicit removal on SUCCESS.
-                        # Since Bug B fix stopped removing triggered watchers
-                        # upfront (they used to zombie on retry), success now
-                        # needs an explicit removal so the watcher doesn't
-                        # re-fire on the next poll cycle. Uses id-based match
-                        # to avoid mutating _pending during callback iteration.
-                        with self._lock:
-                            _wid = id(w)
-                            self._pending = [_p for _p in self._pending if id(_p) != _wid]
-                        try:
-                            w._release_dedup_key()
-                        except Exception:
-                            pass
                         log.info(
                             "WATCHER_TRIGGER_CALLBACK_OK ticker=%s signal_id=%s "
                             "removed_from_pending=true dedup_released=true "

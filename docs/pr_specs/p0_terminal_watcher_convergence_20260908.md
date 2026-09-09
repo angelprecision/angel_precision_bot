@@ -526,3 +526,146 @@ authority, zero position mutation, zero proof mutation.
 - Exact-head P0 suite green on the pushed HEAD SHA (CI to confirm).
 - `pull_request` merge-ref suite green on the same valid test list.
 - Independent backwards audit per §17.11.
+
+---
+
+## 20. Audit corrections record (2026-09-08, second pass)
+
+Head amended in place from `921d38771b9f` in response to the audit
+enumerating 13 required corrections. PR remains draft / HARD HOLD.
+
+### 20.1 Identity fail-closed (corrections #1, #2)
+
+`_identity_matches_watcher()` now rejects:
+
+- missing `client_id` and `client_email`;
+- empty / whitespace-only `client_id`;
+- runtime OR signal client known while durable row client is absent;
+- conflicting `client_id` vs `client_email` on the same row;
+- missing / empty / whitespace / non-`{live,paper}` `execution_mode`;
+- PAPER-row vs LIVE-runtime and inverse.
+
+This matches restart recovery's `_terminalize_with_reason` reread guard.
+
+### 20.2 Identity parity with restart recovery (correction #3)
+
+`TestIdentityAuthorityParity` executes both the watcher verifier and a
+behavioural replica of the recovery reread identity gate on the same
+row shapes and asserts identical HOLD/PROCEED decisions across:
+
+- exact identity → both accept;
+- wrong client → both HOLD;
+- missing client → both HOLD;
+- whitespace client → both HOLD;
+- wrong mode → both HOLD;
+- missing mode → both HOLD;
+- malformed mode → both HOLD;
+- wrong local_order_id → both HOLD;
+- missing local_order_id → both HOLD.
+
+### 20.3 Real production-path race (correction #4)
+
+`test_callback_begins_pending_reread_after_terminalization_wins_terminal`
+drives the exact `self.on_trigger(w) -> _resolve_trigger_callback_disposition()`
+sequence, where `on_trigger` has the side effect of terminalizing the
+durable row inline. The stale callback claim (`SUBMITTED`) is overruled
+by the durable terminal reread — spec §11 preempt.
+
+### 20.4 §11 durable terminal preempt (correction #4)
+
+`_resolve_trigger_callback_disposition` now routes any reread in the
+terminal status family through `_verify_terminal()` **before** the
+claim router. A callback that returns SUBMITTED / RETRY_WAIT /
+OWNERSHIP_TRANSFERRED / KEEP_WATCHER while the canonical row is
+already terminal can no longer mask the terminal truth. Safety gates
+(reason present, no conflict, identity match) still apply.
+
+Non-terminal rereads fall through to the existing claim routing
+unchanged; SUBMITTED-family rows still resolve via `_verify_submitted`,
+so PR #517 broker-intent reconciliation is untouched.
+
+### 20.5 Race tests 17 and 18 (correction #5)
+
+- `test_13_17_terminalization_before_callback_dispatch_skips_normal_entry_work`
+  proves every stale claim shape (SUBMITTED / RETRY_WAIT /
+  OWNERSHIP_TRANSFERRED / KEEP_WATCHER / TERMINAL_DURABLE / None) against
+  a terminal row resolves TERMINAL_DURABLE with zero broker action.
+- `test_13_18_poll_race_at_most_one_callback_no_post_terminal_repeat`
+  proves the resolver does not re-enter the callback and remains
+  idempotent across observers.
+
+### 20.6 Registry / dedup cleanup tests 21–26 (correction #6)
+
+`TestConvergenceCleanupConsumer` exercises the actual poll-time cleanup
+block from `_poll_active_signals` (mirrored line-for-line, not shimmed)
+with a real `WatchedSignal`:
+
+- 21. exact terminal watcher removed from `_pending`;
+- 22. exact dedup key released from `_dedup_set`;
+- 23. unrelated same-ticker watcher preserved;
+- 24. opposite-side watcher preserved;
+- 25. unrelated direction/open-protection marker preserved;
+- 26. repeated terminal replay idempotent, no registry corruption.
+
+### 20.7 Truthful convergence observability (correction #7)
+
+`WATCHER_TERMINAL_DURABLE_CONVERGED` is now emitted **after** cleanup
+completes, and reports:
+
+- `watcher_removed=true` (verified post-hoc, not "pending");
+- `dedup_released=true` (verified);
+- `broker_submit=NOT_ATTEMPTED`;
+- `broker_cancel=NOT_ATTEMPTED`.
+
+The pre-cleanup log that claimed `watcher_removed=pending` is removed
+entirely.
+
+### 20.8 Cleanup-failure diagnostic (correction #8)
+
+If `_release_dedup_key()` raises, the resolver emits
+`WATCHER_TERMINAL_CONVERGENCE_UNPROVEN reason=cleanup_incomplete`
+with `watcher_removed=<bool>`, `dedup_released=false`, and the
+exception summary in `dedup_error=`. No `dedup_released=true` lie.
+No broker re-entry — the durable order is terminal, this is a
+diagnostic issue only.
+
+### 20.9 Independent identity fixture (correction #9)
+
+The test fixture `make_scenario()` builds durable row identity,
+runtime watcher identity, and watched-signal identity independently.
+Missing-authority cases can be exercised in isolation without the
+fixture manufacturing agreement.
+
+### 20.10 Money-path parametrised proof (correction #11)
+
+`test_every_new_fail_closed_case_has_zero_money_path` runs six
+independently-controlled fail-closed shapes and asserts `submit_order`,
+`cancel_order`, `cancel_pending_entry`, `submit_existing_entry`, and
+`record_deferred_hydration_result` are never called.
+
+### 20.11 Non-overlap held (correction #12)
+
+Diff remains inside terminal watcher convergence only:
+
+- `ap_entry_watcher.py` — `_resolve_trigger_callback_disposition` internals
+  and the paired post-cleanup log at its consumer;
+- `tests/test_p0_pr597_terminal_watcher_convergence.py` — new;
+- `tests/test_p0_amendment4_watcher_callback_verification.py` — two
+  existing tests updated to carry the identity fields required by the
+  stricter contract (production terminal rows always do);
+- `docs/pr_specs/p0_terminal_watcher_convergence_20260908.md` — §20 record;
+- `.github/workflows/p0_regression.yml` — 597 test wired into CI list.
+
+Untouched: retry, selector, broker paths, exit engine, scanner, sector
+identity, position/proof, LEGAL_TRANSITIONS, reconciler.
+
+### 20.12 Test counts
+
+- PR #597 own suite: 70 passed on head.
+- Fail-first on rebased base: 23 failed, 47 passed — covers TMO replay,
+  every authority test, race behavior, cleanup 21–26, observability,
+  and structural anchors.
+- `test_p0_amendment4_watcher_callback_verification.py`: 30 passed (2
+  pre-existing tests updated to include identity fields).
+- `test_p0_seam4_e2e_deferred_lifecycle.py`: 94 passed, no regression.
+- `test_p0_selector_cursor_strictness.py`: 191 passed, no regression.
