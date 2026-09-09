@@ -2829,6 +2829,23 @@ class APEntryWatcher:
             or str(merged_meta.get("materialization_status") or "").strip().upper()
             == "RUNNING"
         )
+        if _materialization_active_shape:
+            # Any active shape is competing authority.  It is not safe to
+            # interpret a missing owner/lease as "no owner"; require the
+            # canonical complete proof before allowing this recovery fence to
+            # proceed.  The canonical predicate fails closed for missing,
+            # malformed, stale, or contradictory active metadata.
+            try:
+                from ap.pending_trigger_classifier import (
+                    is_active_materialization_in_flight,
+                )
+
+                _active_row = dict(row)
+                _active_row["meta"] = merged_meta
+                if not is_active_materialization_in_flight(_active_row):
+                    return False, "recovery_lifecycle_hold_materialization_authority", row
+            except Exception:
+                return False, "recovery_lifecycle_hold_materialization_authority", row
         for key in ("materialization_owner", "materialization_lease_until"):
             raw = merged_meta.get(key)
             if raw is not None and not isinstance(raw, str):
@@ -6435,7 +6452,9 @@ class APEntryWatcher:
         finally:
             signal_dict.pop("__watcher_rearm_pending", None)
             signal_dict.pop("__watcher_rearm_reason", None)
-            signal_dict.pop("__recovery_rearm", None)
+            # WatchedSignal retains this exact signal mapping.  Keep the
+            # recovery marker through dispatch so the poll-time final durable
+            # claim is reached; only the arm-time rearm markers are consumed.
         if not ok:
             # add_signal already logged the audit for locked-path blocks (dedup/opposite/same-side).
             # Attempt a best-effort DB persist here using the full signal context available in watch().

@@ -2425,10 +2425,6 @@ class APOrderStateMachine:
                 sources.append(dict(parsed))
             return sources
 
-        _row_metadata_sources = _metadata_sources(row if isinstance(row, dict) else {})
-        if _row_metadata_sources is None:
-            return False
-
         def _meta(row: dict) -> dict | None:
             sources = _metadata_sources(row)
             if sources is None:
@@ -2527,6 +2523,13 @@ class APOrderStateMachine:
                 if not isinstance(row, dict):
                     return False
                 if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+                    return False
+                # Parse metadata only after the exact row selected by the
+                # FOR UPDATE claim boundary has been loaded.  Never fall back
+                # to a synthetic empty row: absent or malformed durable
+                # metadata is unknown authority and must fail closed.
+                _row_metadata_sources = _metadata_sources(row)
+                if _row_metadata_sources is None:
                     return False
                 if _handoff(row):
                     return False

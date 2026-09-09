@@ -1109,6 +1109,86 @@ class TestPR580AmendmentCorrections:
         assert "broker_handoff" in reason or "hold" in reason
         assert L.LEDGER.current_state(sig["signal_id"]) is None
 
+    @pytest.mark.parametrize(
+        "active_patch",
+        [
+            {
+                "lifecycle_state": "MATERIALIZING",
+                "materialization_status": "RUNNING",
+                "materialization_in_flight": True,
+                "materialization_lease_until": "2099-01-01T00:00:00+00:00",
+            },
+            {
+                "lifecycle_state": "MATERIALIZING",
+                "materialization_status": "RUNNING",
+                "materialization_in_flight": True,
+                "materialization_owner": "   ",
+                "materialization_lease_until": "2099-01-01T00:00:00+00:00",
+            },
+            {
+                "lifecycle_state": "MATERIALIZING",
+                "materialization_status": "RUNNING",
+                "materialization_in_flight": True,
+                "materialization_owner": "materializer:missing-lease",
+            },
+            {
+                "lifecycle_state": "WATCHING",
+                "materialization_status": "RUNNING",
+                "materialization_in_flight": True,
+                "materialization_lease_until": "2099-01-01T00:00:00+00:00",
+            },
+            {
+                "lifecycle_state": "MATERIALIZING",
+                "materialization_status": "RUNNING",
+                "materialization_in_flight": True,
+                "materialization_owner": "materializer:incomplete",
+                "materialization_lease_until": "not-a-timestamp",
+            },
+            {
+                "materialization_in_flight": True,
+                "materialization_owner": "",
+                "materialization_lease_until": "2099-01-01T00:00:00+00:00",
+            },
+        ],
+    )
+    def test_c1_incomplete_active_materialization_authority_holds(
+        self, active_patch,
+    ):
+        """Any active materialization shape requires complete authority proof."""
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        _, w = self._bare_watcher()
+        sig = self._recovery_sig()
+        sig["metadata"].update(active_patch)
+        row = self._durable_recovery_row(sig)
+        row["meta"].update(active_patch)
+        watched = ew.WatchedSignal(sig, overnight=False)
+
+        ok, reason, _ = w._recovery_final_durable_authority(watched, row)
+
+        assert ok is False
+        assert reason == "recovery_lifecycle_hold_materialization_authority"
+        assert L.LEDGER.current_state(sig["signal_id"]) is None
+
+    def test_c1_explicit_non_active_materialization_flag_preserves_recovery(self):
+        """An explicit false flag keeps retained retry metadata non-active."""
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        _, w = self._bare_watcher()
+        sig = self._recovery_sig()
+        row = self._durable_recovery_row(sig)
+        row["meta"].update({
+            "materialization_in_flight": False,
+            "materialization_owner": "retry-owner:retained",
+            "materialization_lease_until": "2099-01-01T00:00:00+00:00",
+        })
+        watched = ew.WatchedSignal(sig, overnight=False)
+
+        ok, reason, _ = w._recovery_final_durable_authority(watched, row)
+
+        assert ok is True, reason
+        assert L.LEDGER.current_state(sig["signal_id"]) is None
+
     # ── Correction 4: lifecycle restored BEFORE _pending.append() ─────────
 
     def test_c4_hold_leaves_pending_empty(self):
@@ -1344,6 +1424,58 @@ class TestPR580AmendmentCorrections:
                 "broker_ready": False,
             },
         }
+
+    @staticmethod
+    def _claim_store(row):
+        """Provide a row-lock/CAS-shaped connection for the real OSM claim."""
+        class _Store:
+            def __init__(self, initial_row):
+                self.row = copy.deepcopy(initial_row)
+                self.lock = threading.Lock()
+                self.claim_count = 0
+
+        class _Connection:
+            def __init__(self, store):
+                self.store = store
+                self.locked = False
+                self.rowcount = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _tb):
+                if self.locked:
+                    self.store.lock.release()
+                    self.locked = False
+                return False
+
+            def execute(self, sql, params=None):
+                normalized = str(sql).lstrip().upper()
+                if normalized.startswith("SELECT"):
+                    self.store.lock.acquire()
+                    self.locked = True
+                    return self
+                if normalized.startswith("UPDATE"):
+                    patch = json.loads(params[0])
+                    claim_owner = params[4]
+                    metadata = self.store.row.get("meta") or {}
+                    existing_owner = metadata.get(
+                        "recovery_trigger_dispatch_owner", ""
+                    )
+                    if existing_owner in ("", claim_owner):
+                        self.store.row["meta"] = {**metadata, **patch}
+                        self.store.claim_count += 1
+                        self.rowcount = 1
+                    else:
+                        self.rowcount = 0
+                    return self
+                raise AssertionError(f"unexpected SQL: {sql!r}")
+
+            def fetchone(self):
+                return copy.deepcopy(self.store.row)
+
+        store = _Store(row)
+        return store, lambda: _Connection(store)
 
     @staticmethod
     def _assert_no_broker_mutation(broker):
@@ -2241,6 +2373,52 @@ class TestPR580AmendmentCorrections:
         ):
             assert not getattr(osm, method_name).mock_calls, method_name
 
+    def test_a7_materialization_resume_bypasses_pr580_final_dispatch_fence(self):
+        """The package shim leaves due materialization work on its own path."""
+        ew, _L, sig, plan, osm, _broker, watcher = (
+            self._materialization_resume_fixture()
+        )
+        assert watcher.watch(
+            plan,
+            sig["local_order_id"],
+            recovery_rearm=True,
+            no_cancel_on_reject=True,
+            materialization_resume=True,
+        ) is True
+        registered = watcher._pending[0]
+        registered.state = ew.WatchState.TRIGGERED
+        watcher._recovery_final_durable_authority = MagicMock(
+            side_effect=AssertionError("#580 final fence entered")
+        )
+
+        completed = watcher._before_trigger_dispatch([("trigger", registered)])
+
+        assert ("trigger", registered) in completed
+        watcher._recovery_final_durable_authority.assert_not_called()
+
+    def test_a8_recovery_rearm_still_uses_pr580_final_dispatch_fence(self):
+        """Ordinary recovery-rearm remains subject to the #580 final fence."""
+        import ap_entry_watcher as ew
+
+        _, watcher = self._bare_watcher()
+        sig = self._recovery_sig()
+        registered = ew.WatchedSignal(sig, overnight=False)
+        registered.state = ew.WatchState.TRIGGERED
+        watcher._recovery_final_durable_authority = MagicMock(
+            return_value=(
+                True,
+                "recovery_lifecycle_final_durable_authority_proven",
+                self._durable_recovery_row(sig),
+            )
+        )
+
+        completed = watcher._before_trigger_dispatch([("trigger", registered)])
+
+        assert ("trigger", registered) in completed
+        watcher._recovery_final_durable_authority.assert_called_once_with(
+            registered
+        )
+
     def test_a7_materialization_resume_cas_miss_is_deterministic_hold(self):
         """A #596 adoption CAS miss creates no false watcher/lifecycle owner."""
         _, L, sig, plan, osm, broker, watcher = (
@@ -2469,6 +2647,158 @@ class TestPR580AmendmentCorrections:
         assert L.LEDGER.current_state(sig["signal_id"]) == L.SignalState.WATCHING
         assert registered in watcher._pending
         assert registered.signal_id in watcher._dedup_set
+
+    def test_a8c_real_claim_reaches_callback_once(self, monkeypatch):
+        """A valid recovered watcher uses the real OSM claim before callback."""
+        import ap.order_state_machine as osm_mod
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+        sig = self._recovery_sig()
+        row = self._durable_recovery_row(sig)
+        store, conn_factory = self._claim_store(row)
+        monkeypatch.setattr(osm_mod, "conn", conn_factory)
+
+        osm = object.__new__(osm_mod.APOrderStateMachine)
+        osm.client_id = sig["client_id"]
+        osm.get_order = lambda _local_order_id: copy.deepcopy(store.row)
+        watcher = ew.APEntryWatcher(
+            broker=MagicMock(),
+            order_state_machine=osm,
+            require_on_trigger=False,
+            mode="LIVE",
+        )
+        watcher._test_only_allow_recovery_without_row_lock = True
+        watcher._persist_watcher_audit = lambda *a, **kw: None
+        watcher._persist_trigger_confirmation_authority = MagicMock(
+            return_value=True
+        )
+        watcher._validate_local_order_id = MagicMock(return_value=True)
+        watcher._is_live_runtime = MagicMock(return_value=False)
+        watcher.on_trigger = MagicMock(
+            return_value={"disposition": "KEEP_WATCHER"}
+        )
+
+        with patch.object(watcher, "_is_regular_session_now", return_value=False), \
+             patch.object(watcher, "_is_past_entry_cutoff_now", return_value=False):
+            assert watcher.watch(
+                self._recovery_plan(sig, sig["local_order_id"]),
+                sig["local_order_id"],
+                recovery_rearm=True,
+            ) is True
+
+        watcher._test_only_allow_recovery_without_row_lock = False
+        registered = watcher._pending[0]
+        assert registered.signal["__recovery_rearm"] is True
+        registered.overnight = False
+        registered.check = MagicMock(return_value=ew.WatchState.TRIGGERED)
+        registered.last_quote_bid = 199.0
+        registered.last_quote_ask = 201.0
+        watcher._fetch_quotes = MagicMock(
+            return_value={sig["ticker"]: {"bid": 199.0, "ask": 201.0}}
+        )
+
+        watcher._poll_active_signals(False)
+
+        assert store.claim_count == 1
+        assert store.row["meta"]["recovery_trigger_dispatch_owner"] == (
+            f"recovery:{sig['local_order_id']}:{sig['signal_id']}"
+        )
+        watcher.on_trigger.assert_called_once_with(registered)
+        assert watcher._pending == [registered]
+
+    @pytest.mark.parametrize(
+        "durable_row",
+        [
+            None,
+            "not-a-durable-row",
+            {"status": "PENDING_TRIGGER", "meta": "not-json"},
+        ],
+    )
+    def test_a8d_real_claim_unknown_row_holds_without_callback(
+        self, durable_row, monkeypatch,
+    ):
+        """Unknown or malformed durable truth cannot authorize callback work."""
+        import ap.order_state_machine as osm_mod
+
+        sig = self._recovery_sig()
+        store, conn_factory = self._claim_store(durable_row)
+        monkeypatch.setattr(osm_mod, "conn", conn_factory)
+        osm = object.__new__(osm_mod.APOrderStateMachine)
+        osm.client_id = sig["client_id"]
+
+        result = osm.claim_recovery_trigger_dispatch(
+            local_order_id=sig["local_order_id"],
+            signal_id=sig["signal_id"],
+            canonical_signal_id=sig["canonical_signal_id"],
+            client_id=sig["client_id"],
+            execution_mode=sig["execution_mode"],
+            ticker=sig["ticker"],
+            side=sig["side"],
+            materialization_generation=sig["materialization_generation"],
+            trigger_generation=sig["trigger_generation"],
+            claim_owner="tok-test",
+            watcher_token=sig["watcher_token"],
+        )
+        callback = MagicMock()
+        if result:
+            callback()
+
+        assert result is False
+        callback.assert_not_called()
+        assert store.claim_count == 0
+
+    def test_a8e_real_claim_race_has_one_winner_and_one_callback(
+        self, monkeypatch,
+    ):
+        """The row-lock/CAS boundary gives exactly one claimant callback."""
+        import ap.order_state_machine as osm_mod
+
+        sig = self._recovery_sig()
+        store, conn_factory = self._claim_store(self._durable_recovery_row(sig))
+        monkeypatch.setattr(osm_mod, "conn", conn_factory)
+        callbacks = MagicMock()
+        results = []
+        errors = []
+
+        def _claim(owner):
+            try:
+                osm = object.__new__(osm_mod.APOrderStateMachine)
+                osm.client_id = sig["client_id"]
+                claimed = osm.claim_recovery_trigger_dispatch(
+                    local_order_id=sig["local_order_id"],
+                    signal_id=sig["signal_id"],
+                    canonical_signal_id=sig["canonical_signal_id"],
+                    client_id=sig["client_id"],
+                    execution_mode=sig["execution_mode"],
+                    ticker=sig["ticker"],
+                    side=sig["side"],
+                    materialization_generation=sig["materialization_generation"],
+                    trigger_generation=sig["trigger_generation"],
+                    claim_owner=owner,
+                    watcher_token=sig["watcher_token"],
+                )
+                results.append(claimed)
+                if claimed:
+                    callbacks()
+            except BaseException as exc:
+                errors.append(exc)
+
+        workers = [
+            threading.Thread(target=_claim, args=(f"owner-{index}",), daemon=True)
+            for index in (1, 2)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+
+        assert not errors, errors
+        assert all(not worker.is_alive() for worker in workers)
+        assert sorted(results) == [False, True]
+        assert store.claim_count == 1
+        callbacks.assert_called_once_with()
 
     @pytest.mark.parametrize(
         "corruption,reason_fragment",

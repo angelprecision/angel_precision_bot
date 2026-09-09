@@ -1034,7 +1034,11 @@ class APEntryWatcher(_BaseAPEntryWatcher):
         recovery_filtered = []
         for action, watched in completed:
             signal = getattr(watched, "signal", {}) or {}
-            if action != "trigger" or not bool(signal.get("__recovery_rearm")):
+            if (
+                action != "trigger"
+                or not bool(signal.get("__recovery_rearm"))
+                or signal.get("__materialization_resume") is True
+            ):
                 recovery_filtered.append((action, watched))
                 continue
             final_ok, final_reason, _row = self._recovery_final_durable_authority(
