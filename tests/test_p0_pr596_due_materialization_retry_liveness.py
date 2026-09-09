@@ -746,7 +746,7 @@ def test_real_postgres_two_due_recovery_workers_claim_once(monkeypatch):
         assert sorted(outcome["disposition"] for outcome in outcomes) == [
             "CLAIM_LOST",
             "RETRY_WAIT",
-        ]
+        ], [(item.get("disposition"), item.get("reason_code")) for item in outcomes]
         assert sum(core.consumer_calls for core in cores) == 1
 
         after = _read_real(pg_conn, local_order_id)
@@ -822,7 +822,12 @@ def test_real_postgres_watcher_and_due_recovery_share_one_claim(monkeypatch):
         assert not errors
         assert set(outcomes) == {"watcher", "recovery"}
         assert outcomes["watcher"]["disposition"] in {"KEEP_WATCHER", "OWNED"}
-        assert outcomes["recovery"]["disposition"] in {"RETRY_WAIT", "CLAIM_LOST"}
+        assert outcomes["recovery"]["disposition"] in {
+            "RETRY_WAIT", "CLAIM_LOST"
+        }, {
+            name: (item.get("disposition"), item.get("reason_code"))
+            for name, item in outcomes.items()
+        }
         assert recovery_core.consumer_calls <= 1
 
         after = _read_real(pg_conn, local_order_id)
@@ -844,11 +849,18 @@ def test_real_postgres_restart_after_claim_has_one_same_attempt_recovery(
 
     with _isolated_postgres(monkeypatch) as (osm, pg_conn, _schema):
         local_order_id = f"pr596-crash-{crash_stage}-{uuid.uuid4().hex[:8]}"
+        crash_meta = _real_retry_meta(now=datetime.now(timezone.utc), due=True)
+        crash_meta["trigger_crossed_at_provenance"] = {
+            "canonical_signal_id": f"sig-{local_order_id}",
+            "client_id": CLIENT_ID,
+            "execution_mode": "live",
+            "local_order_id": local_order_id,
+        }
         _seed_real_retry(
             pg_conn,
             local_order_id=local_order_id,
             symbol="WFC",
-            meta=_real_retry_meta(now=datetime.now(timezone.utc), due=True),
+            meta=crash_meta,
         )
 
         class _CrashCore(_ReplayCore._Core):
@@ -905,7 +917,7 @@ def test_real_postgres_restart_after_claim_has_one_same_attempt_recovery(
             ),
         )
         outcome = restart.recover_one_row(_read_real(pg_conn, local_order_id))
-        assert outcome == _RowOutcome.RETRY_OWNED
+        assert outcome == _RowOutcome.RETRY_OWNED, restart._row_failure_reasons
 
         recovered = _read_real(pg_conn, local_order_id)
         assert recovered["meta"]["lifecycle_state"] == "RETRY_WAIT"
