@@ -5,10 +5,10 @@
 **AMENDED IN PLACE — HARD HOLD. DO NOT MERGE OR DEPLOY.**
 
 Base: `84d8d61278d45040d8a6830e58c0ac912d683ff2`
-Current implementation head: `2448de61e5aa6fb75abf48fa265aa82b4ed5e728`
-PR state: **Draft / open / HARD HOLD**. The implementation head above is the
-code-and-test amendment commit; the final documentation attestation commit
-will be reported in the PR body after CI completes.
+Current implementation/code head: `4a57c63bfa354b1c5dc7f8647f44c47b4ebd668c`
+PR state: **Draft / open / HARD HOLD**. The final branch head including this
+documentation attestation is recorded in the PR body; this spec commit is
+documentation-only and does not alter production code.
 Audited deployed main: `98eeaadae05f9e4e1db624703ec1e3cd758b732c`
 Original head before amendment: `dd41efaac6db81e3762e87a05c8c90276019fe08`
 Prior amended head before live-base rebase: `bb7d2084f014ff216a7915873e34f5bbd92bf4be`
@@ -177,13 +177,21 @@ Files NOT touched (§4/§5 binding):
   schema. Zero new broker submit/cancel authority. No durable retry
   counter added.
 
-Local status before publication: focused amendment class `83 passed, 1
-skipped`; the combined lifecycle/recovery set was green before the final
-constructor-guard test was added and is rerun for the final attestation.
+Local final status: focused amendment class `83 passed, 1 skipped`; complete
+`tests/test_p0_pending_trigger_lifecycle_integrity.py` `126 passed, 1
+skipped`; combined lifecycle/recovery set `514 passed, 1 skipped`.
 The local PostgreSQL lock-race test is skipped when
 `INTELLIGENCE_POSTGRES_TEST_URL` is absent; CI is the required PostgreSQL
 evidence. No local PostgreSQL server was available (`pg_isready` returned
 `localhost:5432 - no response`).
+
+Exact-head and merge-ref CI run `34358392622` both passed the complete
+5,285-test inventory with PostgreSQL enabled: `p0-tests` job
+`102488819289` and `p0-merge-ref-tests` job `102488820035` each reported
+`5285 passed, 2 warnings`. The exact-head log records the real row-lock race,
+same/opposite durable replacement, cancellation-failure preservation,
+missing-OSM-client HOLD, materialization-resume isolation, and post-lock owner
+suppression tests as passed.
 
 This PR owns one failure class:
 
