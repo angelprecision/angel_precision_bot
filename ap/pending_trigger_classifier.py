@@ -652,7 +652,9 @@ class PendingTriggerClassification:
     # Active materialization owner — recovery must observe and leave read-only
     MATERIALIZATION_IN_FLIGHT  = "MATERIALIZATION_IN_FLIGHT"
 
-    # Unsafe — must NOT be rearmed; terminal cleanup required
+    # Unsafe or unresolved — must NOT be rearmed.  Retry authority conflicts
+    # are held for repair; other unsafe states retain their terminal policy.
+    RETRY_AUTHORITY_CONFLICT    = "RETRY_AUTHORITY_CONFLICT"
     STUCK_TRIGGER_READY        = "STUCK_TRIGGER_READY"
     STUCK_INVALIDATED          = "STUCK_INVALIDATED"
     STUCK_TERMINAL_MATERIALIZATION = "STUCK_TERMINAL_MATERIALIZATION"
@@ -1372,6 +1374,11 @@ def has_conflicting_materialization_retry_authority(row: dict) -> bool:
         for value in lifecycle_values
     ):
         return False
+    # The phase-one market-truth crash window is a separate same-attempt
+    # recovery contract.  Its explicit marker is not a due canonical retry
+    # handoff and must retain the existing phase-one recovery path.
+    if meta.get("materialization_market_truth_pending") is True:
+        return False
     surfaces = _retry_authority_surfaces(meta)
     retry_markers = (
         "materialization_status",
@@ -1394,10 +1401,15 @@ def has_conflicting_materialization_retry_authority(row: dict) -> bool:
     if not marked:
         return False
 
-    # This helper is deliberately narrower than the complete canonical
-    # predicate.  Incomplete/legacy rows may still follow their existing
-    # terminal or phase-one path; only an explicit contradictory authority is
-    # promoted to the HOLD/unresolved path.
+    # Retry lineage is executable only when the complete canonical authority
+    # predicate succeeds. Missing counters, schedule, identity, or any other
+    # required durable field are unresolved authority, not first-attempt
+    # defaults. Active MATERIALIZING/RUNNING proof was excluded above.
+    if not has_canonical_materialization_retry_authority(row):
+        return True
+
+    # Retain the duplicate checks below as a defensive guard if the canonical
+    # predicate gains a new surface without this helper being updated.
     def _text_conflict(entries, *, lower: bool = False, allowed=None) -> bool:
         observed = []
         for _label, raw in entries:
@@ -1641,15 +1653,8 @@ def classify_pending_trigger_row(
                 return PendingTriggerClassification.MATERIALIZATION_IN_FLIGHT
             if has_canonical_materialization_retry_authority(row):
                 return PendingTriggerClassification.WAITING_RETRYABLE
-            # A watcher that still owns the row must leave a contradictory
-            # retry handoff untouched. Restart recovery performs the same
-            # explicit unresolved check before any claim; this branch keeps
-            # the running watcher on its safe read-only path.
-            if (
-                watcher_owned is True
-                and has_conflicting_materialization_retry_authority(row)
-            ):
-                return PendingTriggerClassification.WAITING_RETRYABLE
+            if has_conflicting_materialization_retry_authority(row):
+                return PendingTriggerClassification.RETRY_AUTHORITY_CONFLICT
             return PendingTriggerClassification.STUCK_TRIGGER_READY
 
         # ── Priority 2: real invalidation reason ──
@@ -1705,7 +1710,8 @@ def classify_pending_trigger_row(
 def is_safe_to_recovery_rearm(classification: str) -> bool:
     """
     LIVE rescue rule: ONLY WAITING_VALID and WAITING_RETRYABLE may be
-    recovery-rearmed. All other classifications require terminal cleanup.
+    recovery-rearmed. RETRY_AUTHORITY_CONFLICT is held unresolved; other
+    classifications retain their existing terminal/skip policy.
 
     Callers should treat this as the definitive live-safety gate — if this
     returns False, do NOT call entry_watcher.watch(recovery_rearm=True).

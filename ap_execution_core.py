@@ -3328,12 +3328,32 @@ class APExecutionCore:
         # marker plus contradictory retry identity is unresolved; it must not
         # earn a phase-one claim merely because one alias looks usable.
         from ap.pending_trigger_classifier import (
+            has_canonical_materialization_retry_authority,
             has_conflicting_materialization_retry_authority,
             resolve_materialization_retry_schedule,
             resolve_materialization_trigger_crossed_at,
         )
         if has_conflicting_materialization_retry_authority(row):
             return _keep("RETRY_CONFLICTING_AUTHORITY")
+        _retry_lifecycle = str(meta.get("lifecycle_state") or "").strip().upper()
+        _retry_status = str(meta.get("materialization_status") or "").strip().upper()
+        _trigger_ready_marker = meta.get("watcher_audit")
+        _trigger_ready_marker = (
+            isinstance(_trigger_ready_marker, dict)
+            and str(_trigger_ready_marker.get("reason_code") or "").strip().lower()
+            == "trigger_ready"
+        )
+        if (
+            (_retry_lifecycle == "RETRY_WAIT" or _retry_status == "RETRY_PENDING")
+            and meta.get("materialization_market_truth_pending") is not True
+            and _trigger_ready_marker
+        ):
+            _retry_authority_row = dict(row)
+            _retry_authority_row["meta"] = meta
+            if not has_canonical_materialization_retry_authority(
+                _retry_authority_row
+            ):
+                return _keep("RETRY_INCOMPLETE_AUTHORITY")
 
         _selector_failure_meta = meta.get("materialization_selector_failure")
         if not isinstance(_selector_failure_meta, dict):

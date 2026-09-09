@@ -2730,6 +2730,35 @@ class APStartupRecovery:
                     lifecycle == "RETRY_WAIT" or materialization_status == "RETRY_PENDING"
                 )
 
+                if (
+                    _is_retry_row
+                    and watcher_reason == "trigger_ready"
+                    and meta.get("materialization_market_truth_pending") is not True
+                ):
+                    # The due takeover path must never manufacture retry
+                    # lineage from absent JSONB counters.  Require the same
+                    # complete canonical authority used by classification;
+                    # unresolved rows are retained for repair and cannot
+                    # reach phase-one claim or selector work.
+                    _retry_authority_row = dict(order)
+                    _retry_authority_row["meta"] = meta
+                    if not has_canonical_materialization_retry_authority(
+                        _retry_authority_row
+                    ):
+                        log.critical(
+                            "[%s] RECOVERY_RETRY_AUTHORITY_INCOMPLETE "
+                            "local_order_id=%s lifecycle=%s mstatus=%s "
+                            "— holding unresolved; no synthesized retry attempt",
+                            self.client_id,
+                            local_order_id,
+                            lifecycle,
+                            materialization_status,
+                        )
+                        result.setdefault("errors", []).append(
+                            f"retry_authority_incomplete:{local_order_id}"
+                        )
+                        continue
+
                 # ── Parse + validate the durable retry schedule ───────────────
                 _durable_next_retry_at = None
                 _due_at = None

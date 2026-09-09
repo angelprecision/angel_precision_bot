@@ -310,12 +310,17 @@ class PendingTriggerRestartRecovery:
         # malformed retry metadata into a terminal outcome.
         if has_conflicting_materialization_retry_authority(row):
             self._mark_failure(local_oid, "retry_authority_conflict")
+            watcher_owned = self._check_watcher_owns(local_oid, row)
             log.critical(
                 "RESTART_RECOVERY_RETRY_AUTHORITY_CONFLICT local=%s client=%s "
                 "mode=%s signal=%s — row held; no claim, selector, broker, "
                 "cancel, or terminal write",
                 local_oid, row_client, row_mode, signal_id,
             )
+            if watcher_owned is True:
+                # An exact live watcher remains the read-only owner. Do not
+                # relabel it retryable or let the conflict reach cleanup.
+                return _RowOutcome.WATCHER_OWNED
             return _RowOutcome.UNRESOLVED
 
         # Confirmed-trigger evidence is a durable lifecycle fact, not a quote

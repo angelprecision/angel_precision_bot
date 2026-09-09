@@ -101,21 +101,50 @@ def test_trigger_ready_canonical_retry_is_waiting_retryable(due):
     ],
     ids=["conflicting-attempt", "broker-handoff", "conflicting-provenance"],
 )
-def test_contradictory_retry_authority_stays_stuck(mutation):
+def test_contradictory_retry_authority_is_unsafe_hold(mutation):
     from ap.pending_trigger_classifier import (
         PendingTriggerClassification,
         classify_pending_trigger_row,
+        is_safe_to_recovery_rearm,
     )
 
     row = _row()
     mutation(row["meta"])
     assert classify_pending_trigger_row(row, watcher_owned=False) == (
-        PendingTriggerClassification.STUCK_TRIGGER_READY
+        PendingTriggerClassification.RETRY_AUTHORITY_CONFLICT
+    )
+    assert classify_pending_trigger_row(row, watcher_owned=True) == (
+        PendingTriggerClassification.RETRY_AUTHORITY_CONFLICT
+    )
+    assert not is_safe_to_recovery_rearm(
+        PendingTriggerClassification.RETRY_AUTHORITY_CONFLICT
     )
 
 
 class _NoopBroker:
     pass
+
+
+class _EmptySessionBroker:
+    """Complete empty broker snapshot for phase-one crash replay."""
+
+    def __init__(self):
+        self.cfg = SimpleNamespace(account_id="acct-pr596")
+        self.paths = []
+        self.submit_calls = 0
+        self.cancel_calls = 0
+
+    def _get(self, path):
+        self.paths.append(path)
+        return {"orders": {"order": []}}
+
+    def submit_order(self, *_args, **_kwargs):
+        self.submit_calls += 1
+        raise AssertionError("crash recovery must not submit")
+
+    def cancel_order(self, *_args, **_kwargs):
+        self.cancel_calls += 1
+        raise AssertionError("crash recovery must not cancel")
 
 
 def _require_postgres():
@@ -387,6 +416,49 @@ def test_real_postgres_due_retry_replay_mo_mmm_wfc(symbol, monkeypatch):
         assert after_meta["broker_ready"] is False
 
 
+def test_real_postgres_due_retry_missing_attempt_authority_is_held(monkeypatch):
+    """A due RETRY_PENDING row cannot synthesize selector attempt one."""
+    from ap_recovery import APStartupRecovery
+
+    with _isolated_postgres(monkeypatch) as (osm, pg_conn, _schema):
+        local_order_id = f"pr596-incomplete-{uuid.uuid4().hex[:8]}"
+        _seed_real_retry(
+            pg_conn,
+            local_order_id=local_order_id,
+            symbol="MO",
+            meta=_real_retry_meta(now=datetime.now(timezone.utc), due=True),
+        )
+        with pg_conn() as connection:
+            connection.execute(
+                "UPDATE orders SET meta = (meta - 'retry_attempt') "
+                "WHERE local_order_id = %s",
+                (local_order_id,),
+            )
+
+        core = _ReplayCore._Core(osm)
+        recovery = APStartupRecovery(
+            client_id=CLIENT_ID,
+            broker=core.broker,
+            osm=osm,
+            pm=SimpleNamespace(),
+            master_control=SimpleNamespace(mode="LIVE"),
+            entry_watcher=None,
+            execution_core=core,
+        )
+        before = _read_real(pg_conn, local_order_id)
+        result = {"deferred_lifecycles_recovered": 0, "errors": []}
+        recovery._recover_deferred_breach_lifecycles(result)
+        after = _read_real(pg_conn, local_order_id)
+
+        assert core.consumer_calls == 0
+        assert "retry_authority_conflict" in " ".join(result["errors"])
+        assert after["status"] == before["status"] == "PENDING_TRIGGER"
+        assert after["meta"]["lifecycle_state"] == "RETRY_WAIT"
+        assert after["meta"]["materialization_status"] == "RETRY_PENDING"
+        assert "retry_attempt" not in after["meta"]
+        assert not after["meta"].get("recovery_owner")
+
+
 class _DeadlineCore(_ReplayCore._Core):
     def _on_entry_trigger(self, watched):
         self.consumer_calls += 1
@@ -612,6 +684,240 @@ def test_real_postgres_terminal_cas_rowcount_and_broker_handoff_fences(monkeypat
         )
 
 
+def _synchronize_first_order_read(osm, barrier):
+    original_get_order = osm.get_order
+    state = {"first": True}
+
+    def _get_order(local_order_id):
+        if state["first"]:
+            state["first"] = False
+            barrier.wait(timeout=10)
+        return original_get_order(local_order_id)
+
+    osm.get_order = _get_order
+
+
+def test_real_postgres_two_due_recovery_workers_claim_once(monkeypatch):
+    """Two due workers share one real phase-one owner and one callback."""
+    from ap.order_state_machine import APOrderStateMachine
+
+    with _isolated_postgres(monkeypatch) as (osm, pg_conn, _schema):
+        local_order_id = f"pr596-two-workers-{uuid.uuid4().hex[:8]}"
+        signal_id = _seed_real_retry(
+            pg_conn,
+            local_order_id=local_order_id,
+            symbol="MO",
+            meta=_real_retry_meta(now=datetime.now(timezone.utc), due=True),
+        )
+        worker_osms = [APOrderStateMachine(CLIENT_ID), APOrderStateMachine(CLIENT_ID)]
+        cores = [_ReplayCore._Core(worker_osm) for worker_osm in worker_osms]
+        barrier = threading.Barrier(2)
+        for worker_osm in worker_osms:
+            _synchronize_first_order_read(worker_osm, barrier)
+
+        outcomes = []
+        errors = []
+
+        def _run(core, owner):
+            try:
+                outcomes.append(core.resume_deferred_materialization_retry(
+                    local_order_id=local_order_id,
+                    expected_generation=1,
+                    expected_retry_attempt=2,
+                    owner=owner,
+                ))
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(
+                target=_run,
+                args=(cores[index], f"recovery-worker-{index}"),
+            )
+            for index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+
+        assert not errors
+        assert len(outcomes) == 2
+        assert sorted(outcome["disposition"] for outcome in outcomes) == [
+            "CLAIM_LOST",
+            "RETRY_WAIT",
+        ]
+        assert sum(core.consumer_calls for core in cores) == 1
+
+        after = _read_real(pg_conn, local_order_id)
+        assert after["status"] == "PENDING_TRIGGER"
+        assert after["meta"]["lifecycle_state"] == "RETRY_WAIT"
+        assert after["meta"]["materialization_status"] == "RETRY_PENDING"
+        assert after["meta"]["materialization_generation"] == 2
+        assert after["meta"]["retry_attempt"] == 1
+        assert not after["broker_order_id"]
+
+
+def test_real_postgres_watcher_and_due_recovery_share_one_claim(monkeypatch):
+    """A watcher callback racing takeover cannot create a second owner."""
+    from ap.order_state_machine import APOrderStateMachine
+
+    with _isolated_postgres(monkeypatch) as (osm, pg_conn, _schema):
+        local_order_id = f"pr596-watcher-race-{uuid.uuid4().hex[:8]}"
+        signal_id = _seed_real_retry(
+            pg_conn,
+            local_order_id=local_order_id,
+            symbol="MMM",
+            meta=_real_retry_meta(now=datetime.now(timezone.utc), due=True),
+        )
+        watcher_osm = APOrderStateMachine(CLIENT_ID)
+        recovery_osm = APOrderStateMachine(CLIENT_ID)
+        watcher_core = _ReplayCore._Core(watcher_osm)
+        recovery_core = _ReplayCore._Core(recovery_osm)
+        barrier = threading.Barrier(2)
+        _synchronize_first_order_read(watcher_osm, barrier)
+        _synchronize_first_order_read(recovery_osm, barrier)
+        watched = SimpleNamespace(
+            trigger_crossed_at=datetime.now(timezone.utc) - timedelta(minutes=3),
+            trigger_price=300.0,
+            last_quote_bid=300.0,
+            last_quote_ask=300.1,
+        )
+        watcher_signal = {"watcher_token": "live-watcher-owner"}
+        outcomes = {}
+        errors = []
+
+        def _watcher_claim():
+            try:
+                outcomes["watcher"] = watcher_core._claim_deferred_materialization_for_trigger(
+                    watched=watched,
+                    signal=watcher_signal,
+                    local_order_id=local_order_id,
+                    ticker="MMM",
+                    client_id=CLIENT_ID,
+                    execution_mode="live",
+                    signal_id=signal_id,
+                )
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        def _recovery_takeover():
+            try:
+                outcomes["recovery"] = recovery_core.resume_deferred_materialization_retry(
+                    local_order_id=local_order_id,
+                    expected_generation=1,
+                    expected_retry_attempt=2,
+                    owner="recovery-racer",
+                )
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        watcher_thread = threading.Thread(target=_watcher_claim)
+        recovery_thread = threading.Thread(target=_recovery_takeover)
+        watcher_thread.start()
+        recovery_thread.start()
+        watcher_thread.join(timeout=15)
+        recovery_thread.join(timeout=15)
+
+        assert not errors
+        assert set(outcomes) == {"watcher", "recovery"}
+        assert outcomes["watcher"]["disposition"] in {"KEEP_WATCHER", "OWNED"}
+        assert outcomes["recovery"]["disposition"] in {"RETRY_WAIT", "CLAIM_LOST"}
+        assert recovery_core.consumer_calls <= 1
+
+        after = _read_real(pg_conn, local_order_id)
+        assert after["status"] == "PENDING_TRIGGER"
+        assert after["meta"]["materialization_generation"] == 2
+        assert not after["broker_order_id"]
+        assert not after["submitted_ts"]
+
+
+@pytest.mark.parametrize("crash_stage", ["after_claim", "after_selector"])
+def test_real_postgres_restart_after_claim_has_one_same_attempt_recovery(
+    crash_stage, monkeypatch
+):
+    """Process death at either callback boundary restores one retry, no POST."""
+    from ap.pending_trigger_restart_recovery import (
+        PendingTriggerRestartRecovery,
+        _RowOutcome,
+    )
+
+    with _isolated_postgres(monkeypatch) as (osm, pg_conn, _schema):
+        local_order_id = f"pr596-crash-{crash_stage}-{uuid.uuid4().hex[:8]}"
+        _seed_real_retry(
+            pg_conn,
+            local_order_id=local_order_id,
+            symbol="WFC",
+            meta=_real_retry_meta(now=datetime.now(timezone.utc), due=True),
+        )
+
+        class _CrashCore(_ReplayCore._Core):
+            def __init__(self, crash_osm):
+                super().__init__(crash_osm)
+                self.selector_calls = 0
+
+            def _on_entry_trigger(self, watched):
+                self.consumer_calls += 1
+                if crash_stage == "after_selector":
+                    self.selector_calls += 1
+                raise SystemExit(f"simulated_{crash_stage}")
+
+        core = _CrashCore(osm)
+        with pytest.raises(SystemExit, match=f"simulated_{crash_stage}"):
+            core.resume_deferred_materialization_retry(
+                local_order_id=local_order_id,
+                expected_generation=1,
+                expected_retry_attempt=2,
+                owner=f"crash-owner-{crash_stage}",
+            )
+
+        active = _read_real(pg_conn, local_order_id)
+        assert active["meta"]["lifecycle_state"] == "MATERIALIZING"
+        assert active["meta"]["materialization_status"] == "RUNNING"
+        assert active["meta"]["materialization_in_flight"] is True
+        assert active["meta"]["materialization_generation"] == 2
+        assert active["meta"]["retry_attempt"] == 1
+        assert core.consumer_calls == 1
+        assert core.selector_calls == (1 if crash_stage == "after_selector" else 0)
+
+        with pg_conn() as connection:
+            connection.execute(
+                "UPDATE orders SET meta = meta || %s::jsonb "
+                "WHERE local_order_id = %s",
+                (
+                    json.dumps({
+                        "materialization_lease_until": (
+                            datetime.now(timezone.utc) - timedelta(minutes=1)
+                        ).isoformat()
+                    }),
+                    local_order_id,
+                ),
+            )
+
+        broker = _EmptySessionBroker()
+        restart = PendingTriggerRestartRecovery(
+            client_id=CLIENT_ID,
+            execution_mode="live",
+            osm=osm,
+            broker=broker,
+            quote_check_fn=lambda *args, **kwargs: pytest.fail(
+                "phase-one crash recovery must not request a quote"
+            ),
+        )
+        outcome = restart.recover_one_row(_read_real(pg_conn, local_order_id))
+        assert outcome == _RowOutcome.RETRY_OWNED
+
+        recovered = _read_real(pg_conn, local_order_id)
+        assert recovered["meta"]["lifecycle_state"] == "RETRY_WAIT"
+        assert recovered["meta"]["materialization_status"] == "RETRY_PENDING"
+        assert recovered["meta"]["materialization_generation"] == 2
+        assert recovered["meta"]["retry_attempt"] == 1
+        assert not recovered["broker_order_id"]
+        assert not recovered["submitted_ts"]
+        assert broker.submit_calls == 0
+        assert broker.cancel_calls == 0
+
+
 def test_restart_recovery_accepts_the_same_canonical_retry_authority():
     from ap.pending_trigger_restart_recovery import (
         PendingTriggerRestartRecovery,
@@ -671,10 +977,10 @@ def test_legacy_missing_provenance_rejects_every_duplicate_identity_conflict(lab
     mutate(row)
     assert not has_canonical_materialization_retry_authority(row), label
     assert classify_pending_trigger_row(row, watcher_owned=False) == (
-        PendingTriggerClassification.STUCK_TRIGGER_READY
+        PendingTriggerClassification.RETRY_AUTHORITY_CONFLICT
     )
     assert classify_pending_trigger_row(row, watcher_owned=True) == (
-        PendingTriggerClassification.WAITING_RETRYABLE
+        PendingTriggerClassification.RETRY_AUTHORITY_CONFLICT
     )
 
 
@@ -684,6 +990,28 @@ def test_legacy_missing_provenance_exact_identity_remains_allowed():
     row = _row()
     assert "trigger_crossed_at_provenance" not in row["meta"]
     assert has_canonical_materialization_retry_authority(row)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["retry_attempt", "breach_attempt_count", "materialization_attempts", "retry_max_attempts"],
+)
+def test_incomplete_retry_lineage_is_hold_not_first_attempt(field):
+    from ap.pending_trigger_classifier import (
+        PendingTriggerClassification,
+        classify_pending_trigger_row,
+        has_canonical_materialization_retry_authority,
+    )
+
+    row = _row()
+    row["meta"].pop(field)
+    assert not has_canonical_materialization_retry_authority(row)
+    assert classify_pending_trigger_row(row, watcher_owned=False) == (
+        PendingTriggerClassification.RETRY_AUTHORITY_CONFLICT
+    )
+    assert classify_pending_trigger_row(row, watcher_owned=True) == (
+        PendingTriggerClassification.RETRY_AUTHORITY_CONFLICT
+    )
 
 
 def test_conflicting_retry_authority_is_hold_end_to_end_without_any_mutation():
@@ -776,6 +1104,40 @@ def test_conflicting_retry_authority_is_hold_end_to_end_without_any_mutation():
     }
     assert broker.calls == {"submit": 0, "cancel": 0, "replace": 0}
     assert quote_calls == []
+
+
+def test_conflicting_retry_authority_with_exact_watcher_stays_read_only_owned():
+    from ap.pending_trigger_restart_recovery import (
+        PendingTriggerRestartRecovery,
+        _RowOutcome,
+    )
+
+    row = _row()
+    row["meta"]["client_email"] = "other@example.com"
+    watcher = SimpleNamespace(
+        _pending=[SimpleNamespace(
+            signal={
+                "local_order_id": LOCAL_ORDER_ID,
+                "signal_id": row["signal_id"],
+                "client_id": CLIENT_ID,
+                "execution_mode": "live",
+            },
+            state="PENDING",
+            _ownership_quarantine=False,
+        )],
+        _dedup_set={row["signal_id"]},
+    )
+
+    recovery = PendingTriggerRestartRecovery(
+        client_id=CLIENT_ID,
+        execution_mode="live",
+        osm=SimpleNamespace(),
+        entry_watcher=watcher,
+        broker=_NoopBroker(),
+    )
+
+    assert recovery.recover_one_row(row) == _RowOutcome.WATCHER_OWNED
+    assert recovery.last_watcher_registered_by_this_attempt is False
 
 
 def test_direct_materializer_holds_conflicting_retry_authority_before_claim():
