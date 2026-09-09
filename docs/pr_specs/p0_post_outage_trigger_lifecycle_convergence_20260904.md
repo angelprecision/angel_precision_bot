@@ -83,6 +83,16 @@ Focused local evidence for this amendment:
   unrelated `TestFix1_EntryMetaPersistence.test_create_entry_order_writes_score_column`
   failure (`metadata_invalid:unknown_execution_mode` from its MagicMock plan).
 
+The exact-head/merge-ref P0 workflow for code head
+`d2f1822118649ae8ba4954587b887b7ee8d14c45` is run `34401868608`:
+
+- exact-head `p0-tests`, job `102635448218`: **PASS**;
+- pull-request merge-ref `p0-merge-ref-tests`, job `102635448468`: **PASS**.
+
+Both jobs ran the same canonical inventory with PostgreSQL enabled, including
+the complete lifecycle-integrity file, lifecycle-convergence tests, and the
+row-lock race. The local PostgreSQL skip above is environmental only.
+
 Implementation on this branch is preparatory only, per explicit override.
 Before merge:
 1. #569 remains separately open/draft and must be independently resolved and
