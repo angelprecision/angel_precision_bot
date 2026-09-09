@@ -260,16 +260,21 @@ retention-failure test is a supplemental local test outside the canonical
 inventory.
 
 The follow-up transaction/provenance correction is on production commit
-`86b97873a2068b02c89f846b7fbd4180417f04d6`; the final Draft PR head including
-this spec pointer is `a84fae378aa2e8083eb16e59c6fab49cf8eef341`. Run
-`34391055722` reran the same PostgreSQL-enabled canonical inventory at that
-head. Both exact-head job `102599167598` (`p0-tests`) and merge-ref job
-`102599167468` (`p0-merge-ref-tests`) completed successfully. The run includes
-the shared-transaction multi-incumbent rollback and terminal-reread tests,
-confirmed-trigger provenance fencing, and the existing PostgreSQL row-lock
-race. Local focused evidence for this follow-up is 131 passed / 1 skipped in
-the complete lifecycle-integrity file and 214 passed / 1 skipped in the
-adjacent recovery/convergence suites.
+`86b97873a2068b02c89f846b7fbd4180417f04d6`. Run `34391055722` reran the same
+PostgreSQL-enabled canonical inventory at the then-current Draft head
+`a84fae378aa2e8083eb16e59c6fab49cf8eef341`. Both exact-head job `102599167598`
+(`p0-tests`) and merge-ref job `102599167468` (`p0-merge-ref-tests`) completed
+successfully. The run includes the shared-transaction multi-incumbent rollback
+and terminal-reread tests, confirmed-trigger provenance fencing, and the
+existing PostgreSQL row-lock race. Local focused evidence for this follow-up
+is 131 passed / 1 skipped in the complete lifecycle-integrity file and 214
+passed / 1 skipped in the adjacent recovery/convergence suites.
+
+The resulting Draft PR ref is maintained in the PR metadata/body because this
+spec is itself part of that ref. The subsequent corrected-head workflow
+`34394117484` ran against the corrected ref and completed successfully for
+exact-head job `102609445596` (`p0-tests`) and merge-ref job `102609445888`
+(`p0-merge-ref-tests`).
 
 This PR owns one failure class:
 
