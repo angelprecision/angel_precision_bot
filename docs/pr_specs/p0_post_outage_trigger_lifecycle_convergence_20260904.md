@@ -5,7 +5,7 @@
 **AMENDED IN PLACE — HARD HOLD. DO NOT MERGE OR DEPLOY.**
 
 Base: `84d8d61278d45040d8a6830e58c0ac912d683ff2`
-Current implementation/code head: `4a57c63bfa354b1c5dc7f8647f44c47b4ebd668c`
+Current implementation/code head: `d353067a62df8ccf67579a68361d36c986e3a0d4`
 PR state: **Draft / open / HARD HOLD**. The final branch head including this
 documentation attestation is recorded in the PR body; this spec commit is
 documentation-only and does not alter production code.
@@ -135,10 +135,36 @@ No changes made to `#568`/`#569` selector or materializer retry counters.
 `WATCHING → TRIGGER_READY` remains legal per existing `LEGAL_TRANSITIONS`.
 Recovery never creates a second broker submission attempt.
 
+### Follow-up amendment — materialization-resume ownership boundary
+
+Code/test commit: `d353067a62df8ccf67579a68361d36c986e3a0d4`.
+
+The real production `watch()` → `add_signal()` path now treats
+`__materialization_resume=True` as an explicit #596 ownership boundary:
+
+- the existing `adopt_deferred_retry_watcher()` CAS remains the sole durable
+  retry-owner decision;
+- a successful CAS may register at most one watcher, but it does not invoke
+  `_restore_recovered_watcher_lifecycle()` or synthesize a parallel #580
+  `ap_lifecycle.WATCHING` owner;
+- an unavailable, raised, or false CAS returns a deterministic rejection
+  reason, leaves `_pending`, dedup, callback, and lifecycle state untouched,
+  and lets the existing recovery retention path decide the durable outcome;
+- the ordinary `recovery_rearm=True, materialization_resume=False` path keeps
+  the #580 lifecycle bridge unchanged.
+
+The September 8 Jason LIVE RTX replay is covered with the exact local order
+`84d9106b-7b67-4d58-b479-e9e65b9eb289`, signal
+`322adca3-c407-491f-b5f5-102c2b0a5701`, `PUT` trigger `198.13`, generation 19,
+and retry attempt 13. CAS-miss and retention-write-failure evidence proves no
+false watcher owner, no false lifecycle owner, no callback, and no broker or
+order mutation.
+
 ## Implementation summary (current amendment)
 
 Production files changed:
-- `ap_entry_watcher.py` — 430 insertions / 113 deletions. Changed recovery
+- `ap_entry_watcher.py` — 430 insertions / 113 deletions (prior amendment),
+  plus `20 insertions / 3 deletions` in the follow-up boundary commit. Changed recovery
   identity/generation/final-authority helpers, row-lock fence, lifecycle
   repair, candidate commit/replacement convergence, strict recovery `watch()`
   construction, and `add_signal()`'s recovery-only constructor guard.
@@ -150,9 +176,12 @@ Test/CI files changed:
   and merge-ref jobs run the complete lifecycle-integrity file plus the
   canonical P0 inventory with PostgreSQL enabled.
 - `tests/test_p0_pending_trigger_lifecycle_integrity.py` — 542 insertions /
-  17 deletions; complete identity/generation/OSM-fence/lifecycle failure,
+  17 deletions (prior amendment), plus `181 insertions / 25 deletions` in the
+  follow-up; complete identity/generation/OSM-fence/lifecycle failure,
   replacement convergence, materialization-resume isolation, and real
   PostgreSQL lock-race coverage.
+- `tests/test_p0_amendment5_7_recovery_outcome_integrity.py` — `95 insertions /
+  3 deletions` in the follow-up; exact RTX CAS-miss retention-failure replay.
 - `tests/test_p0_post_outage_trigger_lifecycle_convergence.py` — 4 insertions;
   explicit test-only fence seam for the September 8 Jason LIVE replay.
 - `tests/test_p0_reattach_no_cancel_on_missing_quote.py` — 5 insertions;
@@ -177,9 +206,13 @@ Files NOT touched (§4/§5 binding):
   schema. Zero new broker submit/cancel authority. No durable retry
   counter added.
 
-Local final status: focused amendment class `83 passed, 1 skipped`; complete
-`tests/test_p0_pending_trigger_lifecycle_integrity.py` `126 passed, 1
-skipped`; combined lifecycle/recovery set `514 passed, 1 skipped`.
+Follow-up local status: focused amendment class `85 passed, 1 skipped`; complete
+`tests/test_p0_pending_trigger_lifecycle_integrity.py` plus the amendment 5/7
+recovery-outcome file `140 passed, 1 skipped`; adjacent deferred-materialization
+and watcher suites `292 passed, 1 skipped`; exact follow-up boundary tests `4
+passed`. The local PostgreSQL lock-race test is skipped when
+`INTELLIGENCE_POSTGRES_TEST_URL` is absent; CI is the required PostgreSQL
+evidence.
 The local PostgreSQL lock-race test is skipped when
 `INTELLIGENCE_POSTGRES_TEST_URL` is absent; CI is the required PostgreSQL
 evidence. No local PostgreSQL server was available (`pg_isready` returned
