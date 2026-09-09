@@ -109,6 +109,7 @@ _PAPER_MODE  = "paper"
 # Test-only client identity that cannot collide with any real production row.
 _DB_TEST_MO_CLIENT  = "test-pr596-jason@angelprecision.co"
 _DB_TEST_MMM_CLIENT = "test-pr596-jose@angelprecision.co"
+_DB_SCHEMA = f"pr596_boundary_{os.getpid()}"
 
 _POSTGRES_URL = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL", "")
 
@@ -176,6 +177,7 @@ def _pg_conn():
     """Open a test PostgreSQL connection matching ap.db.conn() semantics."""
     conn = psycopg2.connect(_POSTGRES_URL)
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(f'SET search_path TO "{_DB_SCHEMA}", public')
     wrapper = _CursorWrapper(conn, cur)
     try:
         yield wrapper
@@ -189,8 +191,19 @@ def _pg_conn():
 
 
 def _ensure_orders_table():
-    with _pg_conn() as c:
-        c.execute(_ORDERS_DDL)
+    conn = psycopg2.connect(_POSTGRES_URL)
+    try:
+        with conn.cursor() as cur:
+            # Keep this boundary proof isolated from other P0 tests that use
+            # a deliberately minimal public.orders table.  The production
+            # query still runs unchanged; only the test connection's search
+            # path points at this test-owned canonical-shaped table.
+            cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{_DB_SCHEMA}"')
+            cur.execute(f'SET search_path TO "{_DB_SCHEMA}", public')
+            cur.execute(_ORDERS_DDL)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _insert_order(*, local_order_id, client_id, execution_mode, meta,
@@ -239,6 +252,21 @@ def _delete_test_orders(*client_ids):
         with _pg_conn() as c:
             for cid in client_ids:
                 c.execute("DELETE FROM orders WHERE client_id = %s", (cid,))
+    except Exception:
+        pass
+
+
+def _drop_test_schema():
+    if not _PSYCOPG2_AVAILABLE:
+        return
+    try:
+        conn = psycopg2.connect(_POSTGRES_URL)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f'DROP SCHEMA IF EXISTS "{_DB_SCHEMA}" CASCADE')
+            conn.commit()
+        finally:
+            conn.close()
     except Exception:
         pass
 
@@ -385,6 +413,7 @@ class TestProductionBoundaryProjection:
         _ensure_orders_table()
         yield
         _delete_test_orders(_DB_TEST_MO_CLIENT, _DB_TEST_MMM_CLIENT)
+        _drop_test_schema()
 
     @pytest.fixture
     def _mo_osm(self):
@@ -650,8 +679,10 @@ class TestProductionBoundaryProjection:
 
     def test_broker_handoff_evidence_not_retried(self, _mo_osm):
         """
-        Row with broker_order_id set: classify_pending_trigger_row returns
-        NOT_PENDING_TRIGGER → SKIPPED. Recovery does not take action.
+        A broker handoff marker on an active SUBMITTED row is not permission
+        for restart recovery to retry or cancel the order.  The row is still
+        returned by the monitor, and the canonical recovery engine classifies
+        it as not pending before taking any action.
         """
         oid = f"pr596-broker-{uuid.uuid4()}"
         meta = _retry_meta(due=True)
@@ -662,9 +693,8 @@ class TestProductionBoundaryProjection:
             meta=meta,
             contract="DEFERRED:MO",
             broker_order_id="BROKER-LIVE-789",  # broker handoff evidence
-            status="SUBMITTED",                  # not PENDING_TRIGGER
+            status="SUBMITTED",                  # active monitor status
         )
-        # submitted status excluded by WHERE — this proves the WHERE guard
         monitor = _make_monitor(
             client_id=_DB_TEST_MO_CLIENT,
             execution_mode="live",
@@ -672,9 +702,28 @@ class TestProductionBoundaryProjection:
         )
         with patch("ap.order_monitor.conn", _pg_conn):
             rows = monitor._get_active_entry_orders()
-        # SUBMITTED is not in the WHERE status IN (...) list
-        assert not any(r.get("local_order_id") == oid for r in rows), (
-            "SUBMITTED order with broker_order_id must be excluded by WHERE"
+            row = next(
+                (r for r in rows if r.get("local_order_id") == oid),
+                None,
+            )
+            assert row is not None, (
+                "Active SUBMITTED order with broker handoff evidence must reach "
+                "the canonical recovery boundary"
+            )
+            assert row["client_id"] == _DB_TEST_MO_CLIENT
+            assert row["kind"] == "ENTRY"
+
+            attempted, succeeded, reason = monitor._canonical_pending_trigger_rearm(
+                row, oid, row["contract"]
+            )
+
+        assert attempted is False
+        assert succeeded is False
+        assert reason == "canonical_recovery_not_pending_trigger"
+        assert _mo_osm.cancel_calls == [], "No cancel on broker handoff evidence"
+        assert _mo_osm.meta_writes == [], "No durable mutation on broker handoff evidence"
+        assert monitor.broker.mock_calls == [], (
+            "Broker handoff ambiguity must not submit, cancel, or query the broker"
         )
 
     def test_not_due_retry_owned_waiting(self, _mo_osm):
