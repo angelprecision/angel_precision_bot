@@ -5,9 +5,9 @@
 **AMENDED IN PLACE — HARD HOLD. DO NOT MERGE OR DEPLOY.**
 
 Base: `d404df34e00522ba2cce995b6a0129ba39b83944`
-Current implementation/code head: `2cf420c5`
+Current implementation/code head: `e5a4dfe43f4cf95f425312f42012025b41fc217f`
 PR state: **Draft / open / HARD HOLD**. The final branch head including this
-documentation attestation is recorded in the PR body; this spec commit is
+documentation attestation is recorded in the PR body; this spec update is
 documentation-only and does not alter production code.
 Audited committed main: `d404df34e00522ba2cce995b6a0129ba39b83944`
 Original head before amendment: `dd41efaac6db81e3762e87a05c8c90276019fe08`
@@ -16,8 +16,9 @@ Prior amended head before live-base rebase: `bb7d2084f014ff216a7915873e34f5bbd92
 Amendment applied: 2026-09-09
 
 Latest code amendment commit (before this documentation attestation):
-`2cf420c5`. The final branch SHA, including this specification update, is
-recorded in the PR body after the documentation commit.
+`e5a4dfe43f4cf95f425312f42012025b41fc217f`. The final branch SHA, including
+this specification update, is recorded in the PR body after the documentation
+commit.
 
 Dependencies (§STATUS binding order):
 - PR #568 (deferred selector/materialization retry authority): current `main`
@@ -84,10 +85,10 @@ Focused local evidence for this amendment:
   failure (`metadata_invalid:unknown_execution_mode` from its MagicMock plan).
 
 The exact-head/merge-ref P0 workflow for code head
-`d2f1822118649ae8ba4954587b887b7ee8d14c45` is run `34401868608`:
+`e5a4dfe43f4cf95f425312f42012025b41fc217f` is run `34402725559`:
 
-- exact-head `p0-tests`, job `102635448218`: **PASS**;
-- pull-request merge-ref `p0-merge-ref-tests`, job `102635448468`: **PASS**.
+- exact-head `p0-tests`, job `102638262954`: **PASS**;
+- pull-request merge-ref `p0-merge-ref-tests`, job `102638263172`: **PASS**.
 
 Both jobs ran the same canonical inventory with PostgreSQL enabled, including
 the complete lifecycle-integrity file, lifecycle-convergence tests, and the
