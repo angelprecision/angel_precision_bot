@@ -634,8 +634,9 @@ class TestSelectorQuality:
 
         # The fix is purely in the SQL SELECT; it must not introduce a
         # selector call, capacity check, or retry limit change.
-        assert "APContractSelectionEngine" not in src or True  # selector may exist elsewhere
-        # The key invariant: the new columns are client_id and kind
+        # The selector exists elsewhere in order_monitor for deferred hydration;
+        # the invariant is that _get_active_entry_orders projects client_id and
+        # kind from the database row — not that the whole file is selector-free.
         assert "client_id" in src, "client_id must appear in the fixed SELECT"
         assert "kind" in src, "kind must appear in the fixed SELECT"
 
