@@ -690,6 +690,9 @@ class ClientRunner(threading.Thread):
         self.last_fill_monitor_heartbeat_ts = 0.0
         self.last_worker_heartbeat_ts = 0.0
         self.last_equity_heartbeat_ts = 0.0
+        self.last_deferred_recovery_ts = 0.0
+        self.deferred_recovery_ticks = 0
+        self.deferred_recovery_errors = 0
 
         self.core = None
         self.master_control = None
@@ -709,6 +712,7 @@ class ClientRunner(threading.Thread):
         self.intelligence_context_thread = None
         self.equity_thread = None
         self.health_thread = None
+        self.deferred_recovery_thread = None
         self.failure_reason: str = ""
         self._overnight_reeval_attempt_lock = threading.Lock()
         self._overnight_reeval_state_date = None
@@ -2671,17 +2675,22 @@ class ClientRunner(threading.Thread):
             logger.debug("[%s] exit_autonomous_recovery error (non-fatal): %s", self.email, _exc)
 
     def _run_deferred_breach_lifecycle_recovery(self):
-        """Continuously recover due/stale deferred-breach ownership rows."""
-        _now = time.time()
-        _last = getattr(self, "_last_deferred_breach_recovery_ts", 0.0)
-        if _now - _last < 20.0:
-            return
-        self._last_deferred_breach_recovery_ts = _now
+        """Run one client-scoped deferred-retry recovery tick.
+
+        This method owns scheduling no business logic.  It only constructs the
+        existing recovery boundary and delegates all durable identity, retry,
+        generation, selector, and broker-evidence decisions to it.
+        """
+        if self.stopping.is_set() or self.stopped.is_set() or self.failed.is_set():
+            return {"deferred_lifecycles_recovered": 0, "errors": ["runner_stopping"]}
+
+        self.last_deferred_recovery_ts = time.time()
+        self.deferred_recovery_ticks = getattr(self, "deferred_recovery_ticks", 0) + 1
         broker = getattr(self, "broker", None)
         core = getattr(self, "core", None)
         watcher = getattr(core, "entry_watcher", None) if core is not None else None
         if broker is None or core is None or self.order_state_machine is None:
-            return
+            return {"deferred_lifecycles_recovered": 0, "errors": ["runtime_stack_unavailable"]}
         try:
             recovery = APStartupRecovery(
                 client_id=self.email,
@@ -2695,20 +2704,99 @@ class ClientRunner(threading.Thread):
             )
             outcome = recovery.recover_deferred_lifecycles()
             if outcome.get("errors"):
+                self.deferred_recovery_errors = getattr(self, "deferred_recovery_errors", 0) + 1
                 logger.error(
-                    "[%s] deferred breach lifecycle recovery errors=%s",
-                    self.email, outcome.get("errors"),
+                    "[%s] deferred retry scheduler tick found=%s due=%s recovered=%s errors=%s commit=%s",
+                    self.email,
+                    outcome.get("deferred_lifecycles_found", 0),
+                    outcome.get("deferred_lifecycles_due", 0),
+                    outcome.get("deferred_lifecycles_recovered", 0),
+                    outcome.get("errors"),
+                    _autonomy_log_context(self.mode).get("commit_sha"),
                 )
             elif outcome.get("deferred_lifecycles_recovered"):
                 logger.info(
-                    "[%s] deferred breach lifecycles recovered=%s",
-                    self.email, outcome.get("deferred_lifecycles_recovered"),
+                    "[%s] deferred retry scheduler tick found=%s due=%s recovered=%s commit=%s",
+                    self.email,
+                    outcome.get("deferred_lifecycles_found", 0),
+                    outcome.get("deferred_lifecycles_due", 0),
+                    outcome.get("deferred_lifecycles_recovered", 0),
+                    _autonomy_log_context(self.mode).get("commit_sha"),
                 )
+            else:
+                logger.debug(
+                    "[%s] deferred retry scheduler tick found=%s due=%s recovered=0 commit=%s",
+                    self.email,
+                    outcome.get("deferred_lifecycles_found", 0),
+                    outcome.get("deferred_lifecycles_due", 0),
+                    _autonomy_log_context(self.mode).get("commit_sha"),
+                )
+            return outcome
         except Exception as exc:
+            self.deferred_recovery_errors = getattr(self, "deferred_recovery_errors", 0) + 1
             logger.error(
-                "[%s] deferred breach lifecycle recovery failed: %s",
-                self.email, exc, exc_info=True,
+                "[%s] deferred retry scheduler tick failed: %s commit=%s",
+                self.email, exc,
+                _autonomy_log_context(self.mode).get("commit_sha"),
+                exc_info=True,
             )
+            return {
+                "deferred_lifecycles_recovered": 0,
+                "errors": [f"runtime_tick:{type(exc).__name__}"],
+            }
+
+    def _start_deferred_breach_lifecycle_scheduler(self):
+        """Start the independent runtime consumer for due deferred retries.
+
+        Startup recovery is deliberately one-shot.  This daemon is the
+        uninterrupted-run consumer for rows that become due later.  Durable
+        CAS in the canonical recovery/execution path remains the authority;
+        this thread is only a timer and caller boundary.
+        """
+        if self.stopping.is_set() or self.stopped.is_set() or self.failed.is_set():
+            return
+
+        current = getattr(self, "deferred_recovery_thread", None)
+        if current is not None and current.is_alive():
+            return
+
+        try:
+            interval = float(os.getenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "20"))
+        except (TypeError, ValueError):
+            interval = 20.0
+        interval = max(1.0, interval)
+
+        def _scheduler_loop():
+            logger.info(
+                "[%s] Deferred retry scheduler started interval=%.1fs commit=%s",
+                self.email,
+                interval,
+                _autonomy_log_context(self.mode).get("commit_sha"),
+            )
+            while not self.stopped.wait(interval):
+                if self.stopping.is_set() or self.stopped.is_set() or self.failed.is_set():
+                    break
+                try:
+                    self._run_deferred_breach_lifecycle_recovery()
+                except Exception as exc:
+                    # The tick already has its own boundary.  Keep this outer
+                    # guard so a future refactor cannot silently kill liveness.
+                    self.deferred_recovery_errors = getattr(self, "deferred_recovery_errors", 0) + 1
+                    logger.error(
+                        "[%s] deferred retry scheduler unhandled tick failure: %s commit=%s",
+                        self.email,
+                        exc,
+                        _autonomy_log_context(self.mode).get("commit_sha"),
+                        exc_info=True,
+                    )
+            logger.info("[%s] Deferred retry scheduler stopped", self.email)
+
+        self.deferred_recovery_thread = threading.Thread(
+            target=_scheduler_loop,
+            daemon=True,
+            name=f"runner-deferred-retry-{self.email}",
+        )
+        self.deferred_recovery_thread.start()
 
     def _detect_manual_closes(self):
         """Delegate to ap.manual_close_reconciliation.
@@ -2787,7 +2875,6 @@ class ClientRunner(threading.Thread):
                 self._check_split_brain_recovery()   # BUG-5 FIX: poll for reconciler resolution
                 self._run_overnight_reeval_if_due()  # Arm WATCHING signals at 9:00-9:45 AM ET
                 self._run_exit_autonomous_recovery() # Resolve CLOSING-forever positions every 60s
-                self._run_deferred_breach_lifecycle_recovery()
                 self._detect_manual_closes()         # Detect broker-closed positions not in DB
                 self._set_entry_permission()
 
@@ -2865,6 +2952,8 @@ class ClientRunner(threading.Thread):
         try:
             self._run_inner()
         except Exception as exc:
+            self.stopping.set()
+            self.stopped.set()
             self._mark_failed(str(exc))
             logger.error("[%s] Runner crashed", self.email, exc_info=True)
         finally:
@@ -3449,6 +3538,7 @@ class ClientRunner(threading.Thread):
         self._set_entry_permission()
         self._run_startup_morning_handoff()
         self._start_runtime_health_loop()
+        self._start_deferred_breach_lifecycle_scheduler()
 
         logger.info(
             "[%s] Control stack initialized | mode=%s max_pos=%s max_trades=%s daily_loss=$%.0f entries_allowed=%s",
@@ -3537,7 +3627,13 @@ class ClientRunner(threading.Thread):
     def _join_child_threads(self):
         timeout = float(os.getenv("RUNNER_CHILD_JOIN_TIMEOUT_SEC", "2"))
         current = threading.current_thread()
-        for name in ("fill_monitor_thread", "worker_thread", "equity_thread", "health_thread"):
+        for name in (
+            "fill_monitor_thread",
+            "worker_thread",
+            "equity_thread",
+            "health_thread",
+            "deferred_recovery_thread",
+        ):
             thread = getattr(self, name, None)
             if thread and thread is not current and thread.is_alive():
                 try:

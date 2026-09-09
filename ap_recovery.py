@@ -456,6 +456,8 @@ class APStartupRecovery:
             "dedup_seeded":        0,
             "watchers_requeued":   0,
             "deferred_lifecycles_recovered": 0,
+            "deferred_lifecycles_found": 0,
+            "deferred_lifecycles_due": 0,
             "exit_fill_reconciliations_attempted": 0,
             "exit_fill_reconciliations_reconciled": 0,
             "exit_fill_reconciliations_quarantined": 0,
@@ -635,6 +637,8 @@ class APStartupRecovery:
         result = {
             "client_id": self.client_id,
             "deferred_lifecycles_recovered": 0,
+            "deferred_lifecycles_found": 0,
+            "deferred_lifecycles_due": 0,
             "errors": [],
         }
         if self._execution_mode() is None:
@@ -1986,6 +1990,7 @@ class APStartupRecovery:
                 return c.fetchall()
 
         rows = run_with_retry(_load) or []
+        result["deferred_lifecycles_found"] = len(rows)
         now = datetime.now(timezone.utc)
         recovered = 0
 
@@ -2839,6 +2844,9 @@ class APStartupRecovery:
 
                 # ── Due-retry path (blocker §4: watcher not required) ─────────
                 if _is_retry_row and _is_due:
+                    result["deferred_lifecycles_due"] = int(
+                        result.get("deferred_lifecycles_due", 0) or 0
+                    ) + 1
                     # Prove executable ownership regardless of watcher state.
                     _proof_result = {"proven": False, "reason_code": "PROOF_UNAVAILABLE"}
                     if self.entry_watcher is not None:
