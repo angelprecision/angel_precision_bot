@@ -213,20 +213,19 @@ and watcher suites `292 passed, 1 skipped`; exact follow-up boundary tests `4
 passed`. The local PostgreSQL lock-race test is skipped when
 `INTELLIGENCE_POSTGRES_TEST_URL` is absent; CI is the required PostgreSQL
 evidence.
-The local PostgreSQL lock-race test is skipped when
-`INTELLIGENCE_POSTGRES_TEST_URL` is absent; CI is the required PostgreSQL
 evidence. No local PostgreSQL server was available (`pg_isready` returned
 `localhost:5432 - no response`).
 
-The final exact-head and merge-ref CI run after the documentation attestation
-is `34358977197` on the final pushed branch head recorded in the PR body. Both
-jobs passed the complete 5,285-test inventory with PostgreSQL enabled:
-`p0-tests` job `102490772911` and `p0-merge-ref-tests` job `102490773249` each
-reported `5285 passed, 2 warnings`. The exact-head log records the real
-row-lock race, same/opposite durable replacement, cancellation-failure
-preservation, missing-OSM-client HOLD, materialization-resume isolation, and
-post-lock owner suppression tests as passed. The preceding code/test parent
-run was `34358392622` at `4a57c63bfa354b1c5dc7f8647f44c47b4ebd668c`.
+The final exact-head and merge-ref CI run is `34373920720` on PR head
+`b12ef19919b97008b89788a8f47ef002d21c2c77` with merge ref
+`945bb95484fd5f92fd82206a64224bf0e1e91725`. Both jobs passed the complete
+5,287-test inventory with PostgreSQL enabled: `p0-tests` job `102541773696`
+and `p0-merge-ref-tests` job `102541774136` each reported `5287 passed, 2
+warnings`. The run includes the real PostgreSQL row-lock race,
+same/opposite durable replacement, cancellation-failure preservation,
+missing-OSM-client HOLD, and materialization-resume isolation. The exact RTX
+retention-failure test is a supplemental local test outside the canonical
+inventory.
 
 This PR owns one failure class:
 
