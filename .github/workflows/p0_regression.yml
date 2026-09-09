@@ -219,6 +219,7 @@ jobs:
             tests/test_p0_startup_readiness_fail_closed.py \
             tests/test_p0_manual_client_close_proof.py \
             tests/test_p0_manual_close_production_shape.py \
+            tests/test_p1_manual_close_broker_snapshot_integrity.py \
             tests/test_p0_manual_close_idempotency_and_validation.py \
             tests/test_p0_manual_close_terminal_recovery.py \
             tests/test_p0_terminal_proof_lock_postgres_concurrency.py \
