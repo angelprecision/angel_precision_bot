@@ -4305,7 +4305,16 @@ class APOrderMonitor:
                            -- longer window. This was the source of "score=0.0 tier=normal"
                            -- log noise on rows that actually had score=70 tier=B.
                            score, tier, trigger_price, stop_underlying,
-                           target_underlying, meta
+                           target_underlying, meta,
+                           -- PR #602: project durable client_id and kind so
+                           -- _canonical_pending_trigger_rearm passes a row
+                           -- with real identity to PendingTriggerRestartRecovery.
+                           -- Without these columns, row.get('client_id') is None,
+                           -- which triggers RESTART_RECOVERY_MISSING_DURABLE_CLIENT_ID
+                           -- -> UNRESOLVED -> due RETRY_PENDING is never consumed.
+                           -- Use the database row as authority; never synthesize
+                           -- identity from runner context.
+                           client_id, kind
                     FROM orders
                     WHERE client_id=%s
                       AND kind='ENTRY'
