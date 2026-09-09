@@ -2275,7 +2275,7 @@ class APEntryWatcher:
                     continue
                 if isinstance(raw, str):
                     if not raw.strip():
-                        continue
+                        return [], False
                     try:
                         parsed = json.loads(raw)
                     except Exception:
