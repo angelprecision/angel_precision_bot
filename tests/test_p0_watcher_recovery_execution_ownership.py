@@ -52,6 +52,12 @@ def _watched_signal() -> WatchedSignal:
 
 
 def _watcher_with_row(row: dict) -> APEntryWatcher:
+    row.setdefault("local_order_id", "oid-1")
+    row.setdefault("client_id", "client@example.com")
+    row.setdefault("execution_mode", "live")
+    row.setdefault("signal_id", "sig-1")
+    row.setdefault("ticker", "SPY")
+    row.setdefault("side", "CALL")
     osm = MagicMock()
     osm.update_order_meta.return_value = True
     osm.get_order.return_value = row
@@ -95,19 +101,22 @@ def test_reconcile_broker_intent_keeps_watcher_and_dedup_until_retry_time():
     assert "sig-1" in watcher._dedup_set
     assert watched.state == WatchState.PENDING
     assert watched.deferred_retry_not_before is not None
-    assert watcher.on_trigger.call_count == 1
+    # Durable broker handoff already owns this row. The watcher must retain
+    # dedup ownership without re-entering the submit-capable callback.
+    assert watcher.on_trigger.call_count == 0
+    watcher.order_state_machine.update_order_meta.assert_not_called()
 
     watcher._poll_active_signals(open_protect_active=False)
 
-    assert watcher.on_trigger.call_count == 1
+    assert watcher.on_trigger.call_count == 0
 
 
 def test_trigger_timestamps_are_persisted_before_execution_callback():
     row = {
-        "status": "SUBMITTED",
-        "broker_order_id": "BRK-1",
-        "submitted_ts": "2026-07-14T13:30:01+00:00",
-        "meta": {"submit_intent_at": "2026-07-14T13:30:00+00:00"},
+        "status": "PENDING_TRIGGER",
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "meta": {},
     }
     watcher = _watcher_with_row(row)
     watched = _watched_signal()
@@ -116,13 +125,23 @@ def test_trigger_timestamps_are_persisted_before_execution_callback():
     watcher._dedup_set.add("sig-1")
     events: list[str] = []
 
-    def _update_order_meta(_oid, patch):
+    def _update_order_meta(_oid, patch, **expected):
+        assert expected == {
+            "expected_status": "PENDING_TRIGGER",
+            "expected_execution_mode": "live",
+            "expected_signal_id": "sig-1",
+        }
         if "trigger_confirmed_at" in patch:
             events.append("timestamps")
         return True
 
     def _on_trigger(_watched):
         events.append("callback")
+        row.update({
+            "status": "SUBMITTED",
+            "broker_order_id": "BRK-1",
+            "submitted_ts": "2026-07-14T13:30:01+00:00",
+        })
         return {"disposition": "SUBMITTED"}
 
     watcher.order_state_machine.update_order_meta.side_effect = _update_order_meta
