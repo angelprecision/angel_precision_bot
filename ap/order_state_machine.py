@@ -1019,8 +1019,27 @@ class APOrderStateMachine:
             return False
         return self.transition(local_order_id, OrderStatus.EXPIRED, last_error=reason)
 
-    def cancel_pending_entry(self, local_order_id: str, *, reason: str = "watcher_invalidated") -> bool:
-        current = self._get_order(local_order_id)
+    def cancel_pending_entry(
+        self,
+        local_order_id: str,
+        *,
+        reason: str = "watcher_invalidated",
+        _connection=None,
+        _defer_side_effects: bool = False,
+    ) -> bool:
+        """Cancel a still-unowned ENTRY row through the canonical OSM fence.
+
+        ``_connection`` and ``_defer_side_effects`` are private recovery
+        transaction seams.  The public path keeps its existing connection and
+        observability behavior; PR #580 supplies the already-held admission
+        transaction so incumbent cancellation can roll back with the
+        candidate when a later proof fails.
+        """
+        current = self._get_order(
+            local_order_id,
+            _connection=_connection,
+            _for_update=_connection is not None,
+        )
         if not current:
             log.error("[%s] cancel_pending_entry: order %s not found",
                       self.client_id, local_order_id)
@@ -1044,7 +1063,13 @@ class APOrderStateMachine:
                 self.client_id, local_order_id,
             )
             return False
-        return self.transition(local_order_id, OrderStatus.CANCELED, last_error=reason)
+        return self.transition(
+            local_order_id,
+            OrderStatus.CANCELED,
+            last_error=reason,
+            _connection=_connection,
+            _defer_side_effects=_defer_side_effects,
+        )
 
     @staticmethod
     def _pending_entry_has_submit_or_recovery_owner(order: dict) -> bool:
@@ -1091,18 +1116,21 @@ class APOrderStateMachine:
         filled_ts=None,
         position_id=None,
         allow_submit_owner_terminalization: bool = False,
+        _connection=None,
+        _defer_side_effects: bool = False,
     ) -> bool:
-        current = self._get_order(local_order_id)
+        current = self._get_order(local_order_id, _connection=_connection)
         if not current:
             log.error("[%s] transition: order %s not found", self.client_id, local_order_id)
-            self._emit_transition_event(
-                local_order_id=local_order_id,
-                old_status="UNKNOWN",
-                new_status=new_status,
-                decision="REJECT",
-                reason_code="ORDER_NOT_FOUND",
-                explanation=f"Order {local_order_id} not found for transition to {new_status}",
-            )
+            if not _defer_side_effects:
+                self._emit_transition_event(
+                    local_order_id=local_order_id,
+                    old_status="UNKNOWN",
+                    new_status=new_status,
+                    decision="REJECT",
+                    reason_code="ORDER_NOT_FOUND",
+                    explanation=f"Order {local_order_id} not found for transition to {new_status}",
+                )
             return False
 
         current     = dict(current)
@@ -1121,13 +1149,14 @@ class APOrderStateMachine:
             if incoming_filled < prev_filled:
                 log.critical("[%s] INVALID CUMULATIVE FILL REGRESSION | order=%s new=%s prev=%s",
                              self.client_id, local_order_id, incoming_filled, prev_filled)
-                self._emit_transition_event(
-                    local_order_id=local_order_id, old_status=old_status, new_status=new_status,
-                    order=current, decision="REJECT", reason_code="FILL_QTY_REGRESSION",
-                    explanation=f"filled_qty must be cumulative: new={incoming_filled} prev={prev_filled}",
-                    broker_order_id=broker_order_id, filled_qty=filled_qty,
-                    fill_price=fill_price, last_error=last_error,
-                )
+                if not _defer_side_effects:
+                    self._emit_transition_event(
+                        local_order_id=local_order_id, old_status=old_status, new_status=new_status,
+                        order=current, decision="REJECT", reason_code="FILL_QTY_REGRESSION",
+                        explanation=f"filled_qty must be cumulative: new={incoming_filled} prev={prev_filled}",
+                        broker_order_id=broker_order_id, filled_qty=filled_qty,
+                        fill_price=fill_price, last_error=last_error,
+                    )
                 return False
 
         if old_status == new_status:
@@ -1148,12 +1177,13 @@ class APOrderStateMachine:
             reason = f"terminal_transition_blocked:{old_status}->{new_status}"
             log.warning("[%s] TRANSITION BLOCKED -- %s already terminal (%s), cannot move to %s",
                         self.client_id, local_order_id, old_status, new_status)
-            self._record_error(local_order_id, reason)
-            self._emit_transition_event(
-                local_order_id=local_order_id, old_status=old_status, new_status=new_status,
-                order=current, decision="REJECT", reason_code="TERMINAL_STATE_BLOCK",
-                explanation=reason, last_error=last_error,
-            )
+            if not _defer_side_effects:
+                self._record_error(local_order_id, reason)
+                self._emit_transition_event(
+                    local_order_id=local_order_id, old_status=old_status, new_status=new_status,
+                    order=current, decision="REJECT", reason_code="TERMINAL_STATE_BLOCK",
+                    explanation=reason, last_error=last_error,
+                )
             return False
 
         if (
@@ -1167,13 +1197,14 @@ class APOrderStateMachine:
                 self.client_id, local_order_id, old_status, new_status, kind,
                 broker_order_id or current.get("broker_order_id"), filled_qty, fill_price,
             )
-            self._record_error(local_order_id, reason)
-            self._emit_transition_event(
-                local_order_id=local_order_id, old_status=old_status, new_status=new_status,
-                order=current, decision="REJECT", reason_code="ILLEGAL_TRANSITION",
-                explanation=reason, broker_order_id=broker_order_id,
-                filled_qty=filled_qty, fill_price=fill_price, last_error=last_error,
-            )
+            if not _defer_side_effects:
+                self._record_error(local_order_id, reason)
+                self._emit_transition_event(
+                    local_order_id=local_order_id, old_status=old_status, new_status=new_status,
+                    order=current, decision="REJECT", reason_code="ILLEGAL_TRANSITION",
+                    explanation=reason, broker_order_id=broker_order_id,
+                    filled_qty=filled_qty, fill_price=fill_price, last_error=last_error,
+                )
             return False
 
         updates = ["status=%s", "updated_ts=NOW()"]
@@ -1245,19 +1276,23 @@ class APOrderStateMachine:
                 " AND COALESCE(last_error,'') NOT LIKE 'SPLIT_BRAIN:%%'"
             )
 
-        def _fn():
-            with conn() as c:
-                cur = c.execute(sql, tuple(params))
-                return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+        if _connection is not None:
+            cur = _connection.execute(sql, tuple(params))
+            rowcount = getattr(cur, "rowcount", getattr(_connection, "rowcount", None))
+        else:
+            def _fn():
+                with conn() as c:
+                    cur = c.execute(sql, tuple(params))
+                    return getattr(cur, "rowcount", getattr(c, "rowcount", None))
 
-        rowcount = run_with_retry(_fn)
+            rowcount = run_with_retry(_fn)
 
         if rowcount == 0:
             # CAS miss. Re-read to determine WHY the guarded UPDATE matched no row:
             #   (a) another thread already advanced it to new_status -> idempotent OK
             #   (b) another thread moved it somewhere else            -> real conflict
             #   (c) row genuinely missing                             -> real error
-            latest = self._get_order(local_order_id)
+            latest = self._get_order(local_order_id, _connection=_connection)
             if latest:
                 latest_row = dict(latest)
                 latest_status = str(latest_row.get("status") or "")
@@ -1306,11 +1341,12 @@ class APOrderStateMachine:
                 reason = f"transition_update_no_rows:{old_status}->{new_status}"
                 log.critical("[%s] OSM UPDATE TOUCHED ZERO ROWS (row missing) | %s | %s",
                              self.client_id, local_order_id, reason)
-            self._record_error(local_order_id, reason)
-            self._emit_transition_event(
-                local_order_id=local_order_id, old_status=old_status, new_status=new_status,
-                order=current, decision="ERROR", reason_code="DB_UPDATE_MISSED", explanation=reason,
-            )
+            if not _defer_side_effects:
+                self._record_error(local_order_id, reason)
+                self._emit_transition_event(
+                    local_order_id=local_order_id, old_status=old_status, new_status=new_status,
+                    order=current, decision="ERROR", reason_code="DB_UPDATE_MISSED", explanation=reason,
+                )
             return False
 
         if rowcount is None:
@@ -1322,12 +1358,13 @@ class APOrderStateMachine:
                     "your DB driver is proven to never silently fail UPDATE statements",
                     self.client_id, local_order_id, old_status, new_status,
                 )
-                self._record_error(local_order_id, reason)
-                self._emit_transition_event(
-                    local_order_id=local_order_id, old_status=old_status, new_status=new_status,
-                    order=current, decision="ERROR", reason_code="DB_ROWCOUNT_UNCONFIRMED",
-                    explanation=reason,
-                )
+                if not _defer_side_effects:
+                    self._record_error(local_order_id, reason)
+                    self._emit_transition_event(
+                        local_order_id=local_order_id, old_status=old_status, new_status=new_status,
+                        order=current, decision="ERROR", reason_code="DB_ROWCOUNT_UNCONFIRMED",
+                        explanation=reason,
+                    )
                 return False
             else:
                 log.warning(
@@ -1342,42 +1379,46 @@ class APOrderStateMachine:
             f" broker={broker_order_id}" if broker_order_id else "",
             f" fill={filled_qty}@{fill_price}" if fill_price is not None else "",
         )
-        self._emit_transition_event(
-            local_order_id=local_order_id, old_status=old_status, new_status=new_status,
-            order=current,
-            decision="CONFIRMED" if new_status not in {
-                OrderStatus.REJECTED, OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.ERROR
-            } else "TERMINAL",
-            broker_order_id=broker_order_id, filled_qty=filled_qty,
-            fill_price=fill_price, last_error=last_error,
-        )
+        if not _defer_side_effects:
+            self._emit_transition_event(
+                local_order_id=local_order_id, old_status=old_status, new_status=new_status,
+                order=current,
+                decision="CONFIRMED" if new_status not in {
+                    OrderStatus.REJECTED, OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.ERROR
+                } else "TERMINAL",
+                broker_order_id=broker_order_id, filled_qty=filled_qty,
+                fill_price=fill_price, last_error=last_error,
+            )
         # ── PR81 Final Amendment v2 §3: opportunity-ledger lifecycle hook ──────
         # Fan the OSM transition out to the client_signal_opportunities row
         # for ENTRY orders only. Fail-safe: never raises, never blocks the
         # OSM caller. Exit transitions are intentionally ignored — the
         # opportunity ledger tracks the entry lifecycle, not exit lifecycle.
-        try:
-            self._notify_opportunity_ledger(
-                current=current,
-                new_status=new_status,
+        if not _defer_side_effects:
+            try:
+                self._notify_opportunity_ledger(
+                    current=current,
+                    new_status=new_status,
+                    broker_order_id=broker_order_id or current.get("broker_order_id"),
+                    position_id=position_id or current.get("position_id"),
+                    last_error=last_error,
+                    fill_price=fill_price,
+                    filled_qty=filled_qty,
+                    filled_ts=filled_ts,
+                )
+            except Exception as _ledger_exc:
+                log.debug(
+                    "[%s] opportunity ledger notify failed (non-fatal): %s",
+                    self.client_id, _ledger_exc,
+                )
+        exit_hook_result = None
+        if not _defer_side_effects:
+            exit_hook_result = self._handle_exit_engine_hooks(
+                current=current, new_status=new_status, position_id=position_id,
+                filled_qty=filled_qty, fill_price=fill_price,
                 broker_order_id=broker_order_id or current.get("broker_order_id"),
-                position_id=position_id or current.get("position_id"),
-                last_error=last_error,
-                fill_price=fill_price,
-                filled_qty=filled_qty,
-                filled_ts=filled_ts,
+                local_order_id=local_order_id,
             )
-        except Exception as _ledger_exc:
-            log.debug(
-                "[%s] opportunity ledger notify failed (non-fatal): %s",
-                self.client_id, _ledger_exc,
-            )
-        exit_hook_result = self._handle_exit_engine_hooks(
-            current=current, new_status=new_status, position_id=position_id,
-            filled_qty=filled_qty, fill_price=fill_price,
-            broker_order_id=broker_order_id or current.get("broker_order_id"),
-            local_order_id=local_order_id,
-        )
         if (
             kind.upper() == "EXIT"
             and new_status in (
@@ -7484,13 +7525,24 @@ class APOrderStateMachine:
             )
             return None
 
-    def _get_order(self, local_order_id: str):
+    def _get_order(
+        self,
+        local_order_id: str,
+        *,
+        _connection=None,
+        _for_update: bool = False,
+    ):
+        sql = "SELECT * FROM orders WHERE local_order_id=%s AND client_id=%s"
+        if _for_update:
+            sql += " FOR UPDATE"
+        params = (local_order_id, self.client_id)
+        if _connection is not None:
+            _connection.execute(sql, params)
+            return _connection.fetchone()
+
         def _fn():
             with conn() as c:
-                c.execute(
-                    "SELECT * FROM orders WHERE local_order_id=%s AND client_id=%s",
-                    (local_order_id, self.client_id),
-                )
+                c.execute(sql, params)
                 return c.fetchone()
         return run_with_retry(_fn)
 

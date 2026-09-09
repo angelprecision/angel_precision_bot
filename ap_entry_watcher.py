@@ -2137,12 +2137,55 @@ class APEntryWatcher:
 
     def _load_order_row_for_recovery_rearm(self, local_order_id: Optional[str]) -> dict:
         """Best-effort OSM row load for recovery rearm classification."""
+        return self._load_order_row_for_recovery_rearm_with_connection(
+            local_order_id,
+        )
+
+    def _load_order_row_for_recovery_rearm_with_connection(
+        self,
+        local_order_id: Optional[str],
+        *,
+        _connection=None,
+        _for_update: bool = False,
+    ) -> dict:
+        """Load one exact ENTRY row, optionally on the admission transaction.
+
+        Ordinary callers retain the existing OSM read path.  The recovery
+        replacement transaction must read and lock every displaced incumbent
+        through the same PostgreSQL connection that owns the candidate fence;
+        otherwise a later incumbent failure can leave an already-committed
+        cancellation behind.
+        """
         oid = str(local_order_id or "").strip()
         if not oid:
             return {}
         osm = getattr(self, "order_state_machine", None)
         if osm is None:
             return {}
+        if _connection is not None:
+            client_id = getattr(osm, "client_id", None)
+            if not isinstance(client_id, str) or not client_id.strip():
+                return {}
+            sql = (
+                "SELECT * FROM orders "
+                "WHERE local_order_id=%s AND client_id=%s AND kind='ENTRY'"
+            )
+            if _for_update:
+                sql += " FOR UPDATE"
+            try:
+                cursor = _connection.execute(sql, (oid, client_id))
+                fetchone = getattr(cursor, "fetchone", None)
+                if not callable(fetchone):
+                    return {}
+                row = fetchone()
+                return dict(row) if row else {}
+            except Exception as exc:
+                log.warning(
+                    "[%s] recovery rearm transaction row load failed: %s",
+                    oid,
+                    exc,
+                )
+                return {}
         for name in ("get_order", "get", "get_order_by_local_id"):
             fn = getattr(osm, name, None)
             if not callable(fn):
@@ -2323,6 +2366,105 @@ class APEntryWatcher:
                 )
             if incoming_value != durable_value:
                 return False, f"recovery_lifecycle_identity_mismatch_{field}"
+
+        def _trigger_evidence(
+            container: dict,
+            sources: list[dict],
+            local_id: str,
+        ) -> tuple[Optional[datetime], Optional[tuple[str, str, str, str]], str]:
+            """Parse confirmed-trigger timestamp and provenance without fallback."""
+            raw_timestamps: list[object] = []
+            raw_provenance: list[object] = []
+            if "trigger_crossed_at" in container:
+                raw_timestamps.append(container.get("trigger_crossed_at"))
+            if "trigger_crossed_at_provenance" in container:
+                raw_provenance.append(container.get("trigger_crossed_at_provenance"))
+            for source in sources:
+                if "trigger_crossed_at" in source:
+                    raw_timestamps.append(source.get("trigger_crossed_at"))
+                if "trigger_crossed_at_provenance" in source:
+                    raw_provenance.append(source.get("trigger_crossed_at_provenance"))
+
+            # ``watch()`` carries an explicit ``None`` placeholder on a
+            # recovery plan when no confirmed breach exists.  That is the
+            # contract's absence-of-proof state; only a populated timestamp
+            # requires provenance validation.
+            if raw_timestamps and all(value is None for value in raw_timestamps):
+                raw_timestamps = []
+
+            if not raw_timestamps:
+                if raw_provenance:
+                    return (
+                        None,
+                        None,
+                        "recovery_lifecycle_trigger_provenance_without_timestamp",
+                    )
+                return None, None, ""
+
+            parsed_timestamps: list[datetime] = []
+            for raw_timestamp in raw_timestamps:
+                parsed = _parse_trigger_crossed_at(raw_timestamp)
+                if parsed is None:
+                    return None, None, "recovery_lifecycle_malformed_trigger_crossed_at"
+                parsed_timestamps.append(parsed.astimezone(timezone.utc))
+            if any(value != parsed_timestamps[0] for value in parsed_timestamps[1:]):
+                return None, None, "recovery_lifecycle_conflicting_trigger_crossed_at"
+
+            if not raw_provenance:
+                return None, None, "recovery_lifecycle_missing_trigger_crossed_at_provenance"
+
+            # Reuse the existing recovery contract after presenting all
+            # metadata aliases as one explicit source.  This keeps the final
+            # row-locked fence aligned with the upstream trigger-evidence
+            # proof instead of maintaining a weaker second definition.
+            merged_metadata: dict = {}
+            for source in sources:
+                merged_metadata.update(source)
+            validation_container = dict(container)
+            validation_container["metadata"] = merged_metadata
+            if not recovery_trigger_evidence_identity_is_proven(
+                validation_container,
+                local_id,
+            ):
+                return None, None, "recovery_lifecycle_trigger_provenance_unproven"
+
+            provenance_keys: list[tuple[str, str, str, str]] = []
+            for provenance in raw_provenance:
+                if not isinstance(provenance, dict):
+                    return None, None, "recovery_lifecycle_malformed_trigger_provenance"
+                provenance_keys.append(
+                    (
+                        str(provenance.get("canonical_signal_id") or "").strip(),
+                        str(provenance.get("client_id") or "").strip().lower(),
+                        str(provenance.get("execution_mode") or "").strip().lower(),
+                        str(provenance.get("local_order_id") or "").strip(),
+                    )
+                )
+            if any(value != provenance_keys[0] for value in provenance_keys[1:]):
+                return None, None, "recovery_lifecycle_conflicting_trigger_provenance"
+            return parsed_timestamps[0], provenance_keys[0], ""
+
+        incoming_trigger, incoming_provenance, incoming_trigger_error = _trigger_evidence(
+            signal,
+            signal_sources,
+            requested_local_order_id,
+        )
+        if incoming_trigger_error:
+            return False, incoming_trigger_error
+        durable_trigger, durable_provenance, durable_trigger_error = _trigger_evidence(
+            row,
+            row_sources,
+            requested_local_order_id,
+        )
+        if durable_trigger_error:
+            return False, durable_trigger_error
+        if (incoming_trigger is None) != (durable_trigger is None):
+            return False, "recovery_lifecycle_trigger_crossed_at_authority_mismatch"
+        if incoming_trigger is not None and incoming_trigger != durable_trigger:
+            return False, "recovery_lifecycle_trigger_crossed_at_mismatch"
+        if incoming_provenance != durable_provenance:
+            return False, "recovery_lifecycle_trigger_provenance_mismatch"
+
         return True, "recovery_lifecycle_durable_identity_proven"
 
     @staticmethod
@@ -2553,7 +2695,13 @@ class APEntryWatcher:
         )
 
         if getattr(self, "_test_only_allow_recovery_without_row_lock", False):
-            yield None, None
+            try:
+                yield None, None, None
+            except BaseException as exc:
+                if getattr(exc, "recovery_admission_rollback", False):
+                    self._recovery_admission_abort_reason = str(exc)
+                    return
+                raise
             return
 
         if (
@@ -2562,16 +2710,16 @@ class APEntryWatcher:
             or not local_order_id
             or not signal_client_id.strip()
         ):
-            yield None, "recovery_lifecycle_missing_durable_fence_identity"
+            yield None, "recovery_lifecycle_missing_durable_fence_identity", None
             return
         if (
             client_id != client_id.strip()
             or signal_client_id != signal_client_id.strip()
         ):
-            yield None, "recovery_lifecycle_identity_mismatch_client_id"
+            yield None, "recovery_lifecycle_identity_mismatch_client_id", None
             return
         if client_id != signal_client_id:
-            yield None, "recovery_lifecycle_identity_mismatch_client_id"
+            yield None, "recovery_lifecycle_identity_mismatch_client_id", None
             return
 
         try:
@@ -2582,7 +2730,7 @@ class APEntryWatcher:
                 getattr(watched, "ticker", "?"),
                 exc,
             )
-            yield None, "recovery_lifecycle_durable_fence_unavailable"
+            yield None, "recovery_lifecycle_durable_fence_unavailable", None
             return
 
         _db_context = None
@@ -2598,13 +2746,13 @@ class APEntryWatcher:
             _fetchone = getattr(_cursor, "fetchone", None)
             if not callable(_fetchone):
                 _db_context.__exit__(None, None, None)
-                yield None, "recovery_lifecycle_durable_fence_unavailable"
+                yield None, "recovery_lifecycle_durable_fence_unavailable", None
                 return
             _row = _fetchone()
             _row = dict(_row) if _row else None
             if _row is None:
                 _db_context.__exit__(None, None, None)
-                yield None, "recovery_lifecycle_durable_row_unavailable"
+                yield None, "recovery_lifecycle_durable_row_unavailable", None
                 return
         except Exception as exc:
             if _db_context is not None:
@@ -2618,18 +2766,38 @@ class APEntryWatcher:
                 local_order_id,
                 exc,
             )
-            yield None, "recovery_lifecycle_durable_fence_unavailable"
+            yield None, "recovery_lifecycle_durable_fence_unavailable", None
             return
 
         try:
             # The transaction remains open, so the row lock remains held while
             # the caller performs the final proof and commits the watcher.
-            yield _row, None
+            # Keep the connection visible to the commit helper so every
+            # incumbent read/cancellation and its terminal reread stays in
+            # this same transaction until the candidate has converged.
+            yield _row, None, _connection
         except BaseException as exc:
             _db_context.__exit__(type(exc), exc, exc.__traceback__)
+            if getattr(exc, "recovery_admission_rollback", False):
+                self._recovery_admission_abort_reason = str(exc)
+                return
             raise
         else:
-            _db_context.__exit__(None, None, None)
+            try:
+                _db_context.__exit__(None, None, None)
+            except Exception as exc:
+                # A commit failure means the durable candidate/incident
+                # transaction is not proven.  Convert it into the same
+                # fail-closed cleanup path used for incumbent proof failure;
+                # never leak an exception after lifecycle/registry mutation.
+                log.critical(
+                    "[%s] recovery admission transaction commit failed: %s",
+                    getattr(watched, "ticker", "?"),
+                    exc,
+                )
+                self._recovery_admission_abort_reason = (
+                    "recovery_lifecycle_durable_commit_failed"
+                )
 
     def _is_past_entry_cutoff_now(self) -> bool:
         try:
@@ -3995,6 +4163,19 @@ class APEntryWatcher:
                 registration_provenance_out["registration_token"] = None
             return False
 
+        class _RecoveryDurableRollback(RuntimeError):
+            """Abort the admission transaction before any incumbent commit."""
+
+            recovery_admission_rollback = True
+
+            def __init__(self, reason: str):
+                super().__init__(reason)
+                self.reason = reason
+
+        _terminal_proven: list[tuple[object, str, dict]] = []
+        _deferred_ledger_rows: list[dict] = []
+        self._recovery_admission_abort_reason = None
+
         # A fresh row is read while the exact durable row lock is held.  A
         # double-read is deliberately not substituted for this boundary: the
         # row lock is what prevents a competing owner from committing between
@@ -4002,6 +4183,7 @@ class APEntryWatcher:
         with self._recovery_admission_row_lock(watched) as (
             _locked_row,
             _lock_error,
+            _admission_connection,
         ):
             if _lock_error:
                 return _hold(_lock_error)
@@ -4030,14 +4212,10 @@ class APEntryWatcher:
             # after lifecycle restoration, remove only this candidate's
             # partial bookkeeping and close WATCHING through the canonical
             # lifecycle API; never return HOLD with a false WATCHING owner.
-            _candidate_dedup_added = False
-            _candidate_registered = False
             try:
                 if dedup_key:
                     self._dedup_set.add(dedup_key)
-                    _candidate_dedup_added = True
                 self._pending.append(watched)
-                _candidate_registered = True
 
                 if registration_provenance_out is not None:
                     registration_provenance_out["created_by_this_call"] = True
@@ -4050,15 +4228,23 @@ class APEntryWatcher:
 
             # Destructive incumbent bookkeeping is delayed until the candidate
             # has both legal lifecycle ownership and a committed registry slot.
-            # Each displaced durable row must then converge through the existing
-            # exact OSM cancellation path and a terminal reread before its
-            # process-local registration or dedup ownership is released.
+            # Every displaced durable row is read, locked, cancelled, and
+            # terminally reread on the same PostgreSQL transaction.  A later
+            # failure raises through the row-lock context so every prior
+            # incumbent UPDATE rolls back with the candidate admission.
             if deferred_conflicts:
                 _deferred_incumbents = []
                 for incumbent, *_details in deferred_conflicts:
                     if incumbent not in _deferred_incumbents:
                         _deferred_incumbents.append(incumbent)
-                _terminal_proven: list[tuple[object, str]] = []
+                _deferred_incumbents.sort(
+                    key=lambda incumbent: str(
+                        (getattr(incumbent, "signal", {}) or {}).get(
+                            "local_order_id"
+                        )
+                        or ""
+                    )
+                )
                 osm = getattr(self, "order_state_machine", None)
                 cancel_pending = getattr(osm, "cancel_pending_entry", None)
                 for incumbent in _deferred_incumbents:
@@ -4072,13 +4258,14 @@ class APEntryWatcher:
                         getattr(incumbent, "_registration_token", "") or ""
                     )
                     if not incumbent_oid or not callable(cancel_pending):
-                        _rollback_candidate(
+                        raise _RecoveryDurableRollback(
                             "recovery_incumbent_cancellation_unavailable"
                         )
-                        return _hold("recovery_incumbent_cancellation_unavailable")
 
-                    incumbent_row = self._load_order_row_for_recovery_rearm(
-                        incumbent_oid
+                    incumbent_row = self._load_order_row_for_recovery_rearm_with_connection(
+                        incumbent_oid,
+                        _connection=_admission_connection,
+                        _for_update=_admission_connection is not None,
                     )
                     incumbent_identity_ok, _ = (
                         self._recovery_identity_matches_durable_row(
@@ -4086,22 +4273,38 @@ class APEntryWatcher:
                         )
                     )
                     if not incumbent_identity_ok:
-                        _rollback_candidate("recovery_incumbent_identity_unproven")
-                        return _hold("recovery_incumbent_identity_unproven")
+                        raise _RecoveryDurableRollback(
+                            "recovery_incumbent_identity_unproven"
+                        )
                     try:
-                        cancel_ok = bool(cancel_pending(
-                            incumbent_oid,
-                            reason="recovery_watcher_replacement_converged",
-                        ))
+                        if _admission_connection is not None:
+                            cancel_ok = bool(cancel_pending(
+                                incumbent_oid,
+                                reason="recovery_watcher_replacement_converged",
+                                _connection=_admission_connection,
+                                _defer_side_effects=True,
+                            ))
+                        else:
+                            # The explicit unit seam is intentionally allowed
+                            # to use a test double without a database.  The
+                            # production path can only reach here with the
+                            # PostgreSQL admission connection above.
+                            cancel_ok = bool(cancel_pending(
+                                incumbent_oid,
+                                reason="recovery_watcher_replacement_converged",
+                            ))
                     except Exception:
-                        _rollback_candidate("recovery_incumbent_cancellation_raised")
-                        return _hold("recovery_incumbent_cancellation_raised")
+                        raise _RecoveryDurableRollback(
+                            "recovery_incumbent_cancellation_raised"
+                        )
                     if not cancel_ok:
-                        _rollback_candidate("recovery_incumbent_cancellation_failed")
-                        return _hold("recovery_incumbent_cancellation_failed")
+                        raise _RecoveryDurableRollback(
+                            "recovery_incumbent_cancellation_failed"
+                        )
 
-                    terminal_row = self._load_order_row_for_recovery_rearm(
-                        incumbent_oid
+                    terminal_row = self._load_order_row_for_recovery_rearm_with_connection(
+                        incumbent_oid,
+                        _connection=_admission_connection,
                     )
                     terminal_status = str(
                         terminal_row.get("status") or ""
@@ -4119,15 +4322,20 @@ class APEntryWatcher:
                         }
                         or not terminal_identity_ok
                     ):
-                        _rollback_candidate(
+                        raise _RecoveryDurableRollback(
                             "recovery_incumbent_terminal_proof_unproven"
                         )
-                        return _hold(
-                            "recovery_incumbent_terminal_proof_unproven"
-                        )
-                    _terminal_proven.append((incumbent, incumbent_token))
+                    _terminal_proven.append(
+                        (incumbent, incumbent_token, incumbent_row)
+                    )
+                    if _admission_connection is not None:
+                        _deferred_ledger_rows.append({
+                            "current": incumbent_row,
+                            "new_status": terminal_status,
+                            "last_error": "recovery_watcher_replacement_converged",
+                        })
 
-                for incumbent, incumbent_token in _terminal_proven:
+                for incumbent, incumbent_token, _incumbent_row in _terminal_proven:
                     # The outer registry lock prevents normal concurrent
                     # replacement, but retain an exact token/object fence so a
                     # future refactor cannot remove a newly registered object
@@ -4137,26 +4345,69 @@ class APEntryWatcher:
                         or str(getattr(incumbent, "_registration_token", "") or "")
                         != incumbent_token
                     ):
-                        _rollback_candidate(
+                        raise _RecoveryDurableRollback(
                             "recovery_incumbent_registration_changed"
                         )
-                        return _hold("recovery_incumbent_registration_changed")
-                    incumbent.state = WatchState.CANCELLED
-                    incumbent._release_dedup_key()
-                    log.info(
-                        "[%s] RECOVERY_CONFLICT_COMMITTED — replaced incumbent "
-                        "only after candidate lifecycle/registry commit | "
-                        "incumbent_signal_id=%s incumbent_local_order_id=%s",
-                        watched.ticker,
-                        incumbent.signal.get("signal_id"),
-                        incumbent.signal.get("local_order_id"),
+
+        _admission_abort_reason = getattr(
+            self,
+            "_recovery_admission_abort_reason",
+            None,
+        )
+        self._recovery_admission_abort_reason = None
+        if _admission_abort_reason:
+            _rollback_candidate(_admission_abort_reason)
+            return _hold(_admission_abort_reason)
+
+        # The admission context has committed here.  Only now may the
+        # incumbent's process-local ownership be released.  Ledger
+        # observability is also deliberately deferred until the durable
+        # cancellation transaction has committed, so rollback leaves no
+        # opportunity-state side effect behind.
+        osm = getattr(self, "order_state_machine", None)
+        notify_ledger = getattr(osm, "_notify_opportunity_ledger", None)
+        if callable(notify_ledger):
+            for ledger_row in _deferred_ledger_rows:
+                try:
+                    notify_ledger(
+                        current=ledger_row["current"],
+                        new_status=ledger_row["new_status"],
+                        last_error=ledger_row["last_error"],
                     )
-                terminal_objects = {id(item) for item, _token in _terminal_proven}
-                self._pending = [
-                    existing for existing in self._pending
-                    if id(existing) not in terminal_objects
-                ]
-            return True
+                except Exception as exc:
+                    log.debug(
+                        "[%s] deferred recovery cancellation ledger notify failed: %s",
+                        watched.ticker,
+                        exc,
+                    )
+
+        for incumbent, incumbent_token, _incumbent_row in _terminal_proven:
+            # The outer registry lock prevents normal concurrent replacement,
+            # but retain an exact token/object fence before touching memory.
+            if (
+                incumbent not in self._pending
+                or str(getattr(incumbent, "_registration_token", "") or "")
+                != incumbent_token
+            ):
+                _rollback_candidate("recovery_incumbent_registration_changed")
+                return _hold("recovery_incumbent_registration_changed")
+            incumbent.state = WatchState.CANCELLED
+            incumbent._release_dedup_key()
+            log.info(
+                "[%s] RECOVERY_CONFLICT_COMMITTED — replaced incumbent "
+                "only after candidate lifecycle/registry commit | "
+                "incumbent_signal_id=%s incumbent_local_order_id=%s",
+                watched.ticker,
+                incumbent.signal.get("signal_id"),
+                incumbent.signal.get("local_order_id"),
+            )
+        terminal_objects = {id(item) for item, _token, _row in _terminal_proven}
+        self._pending = [
+            existing for existing in self._pending
+            if id(existing) not in terminal_objects
+        ]
+        self._recovery_admission_abort_reason = None
+        return True
 
     def add_signal(
         self, signal: dict, *, registration_provenance_out: Optional[dict] = None,

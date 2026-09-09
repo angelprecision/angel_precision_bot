@@ -250,11 +250,19 @@ def test_reattach_with_proven_terminal_truth_terminalizes_existing_order_once(
     w, cancel_spy, add_spy = _make_watcher_for_reattach(
         monkeypatch, quote_bid=bid, quote_ask=ask,
     )
+    plan = _reattach_plan(
+        local_order_id="local-existing-terminal", confirmed=True
+    )
+    # The final #580 identity fence now re-proves confirmed-trigger
+    # provenance against the durable row as well as the incoming plan.  Make
+    # this terminal-truth fixture represent the real persisted PENDING_TRIGGER
+    # shape instead of leaving the timestamp only on the recovery plan.
+    durable_row = w.order_state_machine.get_order("local-existing-terminal")
+    durable_row["meta"].update(plan.metadata)
+    w.order_state_machine.get_order = lambda _oid: dict(durable_row)
 
     result = w.watch(
-        _reattach_plan(
-            local_order_id="local-existing-terminal", confirmed=True
-        ),   # real rearmed recovery has trigger_crossed_at + provenance
+        plan,   # real rearmed recovery has trigger_crossed_at + provenance
         local_order_id="local-existing-terminal",
         recovery_rearm=True,
         no_cancel_on_reject=True,

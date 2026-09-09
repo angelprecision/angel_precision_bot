@@ -27,6 +27,7 @@ import json
 import os
 import threading
 import types
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1901,6 +1902,229 @@ class TestPR580AmendmentCorrections:
         ) == evidence["lifecycle"].SignalState.ERROR
         assert not evidence["osm"].submit_existing_entry.mock_calls
         self._assert_no_broker_mutation(evidence["broker"])
+
+    def _transactional_replacement_fixture(self, *, hide_terminal_read=False):
+        """Exercise the production candidate/OSM transaction seam with a
+        rollback-capable connection double.
+
+        The ordinary unit seam intentionally has no durable transaction.  This
+        fixture models the production row-lock context closely enough to prove
+        that a successful incumbent A cancellation is not allowed to survive a
+        later incumbent B/proof failure.
+        """
+        import ap_entry_watcher as ew, ap_lifecycle as L
+
+        with L.LEDGER._entry_lock:
+            L.LEDGER._current_state.clear()
+
+        candidate_sig = self._recovery_sig(
+            signal_id="candidate-transactional",
+            canonical_signal_id="candidate-canonical-transactional",
+            local_order_id="lo-candidate-transactional",
+            score=95.0,
+        )
+        candidate_sig["metadata"].update({
+            "canonical_signal_id": candidate_sig["canonical_signal_id"],
+            "client_id": candidate_sig["client_id"],
+            "execution_mode": candidate_sig["execution_mode"],
+        })
+        incumbents = []
+        rows = {
+            candidate_sig["local_order_id"]: self._durable_recovery_row(candidate_sig),
+        }
+        for index, score in enumerate((70.0, 80.0), start=1):
+            incumbent_sig = self._recovery_sig(
+                signal_id=f"incumbent-transactional-{index}",
+                canonical_signal_id=f"incumbent-canonical-transactional-{index}",
+                local_order_id=f"lo-incumbent-transactional-{index}",
+                score=score,
+            )
+            incumbent_sig["metadata"].update({
+                "canonical_signal_id": incumbent_sig["canonical_signal_id"],
+                "client_id": incumbent_sig["client_id"],
+                "execution_mode": incumbent_sig["execution_mode"],
+            })
+            rows[incumbent_sig["local_order_id"]] = self._durable_recovery_row(
+                incumbent_sig
+            )
+            incumbents.append(incumbent_sig)
+
+        class _Cursor:
+            def __init__(self, transaction):
+                self.transaction = transaction
+                self.selected = None
+
+            @property
+            def rowcount(self):
+                return 1
+
+            def execute(self, _sql, params=()):
+                self.selected = str(params[0]) if params else None
+                return self
+
+            def fetchone(self):
+                row = self.transaction.rows.get(self.selected)
+                if row is None:
+                    return None
+                result = copy.deepcopy(row)
+                if (
+                    self.transaction.hide_terminal_read
+                    and self.selected in self.transaction.cancelled
+                ):
+                    result["status"] = "PENDING_TRIGGER"
+                return result
+
+        class _Transaction:
+            def __init__(self, source, hide_terminal_read):
+                self.rows = copy.deepcopy(source)
+                self.hide_terminal_read = hide_terminal_read
+                self.cancelled = set()
+                self.cursor = _Cursor(self)
+
+            def execute(self, sql, params=()):
+                self.cursor.execute(sql, params)
+                return self.cursor
+
+        class _OSM:
+            client_id = "jason@example.com"
+
+            def __init__(self, source):
+                self.source = source
+                self.cancel_calls = []
+                self.fail_second = False
+
+            def get_order(self, oid):
+                return copy.deepcopy(self.source.get(oid, {}))
+
+            def cancel_pending_entry(
+                self,
+                oid,
+                *,
+                reason,
+                _connection=None,
+                _defer_side_effects=False,
+            ):
+                self.cancel_calls.append((oid, _connection, _defer_side_effects))
+                if self.fail_second and oid.endswith("-2"):
+                    return False
+                _connection.rows[oid]["status"] = "CANCELED"
+                _connection.cancelled.add(oid)
+                return True
+
+        osm = _OSM(rows)
+        broker = MagicMock()
+        watcher = ew.APEntryWatcher(
+            broker=broker,
+            order_state_machine=osm,
+            require_on_trigger=False,
+            mode="LIVE",
+        )
+        watcher._persist_watcher_audit = lambda *a, **kw: None
+        watcher.on_trigger = MagicMock()
+
+        incumbent_objects = []
+        for incumbent_sig in incumbents:
+            incumbent = ew.WatchedSignal(incumbent_sig, overnight=False)
+            incumbent._watcher_ref = watcher
+            watcher._pending.append(incumbent)
+            watcher._dedup_set.add(incumbent.signal_id)
+            incumbent_objects.append(incumbent)
+
+        @contextmanager
+        def _row_lock(_watched):
+            transaction = _Transaction(rows, hide_terminal_read)
+            locked_row = copy.deepcopy(transaction.rows[candidate_sig["local_order_id"]])
+            try:
+                yield locked_row, None, transaction
+            except BaseException as exc:
+                # Match the production context's rollback/suppression seam.
+                if getattr(exc, "recovery_admission_rollback", False):
+                    watcher._recovery_admission_abort_reason = str(exc)
+                    return
+                raise
+            else:
+                rows.update(copy.deepcopy(transaction.rows))
+
+        watcher._recovery_admission_row_lock = _row_lock
+        return {
+            "watcher": watcher,
+            "osm": osm,
+            "broker": broker,
+            "rows": rows,
+            "candidate_sig": candidate_sig,
+            "incumbents": incumbent_objects,
+            "incumbent_sigs": incumbents,
+            "lifecycle": L,
+        }
+
+    def test_a6b_multi_incumbent_partial_failure_rolls_back_durable_a(self):
+        evidence = self._transactional_replacement_fixture()
+        evidence["osm"].fail_second = True
+        candidate = evidence["candidate_sig"]
+
+        assert evidence["watcher"].add_signal(candidate) is False
+        assert evidence["watcher"]._pending == evidence["incumbents"]
+        assert all(
+            evidence["rows"][sig["local_order_id"]]["status"] == "PENDING_TRIGGER"
+            for sig in evidence["incumbent_sigs"]
+        )
+        assert candidate["signal_id"] not in evidence["watcher"]._dedup_set
+        assert evidence["lifecycle"].LEDGER.current_state(
+            candidate["signal_id"]
+        ) == evidence["lifecycle"].SignalState.ERROR
+        assert len(evidence["osm"].cancel_calls) == 2
+        assert all(call[1] is not None and call[2] for call in evidence["osm"].cancel_calls)
+        self._assert_no_broker_mutation(evidence["broker"])
+
+    def test_a6c_terminal_reread_failure_rolls_back_successful_cancellation(self):
+        evidence = self._transactional_replacement_fixture(
+            hide_terminal_read=True,
+        )
+        candidate = evidence["candidate_sig"]
+
+        assert evidence["watcher"].add_signal(candidate) is False
+        assert evidence["watcher"]._pending == evidence["incumbents"]
+        assert all(
+            evidence["rows"][sig["local_order_id"]]["status"] == "PENDING_TRIGGER"
+            for sig in evidence["incumbent_sigs"]
+        )
+        assert candidate["signal_id"] not in evidence["watcher"]._dedup_set
+        assert evidence["lifecycle"].LEDGER.current_state(
+            candidate["signal_id"]
+        ) == evidence["lifecycle"].SignalState.ERROR
+        self._assert_no_broker_mutation(evidence["broker"])
+
+    def test_a6d_final_fence_reproves_trigger_timestamp_provenance(self):
+        import ap_entry_watcher as ew
+
+        sig = self._recovery_sig()
+        row = self._durable_recovery_row(sig)
+        crossed_at = "2026-09-08T13:00:00+00:00"
+        provenance = {
+            "canonical_signal_id": sig["canonical_signal_id"],
+            "client_id": sig["client_id"],
+            "execution_mode": sig["execution_mode"],
+            "local_order_id": sig["local_order_id"],
+        }
+        sig["trigger_crossed_at"] = crossed_at
+        sig["metadata"]["trigger_crossed_at"] = crossed_at
+        sig["metadata"]["trigger_crossed_at_provenance"] = dict(provenance)
+        row["meta"]["trigger_crossed_at"] = crossed_at
+        row["meta"]["trigger_crossed_at_provenance"] = dict(provenance)
+
+        assert ew.APEntryWatcher._recovery_identity_matches_durable_row(
+            sig, row, sig["local_order_id"]
+        ) == (True, "recovery_lifecycle_durable_identity_proven")
+
+        row["meta"]["trigger_crossed_at_provenance"] = dict(
+            provenance,
+            local_order_id="different-order",
+        )
+        ok, reason = ew.APEntryWatcher._recovery_identity_matches_durable_row(
+            sig, row, sig["local_order_id"]
+        )
+        assert ok is False
+        assert "trigger_provenance" in reason
 
     def test_a7_materialization_resume_does_not_enter_pr580_transaction(self):
         """Real #596 adoption registers once without entering #580 lifecycle."""

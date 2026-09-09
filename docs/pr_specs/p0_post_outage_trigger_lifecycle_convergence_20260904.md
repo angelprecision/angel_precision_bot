@@ -60,12 +60,18 @@ its lifecycle/registry convergence.
   materializer handoff proof, lifecycle restoration, candidate registry/dedup
   and per-call provenance commit. Candidate rollback is failure-atomic; an
   unrepaired lifecycle transition is an explicit quarantine that blocks a
-  duplicate recovery attempt.
+  duplicate recovery attempt. Every displaced incumbent row is also locked,
+  cancelled, and terminally reread on this same transaction; a later
+  incumbent/proof failure rolls back every earlier durable cancellation.
 - A replacement candidate becomes durable watcher owner first. The exact
   displaced incumbent is then identity-reread, cancelled through the existing
   `cancel_pending_entry` authority, reread as terminal, and only then removed
   from `_pending` and dedup. Cancellation failure/exception/identity drift
   preserves the incumbent byte-for-byte and returns HOLD.
+- The final identity fence re-proves populated `trigger_crossed_at` values and
+  their four-field provenance against both the recovery plan and locked durable
+  row. Missing, malformed, conflicting, or one-sided timestamp/provenance is
+  HOLD.
 - A post-lock broker/materializer owner is reread before trigger dispatch;
   the recovered callback is suppressed and no second economic attempt or
   invented broker cancel is made.
@@ -118,6 +124,23 @@ broker-handoff evidence HOLD before the shared classifier or watcher
 registration. This closes the plan-to-row identity gap without changing
 ordinary admissions or retry/terminal classifier precedence.
 
+### Correction 7 — Incumbent replacement is one durable transaction
+
+The recovery bridge now passes the held PostgreSQL connection through the
+existing OSM `cancel_pending_entry()`/`transition()` authority. Every displaced
+incumbent is selected with `FOR UPDATE`, cancelled with transition
+observability deferred, and terminally reread before any process-local state is
+released. Incumbents are processed in deterministic local-order order. If a
+later cancellation, terminal reread, or registration-token proof fails, the
+admission context rolls back all prior incumbent updates; the candidate is
+closed through the canonical lifecycle failure path and the incumbent registry,
+dedup, and durable rows remain intact. Public OSM callers retain their existing
+connection and ledger behavior.
+
+The final fence also applies the existing `trigger_crossed_at` parser and
+provenance contract independently to the incoming plan and durable row, then
+requires exact timestamp/provenance agreement.
+
 ### Correction 3 — Lifecycle import failure must fail closed
 
 `_EW_LIFECYCLE_OK == False` path changed from soft success
@@ -167,11 +190,14 @@ order mutation.
 ## Implementation summary (current amendment)
 
 Production files changed:
-- `ap_entry_watcher.py` — 430 insertions / 113 deletions (prior amendment),
-  plus `20 insertions / 3 deletions` in the follow-up boundary commit. Changed recovery
+- `ap_entry_watcher.py` — 308 insertions / 57 deletions in this follow-up
+  (in addition to the prior amendment). Changed recovery
   identity/generation/final-authority helpers, row-lock fence, lifecycle
   repair, candidate commit/replacement convergence, strict recovery `watch()`
   construction, and `add_signal()`'s recovery-only constructor guard.
+- `ap/order_state_machine.py` — 129 insertions / 79 deletions in this
+  follow-up. Added only the private transaction-aware seam used by recovery
+  replacement; public cancellation/transition behavior is unchanged.
 - `ap_entry_watcher/__init__.py` — 36 insertions. Changed the package poll
   dispatch seam to reread durable ownership after the admission lock.
 
@@ -179,16 +205,17 @@ Test/CI files changed:
 - `.github/workflows/p0_regression.yml` — 1 insertion / 1 deletion; exact-head
   and merge-ref jobs run the complete lifecycle-integrity file plus the
   canonical P0 inventory with PostgreSQL enabled.
-- `tests/test_p0_pending_trigger_lifecycle_integrity.py` — 542 insertions /
-  17 deletions (prior amendment), plus `181 insertions / 25 deletions` in the
-  follow-up; complete identity/generation/OSM-fence/lifecycle failure,
+- `tests/test_p0_pending_trigger_lifecycle_integrity.py` — 224 insertions in
+  this follow-up; complete identity/generation/OSM-fence/lifecycle failure,
   replacement convergence, materialization-resume isolation, and real
-  PostgreSQL lock-race coverage.
+  PostgreSQL lock-race coverage, including multi-incumbent rollback and
+  terminal-reread failure.
 - `tests/test_p0_amendment5_7_recovery_outcome_integrity.py` — `95 insertions /
   3 deletions` in the follow-up; exact RTX CAS-miss retention-failure replay.
 - `tests/test_p0_post_outage_trigger_lifecycle_convergence.py` — 4 insertions;
   explicit test-only fence seam for the September 8 Jason LIVE replay.
-- `tests/test_p0_reattach_no_cancel_on_missing_quote.py` — 5 insertions;
+- `tests/test_p0_reattach_no_cancel_on_missing_quote.py` — 11 insertions /
+  3 deletions in this follow-up;
   explicit test-only fence seam and complete identity fixture.
 - `tests/test_p0_prebreach_stop_activation.py` — 3 insertions; existing
   production-shaped recovery fixtures explicitly opt into the test-only
@@ -199,11 +226,12 @@ Test/CI files changed:
   explicit test-only fence seam.
 
 `ap/pending_trigger_restart_recovery.py` and all #596 production retry
-authority remain unchanged by this amendment.
+authority remain unchanged by this amendment. The only OSM change is the
+private transaction-aware recovery cancellation seam described above.
 
 Files NOT touched (§4/§5 binding):
 - `ap_lifecycle.py`, `ap/order_monitor.py`, `ap/preopen_readiness.py`,
-  `ap_overnight_reeval.py`, `ap/order_state_machine.py`,
+  `ap_overnight_reeval.py`,
   `ap/selector_retry_policy.py`, `ap_execution_core.py`,
   `ap/exposure_gate.py`, contract selector, scanner, sizing, scoring,
   exit engine, reconciler, broker adapters, proof_trades, queue,
