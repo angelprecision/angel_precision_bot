@@ -76,7 +76,9 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
+import types
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
@@ -607,6 +609,27 @@ class TestProductionBoundaryProjection:
         monkeypatch.setenv("DEFERRED_RETRY_OWNER_GRACE_SECONDS", "0")
         monkeypatch.setenv("SELECTOR_DURABLE_RECOVERY_CURSOR_ENABLED", "0")
         monkeypatch.setenv("INTELLIGENCE_EVIDENCE_ENABLED", "0")
+
+        # The P0 workflow intentionally installs only minimal dependencies;
+        # ap.execution's optional yfinance import is outside this liveness
+        # boundary. Keep the production core's existing refresh seam present
+        # with the same five-value contract so the test reaches the real OSM
+        # handoff without making dependency installation part of the proof.
+        fake_execution = types.ModuleType("ap.execution")
+        fake_execution._refresh_ask_at_submit = lambda *_args, **_kwargs: (
+            1.05,
+            0,
+            True,
+            "",
+            {
+                "submit_bid": 1.04,
+                "submit_ask": 1.05,
+                "submit_last": 1.045,
+                "submit_mid": 1.045,
+                "spread_pct": (1.05 - 1.04) / 1.045,
+            },
+        )
+        monkeypatch.setitem(sys.modules, "ap.execution", fake_execution)
 
         # All production DB calls below use the test-owned schema. The real
         # SQL, real OSM CAS, and real monitor/recovery methods remain intact.
