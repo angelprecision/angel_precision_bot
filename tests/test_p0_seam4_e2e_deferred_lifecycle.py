@@ -189,7 +189,7 @@ class _StatefulOSM:
             raise RuntimeError("db_hiccup")
         return self._copy_row()
 
-    def update_order_meta(self, local_order_id, patch):
+    def update_order_meta(self, local_order_id, patch, **_expected):
         assert local_order_id == LOCAL_ORDER_ID
         self._merge_meta(patch)
         return True
@@ -628,7 +628,7 @@ class _ConcurrentTxnStore:
         with self.lock:
             return copy.deepcopy(self.row)
 
-    def update_order_meta(self, patch: dict) -> None:
+    def update_order_meta(self, patch: dict, **_expected) -> None:
         with self.lock:
             self._merge_meta(self.row.setdefault("meta", {}), patch)
 
@@ -793,7 +793,7 @@ class _ConcurrentOSM:
             return None
         return self.store.get_row_copy()
 
-    def update_order_meta(self, local_order_id, patch):
+    def update_order_meta(self, local_order_id, patch, **_expected):
         assert local_order_id == LOCAL_ORDER_ID
         self.store.update_order_meta(patch)
         return True

@@ -350,6 +350,8 @@ def test_postgres_confirmation_cas_has_one_winner_and_never_repairs_timestamp_on
                     signal_id TEXT,
                     canonical_signal_id TEXT,
                     status TEXT,
+                    broker_order_id TEXT,
+                    submitted_ts TIMESTAMPTZ,
                     meta JSONB,
                     updated_ts TIMESTAMPTZ
                 )
