@@ -310,6 +310,28 @@ def test_set_entry_permission_requires_live_ready_nonstale_scheduler(
     assert not runner.entries_allowed.is_set()
 
 
+def test_started_scheduler_readiness_allows_entry_permission(monkeypatch):
+    """The startup handshake is sufficient to let the normal gate proceed."""
+    runner = _permission_runner()
+    runner.stopped = threading.Event()
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+
+    assert runner.deferred_recovery_thread is not None
+    assert runner.deferred_recovery_thread.is_alive()
+    assert runner.deferred_recovery_scheduler_ready.is_set()
+    assert runner._set_entry_permission() is True
+    assert runner.entries_allowed.is_set()
+
+    runner.stopping.set()
+    runner.stopped.set()
+    runner.deferred_recovery_thread.join(timeout=2)
+    assert not runner.deferred_recovery_thread.is_alive()
+
+
 def test_scheduler_dies_immediately_before_health_tick_keeps_entries_blocked(monkeypatch):
     """A startup child that exits before the first health tick fails closed."""
     runner = _permission_runner()
@@ -460,6 +482,45 @@ def _stop_runner_threads(runner):
         if thread is not None:
             thread.join(timeout=3)
             assert not thread.is_alive()
+
+
+def test_health_loop_does_not_invoke_deferred_recovery_scheduler(monkeypatch):
+    """Only the dedicated scheduler may call the deferred recovery boundary."""
+    runner = _health_loop_runner()
+    _disable_health_side_effects(monkeypatch, runner)
+    health_tick = threading.Event()
+    scheduler_tick = threading.Event()
+    deferred_calls = []
+
+    def health_permission():
+        health_tick.set()
+
+    def deferred_tick():
+        deferred_calls.append("scheduler")
+        scheduler_tick.set()
+
+    monkeypatch.setattr(runner, "_set_entry_permission", health_permission)
+    monkeypatch.setattr(
+        runner,
+        "_check_deferred_recovery_scheduler_health",
+        MagicMock(return_value=True),
+    )
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", deferred_tick)
+    monkeypatch.setenv("RUNNER_HEALTH_CHECK_SEC", "0.01")
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "1")
+
+    runner._start_runtime_health_loop()
+    assert health_tick.wait(timeout=2)
+    assert deferred_calls == []
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    assert scheduler_tick.wait(timeout=2)
+    assert deferred_calls == ["scheduler"]
+
+    _stop_runner_threads(runner)
+    calls_after_stop = list(deferred_calls)
+    time.sleep(1.1)
+    assert deferred_calls == calls_after_stop == ["scheduler"]
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
