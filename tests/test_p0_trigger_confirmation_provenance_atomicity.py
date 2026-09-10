@@ -449,7 +449,9 @@ def test_postgres_confirmation_cas_has_one_winner_and_never_repairs_timestamp_on
 
         monkeypatch.setattr(osm_module, "conn", _crash_after_mutation)
         assert not osm.update_order_meta(crash_id, patch, **kwargs)
-        assert _read_meta(url, schema, crash_id) == {}
+        assert _read_meta(url, schema, crash_id) == {
+            "materialization_generation": 7,
+        }
 
         legacy_id = "local-confirm-603-legacy"
         with scoped.conn() as connection:
