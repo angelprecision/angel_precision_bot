@@ -290,6 +290,8 @@ def _trigger_crossed_at_provenance_matches(
     if not isinstance(provenance, dict):
         return False
     expected = _build_trigger_crossed_at_provenance(signal, local_order_id)
+    if set(provenance) != set(expected):
+        return False
     actual = {
         "canonical_signal_id": str(provenance.get("canonical_signal_id") or "").strip(),
         "client_id": str(provenance.get("client_id") or "").strip().lower(),

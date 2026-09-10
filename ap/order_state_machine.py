@@ -2540,6 +2540,8 @@ class APOrderStateMachine:
             "execution_mode": _mode,
             "local_order_id": _local,
         }
+        if set(_provenance) != set(_expected_provenance):
+            return None
         for _key, _expected in _expected_provenance.items():
             _actual = _provenance.get(_key)
             if not isinstance(_actual, str) or not _actual.strip():
@@ -2723,20 +2725,7 @@ class APOrderStateMachine:
                 cur = c.execute(
                     """
                     UPDATE orders
-                    SET meta = COALESCE(meta, '{}'::jsonb)
-                               || %s::jsonb
-                               || jsonb_build_object(
-                                    'trigger_crossed_at_provenance',
-                                    jsonb_build_object(
-                                        'canonical_signal_id', COALESCE(
-                                            NULLIF(TRIM(canonical_signal_id), ''),
-                                            NULLIF(TRIM(meta->>'canonical_signal_id'), '')
-                                        ),
-                                        'client_id', LOWER(TRIM(client_id)),
-                                        'execution_mode', LOWER(TRIM(execution_mode)),
-                                        'local_order_id', local_order_id
-                                    )
-                                  ),
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
@@ -2748,6 +2737,22 @@ class APOrderStateMachine:
                       AND COALESCE(meta->>'lifecycle_state','') = 'BROKER_READY'
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                       AND COALESCE(meta->>'submit_intent_at','') = ''
+                      AND jsonb_typeof(COALESCE(meta, '{}'::jsonb)->
+                                       'trigger_crossed_at_provenance') = 'object'
+                      AND COALESCE(meta, '{}'::jsonb)->
+                          'trigger_crossed_at_provenance' =
+                          jsonb_build_object(
+                              'canonical_signal_id', COALESCE(
+                                  NULLIF(TRIM(canonical_signal_id), ''),
+                                  NULLIF(TRIM(meta->>'canonical_signal_id'), '')
+                              ),
+                              'client_id', LOWER(TRIM(client_id)),
+                              'execution_mode', LOWER(TRIM(execution_mode)),
+                              'local_order_id', local_order_id
+                          )
+                      AND NULLIF(meta->>'trigger_crossed_at', '') IS NOT NULL
+                      AND meta->>'trigger_crossed_at' ~* '(z|[+-][0-9]{2}:?[0-9]{2})$'
+                      AND (meta->>'trigger_crossed_at')::timestamptz IS NOT NULL
                       AND (
                             COALESCE(meta->>'recovery_submit_owner','') = ''
                          OR COALESCE(meta->>'recovery_submit_lease_until','') < %s

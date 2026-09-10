@@ -16,7 +16,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ap_entry_watcher import APEntryWatcher, WatchedSignal
+from ap_entry_watcher import (
+    APEntryWatcher,
+    WatchedSignal,
+    _trigger_crossed_at_provenance_matches,
+)
 
 
 def _signal(*, local_order_id="local-confirm-603", execution_mode="paper"):
@@ -156,6 +160,21 @@ def _row(signal, *, meta=None):
         "status": "PENDING_TRIGGER",
         "meta": dict(meta or {}),
     }
+
+
+def test_trigger_authority_provenance_rejects_extra_fields():
+    signal = _signal()
+    provenance = {
+        "canonical_signal_id": signal["canonical_signal_id"],
+        "client_id": signal["client_id"],
+        "execution_mode": signal["execution_mode"],
+        "local_order_id": signal["local_order_id"],
+        "diagnostic": "must-live-beside-authority",
+    }
+
+    assert not _trigger_crossed_at_provenance_matches(
+        provenance, signal, signal["local_order_id"]
+    )
 
 
 def test_real_confirmation_dispatch_writes_timestamp_and_complete_provenance_atomically():

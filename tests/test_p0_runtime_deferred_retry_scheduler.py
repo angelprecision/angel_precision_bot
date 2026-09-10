@@ -501,6 +501,46 @@ def test_started_scheduler_readiness_allows_entry_permission(monkeypatch):
     assert not runner.deferred_recovery_thread.is_alive()
 
 
+def test_startup_internal_deferred_recovery_failure_holds_entries(monkeypatch):
+    """Returned startup infrastructure errors keep the first unlock closed."""
+    runner = _permission_runner()
+    runner._log_startup_recovery_complete = MagicMock()
+
+    class _Recovery:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, *, include_watcher_reseed):
+            assert include_watcher_reseed is False
+            return {
+                "errors": ["recovery_due_retry_executor_raised:RuntimeError"],
+                "infrastructure_errors": [
+                    "recovery_due_retry_executor_raised:RuntimeError"
+                ],
+            }
+
+    monkeypatch.setattr(cr, "APStartupRecovery", _Recovery)
+
+    runner._run_startup_recovery(MagicMock(), object())
+
+    assert not runner.entries_allowed.is_set()
+    assert runner.degraded.is_set()
+    assert any(
+        runner._reason_key(reason) == "startup_deferred_recovery_failed"
+        for reason in runner.degraded_reasons
+    )
+    assert runner._log_startup_recovery_complete.call_args.kwargs["status"] == "failed"
+
+    # Readiness alone cannot bypass the startup failure state.
+    runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.deferred_recovery_scheduler_ready.set()
+    runner.deferred_recovery_started_ts = time.time()
+    runner.last_deferred_recovery_completed_ts = time.time()
+    runner.deferred_recovery_heartbeat_max_sec = 60.0
+    assert runner._set_entry_permission() is False
+    assert not runner.entries_allowed.is_set()
+
+
 def test_scheduler_dies_immediately_before_health_tick_keeps_entries_blocked(monkeypatch):
     """A startup child that exits before the first health tick fails closed."""
     runner = _permission_runner()

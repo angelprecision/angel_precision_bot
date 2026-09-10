@@ -512,6 +512,133 @@ def _run_recovery_pair(monkeypatch, *, actor_two):
         _drop_schema(url, schema)
 
 
+def test_postgres_broker_ready_submit_claim_consumes_exact_trigger_authority(
+    monkeypatch,
+):
+    """Submit ownership cannot create, rewrite, or broaden trigger evidence."""
+    from ap.order_state_machine import APOrderStateMachine
+
+    url = _postgres_url_or_skip()
+    schema = f"pr603_submit_claim_authority_{uuid.uuid4().hex}"
+    client_id = "submit-claim-authority@example.com"
+    mode = "live"
+    signal_id = f"sig-submit-claim-{uuid.uuid4().hex}"
+    canonical_signal_id = f"canonical-submit-claim-{uuid.uuid4().hex}"
+    local_order_id = f"pr603-submit-claim-{uuid.uuid4().hex}"
+    trigger_crossed_at = datetime.now(timezone.utc).isoformat()
+    exact_provenance = {
+        "canonical_signal_id": canonical_signal_id,
+        "client_id": client_id,
+        "execution_mode": mode,
+        "local_order_id": local_order_id,
+    }
+
+    _create_orders_schema(url, schema)
+    scoped = _ScopedPostgres(url, schema)
+    try:
+        _patch_postgres_modules(monkeypatch, scoped)
+        _insert_order(
+            scoped,
+            local_order_id=local_order_id,
+            client_id=client_id,
+            mode=mode,
+            signal_id=signal_id,
+            contract="AAPL260117C00100000",
+            meta={
+                "lifecycle_state": "BROKER_READY",
+                "materialization_status": "SELECTED",
+                "materialization_generation": 3,
+                "broker_ready": True,
+                "trigger_crossed_at": trigger_crossed_at,
+                "trigger_crossed_at_provenance": exact_provenance,
+                "selected_contract": "AAPL260117C00100000",
+                "selected_limit": 1.25,
+                "selected_qty": 1,
+            },
+        )
+
+        osm = APOrderStateMachine(client_id)
+        assert osm.claim_deferred_broker_ready_submit(
+            local_order_id,
+            owner="submit-owner",
+            generation=3,
+        )
+        after = dict(_read_order(url, schema, local_order_id)["meta"] or {})
+        assert after["trigger_crossed_at"] == trigger_crossed_at
+        assert after["trigger_crossed_at_provenance"] == exact_provenance
+        assert after["recovery_submit_owner"] == "submit-owner"
+
+        timestamp_only_id = f"pr603-submit-claim-timestamp-only-{uuid.uuid4().hex}"
+        _insert_order(
+            scoped,
+            local_order_id=timestamp_only_id,
+            client_id=client_id,
+            mode=mode,
+            signal_id=signal_id,
+            contract="AAPL260117C00100000",
+            meta={
+                "lifecycle_state": "BROKER_READY",
+                "materialization_status": "SELECTED",
+                "materialization_generation": 3,
+                "broker_ready": True,
+                "trigger_crossed_at": trigger_crossed_at,
+                "selected_contract": "AAPL260117C00100000",
+                "selected_limit": 1.25,
+                "selected_qty": 1,
+            },
+        )
+        assert not osm.claim_deferred_broker_ready_submit(
+            timestamp_only_id,
+            owner="submit-owner",
+            generation=3,
+        )
+        assert dict(
+            _read_order(url, schema, timestamp_only_id)["meta"] or {}
+        ) == {
+            "lifecycle_state": "BROKER_READY",
+            "materialization_status": "SELECTED",
+            "materialization_generation": 3,
+            "broker_ready": True,
+            "trigger_crossed_at": trigger_crossed_at,
+            "selected_contract": "AAPL260117C00100000",
+            "selected_limit": 1.25,
+            "selected_qty": 1,
+        }
+
+        extra_id = f"pr603-submit-claim-extra-{uuid.uuid4().hex}"
+        extra_provenance = {**exact_provenance, "diagnostic": "not-authority"}
+        extra_provenance["local_order_id"] = extra_id
+        _insert_order(
+            scoped,
+            local_order_id=extra_id,
+            client_id=client_id,
+            mode=mode,
+            signal_id=signal_id,
+            contract="AAPL260117C00100000",
+            meta={
+                "lifecycle_state": "BROKER_READY",
+                "materialization_status": "SELECTED",
+                "materialization_generation": 3,
+                "broker_ready": True,
+                "trigger_crossed_at": trigger_crossed_at,
+                "trigger_crossed_at_provenance": extra_provenance,
+                "selected_contract": "AAPL260117C00100000",
+                "selected_limit": 1.25,
+                "selected_qty": 1,
+            },
+        )
+        assert not osm.claim_deferred_broker_ready_submit(
+            extra_id,
+            owner="submit-owner",
+            generation=3,
+        )
+        assert dict(_read_order(url, schema, extra_id)["meta"] or {})[
+            "trigger_crossed_at_provenance"
+        ] == extra_provenance
+    finally:
+        _drop_schema(url, schema)
+
+
 def _build_broker_ready_execution_core(osm, *, client_id, mode):
     """Build the real execution-core recovery boundary without broker POST."""
     from ap_execution_core import APExecutionCore

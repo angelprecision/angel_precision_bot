@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import types
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -330,6 +331,195 @@ def test_deferred_recovery_unknown_mode_classifies_boundary_failure():
 
     assert result["errors"] == ["recovery_unknown_execution_mode"]
     assert result["infrastructure_errors"] == ["recovery_unknown_execution_mode"]
+
+
+class _RecoveryRowsConnection:
+    def __init__(self, row):
+        self.row = row
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def execute(self, *_args, **_kwargs):
+        return self
+
+    def fetchall(self):
+        return [dict(self.row)]
+
+
+def _deferred_boundary_row(kind):
+    client_id = "recovery-boundary@example.com"
+    mode = "live"
+    local_order_id = f"recovery-boundary-{kind}"
+    signal_id = f"signal-{kind}"
+    canonical_signal_id = f"canonical-{kind}"
+    contract = "AAPL260117C00100000"
+    now = datetime.now(timezone.utc)
+    meta = {
+        "lifecycle_state": "RETRY_WAIT",
+        "materialization_status": "RETRY_PENDING",
+        "materialization_in_flight": False,
+        "materialization_generation": 1,
+        "retry_attempt": 0,
+        "retry_max_attempts": 5,
+        "broker_ready": False,
+        "trigger_crossed_at": (now - timedelta(seconds=30)).isoformat(),
+        "trigger_crossed_at_provenance": {
+            "canonical_signal_id": canonical_signal_id,
+            "client_id": client_id,
+            "execution_mode": mode,
+            "local_order_id": local_order_id,
+        },
+        "signal_id": signal_id,
+        "canonical_signal_id": canonical_signal_id,
+        "client_id": client_id,
+        "execution_mode": mode,
+        "local_order_id": local_order_id,
+        "trigger_price": 100.0,
+    }
+    if kind == "due_retry":
+        meta["materialization_next_retry_at"] = (
+            now - timedelta(seconds=30)
+        ).isoformat()
+    elif kind == "broker_ready":
+        meta.update(
+            {
+                "lifecycle_state": "BROKER_READY",
+                "materialization_status": "SELECTED",
+                "broker_ready": True,
+                "selected_contract": contract,
+                "selected_limit": 1.25,
+                "selected_qty": 1,
+            }
+        )
+    elif kind == "crash_window":
+        meta["submit_intent_at"] = (now - timedelta(seconds=1)).isoformat()
+    else:
+        raise AssertionError(f"unknown boundary kind: {kind}")
+    return {
+        "local_order_id": local_order_id,
+        "client_id": client_id,
+        "kind": "ENTRY",
+        "status": "PENDING_TRIGGER",
+        "execution_mode": mode,
+        "signal_id": signal_id,
+        "canonical_signal_id": canonical_signal_id,
+        "plan_id": f"plan-{local_order_id}",
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "contract": contract,
+        "symbol": "AAPL",
+        "direction": "CALL",
+        "qty": 1,
+        "limit_price": 1.25,
+        "reserved_cost": 125.0,
+        "trigger_price": 100.0,
+        "stop_underlying": 95.0,
+        "target_underlying": 105.0,
+        "score": 85.0,
+        "tier": "A",
+        "pattern": "test",
+        "timeframe": "5m",
+        "created_ts": now,
+        "meta": meta,
+    }
+
+
+@pytest.mark.parametrize("kind", ("due_retry", "broker_ready", "crash_window"))
+@pytest.mark.parametrize("executor_available", (True, False))
+def test_inner_canonical_executor_failure_is_infrastructure_failure(
+    monkeypatch, kind, executor_available
+):
+    """Inner executor failures cannot masquerade as a successful recovery tick."""
+    row = _deferred_boundary_row(kind)
+    monkeypatch.setattr(
+        db_module,
+        "conn",
+        lambda: _RecoveryRowsConnection(row),
+    )
+    monkeypatch.setattr(db_module, "run_with_retry", lambda fn, *a, **k: fn())
+    monkeypatch.setenv("DEFERRED_RETRY_OWNER_GRACE_SECONDS", "0")
+
+    client_id = row["client_id"]
+    method_name = {
+        "due_retry": "resume_deferred_materialization_retry",
+        "broker_ready": "resume_deferred_broker_ready_order",
+        "crash_window": "reconcile_deferred_broker_intent",
+    }[kind]
+    executor_calls = []
+
+    def _raise(**kwargs):
+        executor_calls.append(kwargs)
+        raise RuntimeError(f"{kind} executor unavailable")
+
+    execution_core = SimpleNamespace()
+    if executor_available:
+        setattr(execution_core, method_name, _raise)
+    retained = MagicMock(return_value=True)
+    osm = SimpleNamespace(
+        client_id=client_id,
+        retain_recovery_ownership_if_no_watcher=retained,
+    )
+    recovery = ap_recovery.APStartupRecovery(
+        client_id=client_id,
+        broker=MagicMock(),
+        osm=osm,
+        pm=None,
+        master_control=SimpleNamespace(mode="LIVE"),
+        entry_watcher=None,
+        execution_core=execution_core,
+    )
+
+    result = recovery.recover_deferred_lifecycles()
+
+    assert result["deferred_lifecycles_recovered"] == 0
+    assert result["infrastructure_errors"]
+    assert result["errors"] == result["infrastructure_errors"]
+    assert kind in result["infrastructure_errors"][0]
+    assert len(executor_calls) == (1 if executor_available else 0)
+    assert retained.call_count == (0 if kind == "broker_ready" else 1)
+    recovery.broker.submit_order.assert_not_called()
+    recovery.broker.submit_entry.assert_not_called()
+
+
+def test_malformed_retry_row_remains_row_level_error_not_infrastructure_failure(
+    monkeypatch,
+):
+    """A bad row is quarantined without declaring the executor unavailable."""
+    row = _deferred_boundary_row("due_retry")
+    row["meta"]["retry_attempt"] = "not-an-integer"
+    monkeypatch.setattr(
+        db_module,
+        "conn",
+        lambda: _RecoveryRowsConnection(row),
+    )
+    monkeypatch.setattr(db_module, "run_with_retry", lambda fn, *a, **k: fn())
+
+    resume = MagicMock()
+    recovery = ap_recovery.APStartupRecovery(
+        client_id=row["client_id"],
+        broker=MagicMock(),
+        osm=SimpleNamespace(
+            client_id=row["client_id"],
+            retain_recovery_ownership_if_no_watcher=MagicMock(return_value=True),
+        ),
+        pm=None,
+        master_control=SimpleNamespace(mode="LIVE"),
+        entry_watcher=None,
+        execution_core=SimpleNamespace(
+            resume_deferred_materialization_retry=resume
+        ),
+    )
+
+    result = recovery.recover_deferred_lifecycles()
+
+    assert result["errors"]
+    assert any("malformed_counter" in error for error in result["errors"])
+    assert result["infrastructure_errors"] == []
+    resume.assert_not_called()
 
 
 def test_reconciler_unknown_mode_skips_terminal_correction(monkeypatch):

@@ -4496,7 +4496,9 @@ class ClientRunner(threading.Thread):
 
     def _run_startup_recovery(self, broker, exit_eng):
         """Run startup recovery with a hard timeout to prevent blocking initialization.
-        Recovery is best-effort — a timeout logs a warning but never blocks entries.
+        Row-level recovery outcomes are best-effort.  An infrastructure failure
+        at the deferred-recovery boundary keeps startup fail-closed so the
+        scheduler cannot publish readiness over an unavailable executor.
         """
         import concurrent.futures as _cf
         _RECOVERY_TIMEOUT = float(os.getenv("STARTUP_RECOVERY_TIMEOUT_SEC", "25"))
@@ -4522,20 +4524,45 @@ class ClientRunner(threading.Thread):
                 _fut = _ex.submit(_do_recovery)
                 try:
                     rec_result = _fut.result(timeout=_RECOVERY_TIMEOUT)
-                    logger.info(
-                        "[%s] Startup recovery complete: positions=%s entries_corrected=%s exits=%s dedup=%s",
-                        self.email,
-                        rec_result.get("positions_recovered"),
-                        rec_result.get("entries_corrected"),
-                        rec_result.get("exits_reattached"),
-                        rec_result.get("dedup_seeded"),
+                    _infrastructure_errors = (
+                        rec_result.get("infrastructure_errors", [])
+                        if isinstance(rec_result, dict)
+                        else []
                     )
-                    self._log_startup_recovery_complete(
-                        status="success",
-                        started_at=_recovery_started_at,
-                        recovery_attempt_id=_recovery_attempt_id,
-                        result=rec_result,
-                    )
+                    if _infrastructure_errors:
+                        logger.critical(
+                            "[%s] Startup deferred recovery infrastructure failure: %s — "
+                            "entries remain blocked",
+                            self.email,
+                            _infrastructure_errors,
+                        )
+                        self._log_startup_recovery_complete(
+                            status="failed",
+                            started_at=_recovery_started_at,
+                            recovery_attempt_id=_recovery_attempt_id,
+                            result=rec_result,
+                        )
+                        self._enter_degraded_mode(
+                            "startup_deferred_recovery_failed:" + ",".join(
+                                str(error) for error in _infrastructure_errors
+                            ),
+                            stop_runner=False,
+                        )
+                    else:
+                        logger.info(
+                            "[%s] Startup recovery complete: positions=%s entries_corrected=%s exits=%s dedup=%s",
+                            self.email,
+                            rec_result.get("positions_recovered"),
+                            rec_result.get("entries_corrected"),
+                            rec_result.get("exits_reattached"),
+                            rec_result.get("dedup_seeded"),
+                        )
+                        self._log_startup_recovery_complete(
+                            status="success",
+                            started_at=_recovery_started_at,
+                            recovery_attempt_id=_recovery_attempt_id,
+                            result=rec_result,
+                        )
                     _completion_logged = True
                 except _cf.TimeoutError:
                     logger.warning(
