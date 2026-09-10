@@ -305,6 +305,52 @@ def _read_order(harness: _PostgresHarness, local_order_id: str) -> dict:
     return harness.fetchone("SELECT * FROM orders WHERE local_order_id=%s", (local_order_id,)) or {}
 
 
+def _read_proof(harness: _PostgresHarness, position_id: str) -> dict:
+    return harness.fetchone("SELECT * FROM proof_trades WHERE position_id=%s", (position_id,)) or {}
+
+
+def _seed_broker_repair(
+    harness: _PostgresHarness,
+    label: str,
+    *,
+    entry_contract=CONTRACT,
+    entry_broker_order_id="entry-authoritative-1",
+    entry_filled_ts=ENTRY_TS,
+    raw_entry_timestamp: bool = False,
+):
+    position_id, entry_id, exit_id, _ = _insert_trade(
+        harness,
+        label,
+        avg_fill=None,
+        exit_price=None,
+        realized_pnl=None,
+        realized_pnl_pct=None,
+        exit_status="EXIT_FILLED",
+        filled_qty=1,
+        fill_price=1.17,
+        filled_ts=FILLED_TS,
+    )
+    if raw_entry_timestamp:
+        # PostgreSQL TIMESTAMPTZ normalizes a naive value before the driver
+        # returns it.  Preserve the malformed raw transport value for this
+        # parser negative without changing the production schema.
+        harness.execute(
+            "ALTER TABLE orders ALTER COLUMN filled_ts TYPE TEXT USING filled_ts::text"
+        )
+    harness.execute(
+        """
+        UPDATE orders
+           SET contract=%s,
+               broker_order_id=%s,
+               filled_ts=%s,
+               fill_price=%s
+         WHERE local_order_id=%s
+        """,
+        (entry_contract, entry_broker_order_id, entry_filled_ts, 1.48, entry_id),
+    )
+    return position_id, entry_id, exit_id
+
+
 def test_qqq_exact_exit_fill_converges_and_replays_idempotently(postgres_harness):
     harness = postgres_harness
     position_id, _, exit_id, broker_id = _insert_trade(
@@ -360,6 +406,94 @@ def test_qqq_exact_exit_fill_converges_and_replays_idempotently(postgres_harness
         (position_id,),
     )["n"] == 1
     assert APPositionManager(CLIENT_ID).open_count() == 0
+
+    
+def test_broker_repair_valid_entry_evidence_converges(postgres_harness):
+    """Positive control: the fallback uses one exact durable ENTRY fill."""
+    harness = postgres_harness
+    position_id, _, exit_id = _seed_broker_repair(
+        harness,
+        "entry-valid",
+        entry_filled_ts=FILLED_TS,  # equality is valid: ENTRY <= EXIT
+    )
+
+    result = APPositionManager(CLIENT_ID).converge_position_from_durable_exit_order(
+        exit_local_order_id=exit_id,
+        expected_execution_mode="live",
+    )
+
+    assert result.disposition == "APPLIED_FULL"
+    position = _read_position(harness, position_id)
+    assert position["status"] == "CLOSED"
+    assert position["quantity_remaining"] == 0
+    assert float(position["exit_price"]) == pytest.approx(1.17)
+    assert float(position["realized_pnl"]) == pytest.approx(-31.00)
+    assert _read_order(harness, exit_id)["meta"]["position_projection_v1"][
+        "applied_cumulative_qty"
+    ] == 1
+    assert _read_proof(harness, position_id)["broker_reconciled"] is True
+
+
+@pytest.mark.parametrize(
+    ("case_id", "entry_contract", "entry_broker_order_id", "entry_filled_ts", "raw_entry_timestamp"),
+    [
+        ("entry-contract-missing", None, "entry-valid", ENTRY_TS, False),
+        ("entry-contract-wrong", "SPY260904C00719000", "entry-valid", ENTRY_TS, False),
+        ("entry-broker-zero", CONTRACT, 0, ENTRY_TS, False),
+        ("entry-broker-dash", CONTRACT, "-", ENTRY_TS, False),
+        ("entry-broker-unknown", CONTRACT, "unknown", ENTRY_TS, False),
+        ("entry-broker-na", CONTRACT, "n/a", ENTRY_TS, False),
+        ("entry-filled-ts-missing", CONTRACT, "entry-valid", None, False),
+        ("entry-filled-ts-naive", CONTRACT, "entry-valid", "2026-09-04T15:00:00", True),
+        (
+            "entry-filled-ts-after-exit",
+            CONTRACT,
+            "entry-valid",
+            datetime(2026, 9, 4, 14, 42, 34, 680788, tzinfo=timezone.utc),
+            False,
+        ),
+    ],
+)
+def test_broker_repair_bad_entry_evidence_holds_without_any_mutation(
+    postgres_harness,
+    case_id,
+    entry_contract,
+    entry_broker_order_id,
+    entry_filled_ts,
+    raw_entry_timestamp,
+):
+    """Every resolver authority failure is a true zero-mutation HOLD."""
+    harness = postgres_harness
+    position_id, _, exit_id = _seed_broker_repair(
+        harness,
+        case_id,
+        entry_contract=entry_contract,
+        entry_broker_order_id=entry_broker_order_id,
+        entry_filled_ts=entry_filled_ts,
+        raw_entry_timestamp=raw_entry_timestamp,
+    )
+    position_before = _read_position(harness, position_id)
+    order_before = _read_order(harness, exit_id)
+    proof_before = _read_proof(harness, position_id)
+
+    result = APPositionManager(CLIENT_ID).converge_position_from_durable_exit_order(
+        exit_local_order_id=exit_id,
+        expected_execution_mode="live",
+    )
+
+    assert result.disposition == "HOLD_ECONOMICS", (
+        f"{case_id}: invalid ENTRY evidence must fail closed; "
+        f"got {result.disposition=} {result.reason=}"
+    )
+    assert _read_position(harness, position_id) == position_before, (
+        f"{case_id}: position mutated on resolver HOLD"
+    )
+    order_after = _read_order(harness, exit_id)
+    assert order_after == order_before, f"{case_id}: EXIT order mutated on resolver HOLD"
+    assert order_after["meta"] == {}, f"{case_id}: watermark was written on resolver HOLD"
+    assert _read_proof(harness, position_id) == proof_before, (
+        f"{case_id}: proof row mutated on resolver HOLD"
+    )
 
 
 def test_reconciler_discovers_populated_economics_blind_spot(postgres_harness):
