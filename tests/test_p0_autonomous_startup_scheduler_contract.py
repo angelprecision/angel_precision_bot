@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -177,6 +178,10 @@ def _runner_for_startup_recovery(client_runner_mod, *, mode="PAPER"):
     runner = client_runner_mod.ClientRunner.__new__(client_runner_mod.ClientRunner)
     runner.email = "telemetry@example.com"
     runner.mode = mode
+    runner.degraded = threading.Event()
+    runner.entries_allowed = threading.Event()
+    runner.degraded_reasons = set()
+    runner._degraded_lock = threading.Lock()
     runner.order_state_machine = object()
     runner.position_manager = object()
     runner.master_control = object()
