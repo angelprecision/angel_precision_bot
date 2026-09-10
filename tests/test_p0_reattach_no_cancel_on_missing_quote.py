@@ -187,7 +187,6 @@ def _reattach_plan(*, local_order_id="local-existing-1", confirmed=False):
             "client_id": "jason@example.com",
             "execution_mode": "live",
             "local_order_id": local_order_id,
-            "materialization_generation": 1,
         }
     return SimpleNamespace(
         signal_id="sig-reattach-1",

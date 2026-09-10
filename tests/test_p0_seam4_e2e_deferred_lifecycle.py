@@ -107,9 +107,18 @@ class _Selector:
                 "quote_source": "tradier_live",
                 "tradier_base_url": "https://api.tradier.com/v1",
             }
+            _persist_cursor = getattr(
+                request_context, "recovery_cursor_persist", None
+            )
+            if callable(_persist_cursor):
+                _persist_cursor(
+                    symbol=REAL_OCC,
+                    result_reason="CHAIN_ROW_ZERO_BID_ASK",
+                    transient=True,
+                )
             return None
         self._last_failure = None
-        return types.SimpleNamespace(
+        _selection = types.SimpleNamespace(
             contract_symbol=REAL_OCC,
             bid=2.09,
             ask=2.10,
@@ -123,6 +132,16 @@ class _Selector:
             open_interest=1200,
             volume=500,
         )
+        _persist_cursor = getattr(
+            request_context, "recovery_cursor_persist", None
+        )
+        if callable(_persist_cursor):
+            _persist_cursor(
+                symbol=REAL_OCC,
+                result_reason="SELECTED",
+                transient=False,
+            )
+        return _selection
 
     def get_last_failure(self):
         return self._last_failure
@@ -272,19 +291,23 @@ class _StatefulOSM:
 
     def claim_deferred_materialization(self, local_order_id, **kwargs):
         assert local_order_id == LOCAL_ORDER_ID
-        self.claimed_generations.append(int(kwargs["generation"]))
+        generation = kwargs.get("generation", kwargs.get("new_generation"))
+        self.claimed_generations.append(int(generation))
         self._merge_meta({
-            "materialization_generation": int(kwargs["generation"]),
+            "materialization_generation": int(generation),
             "materialization_owner": kwargs["owner"],
             "materialization_lease_until": kwargs["lease_until"],
             "materialization_status": "RUNNING",
             "lifecycle_state": "MATERIALIZING",
+            "materialization_in_flight": True,
             "trigger_crossed_at": kwargs["trigger_crossed_at"],
             "trigger_price": kwargs["trigger_price"],
             "observed_underlying_price": kwargs["observed_underlying_price"],
             "execution_mode": "live",
             "signal_id": kwargs["signal_id"],
         })
+        if kwargs.get("retry_attempt") is not None:
+            self._merge_meta({"retry_attempt": int(kwargs["retry_attempt"])})
         return True
 
     def schedule_deferred_materialization_retry(self, local_order_id, **kwargs):
@@ -301,6 +324,25 @@ class _StatefulOSM:
             "materialization_next_retry_at": kwargs["next_retry_at"],
             "selector_failure": copy.deepcopy(kwargs["selector_failure"]),
             "broker_ready": False,
+            "materialization_in_flight": False,
+        })
+        return True
+
+    def persist_selector_recovery_cursor(
+        self,
+        local_order_id,
+        *,
+        owner,
+        generation,
+        signal_id,
+        execution_mode,
+        cursor,
+    ):
+        assert local_order_id == LOCAL_ORDER_ID
+        assert signal_id == SIGNAL_ID
+        assert str(execution_mode).lower() == str(self.execution_mode).lower()
+        self._merge_meta({
+            "selector_recovery_cursor_v1": copy.deepcopy(cursor),
         })
         return True
 
@@ -1005,6 +1047,10 @@ def _build_core(
         _kill_switch=False,
         _max_positions=5,
     )
+    # The canonical due-retry executor revalidates market truth before its
+    # second selector attempt.  Give the selector the same quote transport it
+    # has in production; the old watcher-rearm fallback did not need this.
+    selector.data_broker = broker
     core.store = types.SimpleNamespace(
         update_status=lambda *a, **k: None,
         update_signal_fields=lambda *a, **k: None,
@@ -1026,6 +1072,7 @@ def _build_core(
     core._claim_deferred_materialization_for_trigger = core_mod.APExecutionCore._claim_deferred_materialization_for_trigger.__get__(core, type(core))
     core._plan_is_deferred = core_mod.APExecutionCore._plan_is_deferred
     core.resume_deferred_broker_ready_order = core_mod.APExecutionCore.resume_deferred_broker_ready_order.__get__(core, type(core))
+    core.resume_deferred_materialization_retry = core_mod.APExecutionCore.resume_deferred_materialization_retry.__get__(core, type(core))
     core._on_entry_trigger = core_mod.APExecutionCore._on_entry_trigger.__get__(core, type(core))
     return core
 
@@ -1164,14 +1211,11 @@ def test_real_watcher_to_recovery_to_single_post_call_graph(monkeypatch):
 
         core2 = _build_core(osm, broker, selector)
         watcher2 = _build_watcher(osm, core2)
-        _run_recovery(osm, broker, watcher2, core2)
-        assert LOCAL_ORDER_ID in [w.signal["local_order_id"] for w in watcher2._pending]
-        for watched in watcher2._pending:
-            watched.overnight = False
-
-        watcher2._poll_active_signals(open_protect_active=False)
-        watcher2._poll_active_signals(open_protect_active=False)
-        watcher2._poll_active_signals(open_protect_active=False)
+        recovery_result = _run_recovery(osm, broker, watcher2, core2)
+        # A due retry is now consumed by the canonical recovery executor. It
+        # does not need to create a second in-memory watcher authority.
+        assert recovery_result["deferred_lifecycles_recovered"] == 1
+        assert watcher2._pending == []
 
         row_after_second_trigger = osm.get_order(LOCAL_ORDER_ID)
         meta_after_second_trigger = row_after_second_trigger["meta"]
@@ -2388,14 +2432,11 @@ def test_pr514_named_shapes_retry_waits_for_durable_clock_across_restart(
         core2 = _build_core(osm, broker, selector)
         core2._recover_plan_for_revalidation = lambda _watched: plan
         watcher2 = _build_watcher(osm, core2, ticker=ticker)
-        _run_recovery(osm, broker, watcher2, core2)
-        assert LOCAL_ORDER_ID in [
-            w.signal["local_order_id"] for w in watcher2._pending
-        ]
-        for retry_watched in watcher2._pending:
-            retry_watched.overnight = False
-        for _ in range(3):
-            watcher2._poll_active_signals(open_protect_active=False)
+        recovery_result = _run_recovery(osm, broker, watcher2, core2)
+        # The production-shaped recovery boundary executes the due retry
+        # directly; rearming a watcher here would create a second authority.
+        assert recovery_result["deferred_lifecycles_recovered"] == 1
+        assert watcher2._pending == []
 
     row_after_retry = osm.get_order(LOCAL_ORDER_ID)
     assert selector.calls == 2
