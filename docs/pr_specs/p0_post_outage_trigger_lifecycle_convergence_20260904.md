@@ -4,36 +4,39 @@
 
 **AMENDED IN PLACE — DRAFT / MERGE CANDIDATE. DO NOT MERGE OR DEPLOY.**
 
-Base: `d404df34e00522ba2cce995b6a0129ba39b83944`
-Current implementation/code head: `e5a4dfe43f4cf95f425312f42012025b41fc217f`
+Live PR base: `59eb1882dc84d6bb33475b4bdd0225486a2309fc`
+Latest code/test head before this attestation:
+`007292f3524e971b69093b3049ac913e4996caf7`
 PR state: **Draft / open / MERGE CANDIDATE**. The final branch head including this
-documentation attestation is recorded in the PR body; this spec update is
-documentation-only and does not alter production code.
-Audited committed main: `d404df34e00522ba2cce995b6a0129ba39b83944`
+attestation is recorded in the PR body; no merge, deploy, close, or replacement
+PR was performed.
+Audited committed main for this PR: `59eb1882dc84d6bb33475b4bdd0225486a2309fc`
 Original head before amendment: `dd41efaac6db81e3762e87a05c8c90276019fe08`
 Head before this rebase: `442f37c16c4dbff0b2fcc9b02ff35d7d9d88f84b`
 Prior amended head before live-base rebase: `bb7d2084f014ff216a7915873e34f5bbd92bf4be`
-Amendment applied: 2026-09-09
+Amendment applied: 2026-09-10
 
 Latest code amendment commit (before this documentation attestation):
-`e5a4dfe43f4cf95f425312f42012025b41fc217f`. The final branch SHA, including
+`007292f3524e971b69093b3049ac913e4996caf7`. The final branch SHA, including
 this specification update, is recorded in the PR body after the documentation
 commit.
 
 Dependencies (§STATUS binding order):
-- PR #568 (deferred selector/materialization retry authority): current `main`
-  is the committed pre-#568 rebuild at `d404df34e00522ba2cce995b6a0129ba39b83944`;
-  this rebase replayed only the #580 commits after the former `84d8d612...`
-  base and does not copy or modify #568 retry-owner code
-- PR #569 (fresh market truth / late watcher recovery): **open/draft** and
-  remains a separate ownership boundary; it is not included in this amendment
+- PR #568 (deferred selector/materialization retry authority) remains a separate
+  ownership boundary; #580 does not copy or modify its retry-owner code.
+- PR #569 (fresh market truth / late watcher recovery) is intentionally out of
+  scope and remains untouched.
+- PR #596 (deferred materialization retry ownership) is intentionally out of
+  scope and remains untouched.
 
 ## CURRENT VERIFICATION ATTESTATION — 2026-09-10
 
-This section supersedes older audit snapshots below. The branch has been
-rebased in place onto the current committed GitHub `main` at
-`59eb1882dc84d6bb33475b4bdd0225486a2309fc`. The PR remains Draft/open and
-must not be merged, deployed, or closed during this audit.
+This section supersedes older audit snapshots below. The PR branch is based on
+the live committed GitHub `main` at
+`59eb1882dc84d6bb33475b4bdd0225486a2309fc`. The code/test commit immediately
+before this attestation is `007292f3524e971b69093b3049ac913e4996caf7`; the
+final documentation commit SHA is recorded in the PR body. The PR remains
+Draft/open and must not be merged, deployed, or closed during this audit.
 
 The scope is PR #580 only. PRs #596 and #569 are intentionally out of scope
 for this clearance pass: their code, ownership, and status are not changed or
@@ -103,9 +106,16 @@ changing the PR's ownership boundary.
   replace, position, proof-trade, or queue mutation.
 - The final OSM claim parses both metadata aliases independently and rejects
   malformed or conflicting identity/generation authorities. Its mode-scoped
-  `FOR UPDATE` transaction installs a deterministic recovery dispatch owner;
-  top-level-only generation schemas remain supported because the Python proof
+  `FOR UPDATE` transaction installs a logical recovery owner plus a unique
+  dispatch-attempt token; the owner string is never callback uniqueness proof.
+  Top-level-only generation schemas remain supported because the Python proof
   is performed while the row lock is held.
+- The real deferred LIVE callback now carries the exact recovery dispatch
+  attempt into the materialization CAS. The atomic callback-side transition
+  advances the durable generation family from `N` to `N+1`, mirrors the new
+  generation into the signal/approved plan, and lets the finalizer close the
+  same durable dispatch attempt rather than losing a successful submit at an
+  `N/N` CAS.
 - Successful candidate-first replacement still cancels and terminally rereads
   only the exact displaced incumbent before releasing its registration and
   dedup key. Canonical transition events and opportunity-ledger notifications
@@ -117,39 +127,28 @@ changing the PR's ownership boundary.
 
 Focused local evidence for this amendment:
 
-- complete `tests/test_p0_pending_trigger_lifecycle_integrity.py`:
-  `142 passed, 1 skipped`;
-- lifecycle-integrity plus post-outage convergence:
-  `164 passed, 1 skipped`;
-- recovery/convergence, replay, replacement, pre-breach, reattach, and
-  #596-isolation suites:
-  `368 passed, 2 skipped`;
-- the local PostgreSQL row-lock test is skipped when
-  `INTELLIGENCE_POSTGRES_TEST_URL` is unset; the CI workflow is the required
-  PostgreSQL evidence;
-- OSM-adjacent validation: `65 passed, 1 skipped`, then the pre-existing
-  unrelated `TestFix1_EntryMetaPersistence.test_create_entry_order_writes_score_column`
-  failure (`metadata_invalid:unknown_execution_mode` from its MagicMock plan).
+- the real PostgreSQL/APStartupRecovery/APEntryWatcher/APExecutionCore deferred
+  LIVE restart regression: `1 passed`;
+- the real PostgreSQL trigger-ready `KEEP_WATCHER` restart regression plus the
+  deferred LIVE callback regression: `2 passed`;
+- the complete lifecycle-integrity file was previously green at `180 passed`;
+- the exact-head and pull-request merge-ref jobs below each collected the same
+  canonical inventory and completed `5298 passed` with PostgreSQL enabled;
+- the local disposable PostgreSQL server is environmental evidence only; the
+  GitHub PostgreSQL jobs are the authoritative CI rerun.
 
-The exact-head/merge-ref P0 workflow for code head
-`e5a4dfe43f4cf95f425312f42012025b41fc217f` is run `34402725559`:
+The exact-head/merge-ref P0 workflow for code/test head
+`007292f3524e971b69093b3049ac913e4996caf7` is run `34538566287`:
 
-- exact-head `p0-tests`, job `102638262954`: **PASS**;
-- pull-request merge-ref `p0-merge-ref-tests`, job `102638263172`: **PASS**.
+- exact-head `p0-tests`, job `103075727793`: **PASS**;
+- pull-request merge-ref `p0-merge-ref-tests`, job `103075727630`: **PASS**;
+- both jobs collected `5298` tests and completed `5298 passed`;
+- the separate `p0-rollback-failfirst` guard, job `103075727748`, also passed,
+  but its pre-#579 historical base is not used as #580 clearance evidence.
 
-Both jobs ran the same canonical inventory with PostgreSQL enabled, including
-the complete lifecycle-integrity file, lifecycle-convergence tests, and the
-row-lock race. The local PostgreSQL skip above is environmental only.
-
-Implementation on this branch is preparatory only, per explicit override.
-Before merge:
-1. #569 remains separately open/draft and must be independently resolved and
-   audited; no #569 code is copied here.
-2. This branch must remain based on the actual committed `main` SHA above.
-3. The PEP and September 8 Jason LIVE fail-first replays in
-   `tests/test_p0_post_outage_trigger_lifecycle_convergence.py` must pass
-   against the exact amended head.
-4. Full P0 regression must pass at the exact amended HEAD SHA.
+The historical implementation/gate notes below are retained for audit
+history. Current clearance depends on the live base/head and fresh checks
+above, not on their superseded SHA or count claims.
 
 ## AMEND PR #580 IN PLACE — Corrections applied 2026-09-09
 

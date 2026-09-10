@@ -486,7 +486,7 @@ class TestPR580PostgresRecoveryContract:
         values.pop("trigger_cursor", None)
         return values
 
-    def _run_startup_reseed(self, signal, watcher, osm, broker):
+    def _run_startup_reseed(self, signal, watcher, osm, broker, *, full_run=False):
         from ap_recovery import APStartupRecovery
 
         recovery = APStartupRecovery(
@@ -497,6 +497,8 @@ class TestPR580PostgresRecoveryContract:
             master_control=types.SimpleNamespace(mode="LIVE"),
             entry_watcher=watcher,
         )
+        if full_run:
+            return recovery.run(include_watcher_reseed=True)
         result = {"errors": []}
         recovery._reseed_watchers(result)
         return result
@@ -918,7 +920,12 @@ class TestPR580PostgresRecoveryContract:
             mode="LIVE",
         )
         watcher._persist_watcher_audit = lambda *args, **kwargs: None
-        result = self._run_startup_reseed(signal, watcher, osm, broker)
+        result = self._run_startup_reseed(
+            signal, watcher, osm, broker, full_run=True
+        )
+        assert not any(
+            str(error).startswith("watchers:") for error in result["errors"]
+        ), result["errors"]
         assert result["pending_trigger_watchers_rearmed"] == 1
         registered = watcher._pending[0]
         assert registered.signal["__recovered_trigger_ready"] is True
@@ -1016,8 +1023,11 @@ class TestPR580PostgresRecoveryContract:
         )
         watcher2._persist_watcher_audit = lambda *args, **kwargs: None
         result2 = self._run_startup_reseed(
-            signal, watcher2, watcher2.order_state_machine, broker
+            signal, watcher2, watcher2.order_state_machine, broker, full_run=True
         )
+        assert not any(
+            str(error).startswith("watchers:") for error in result2["errors"]
+        ), result2["errors"]
         assert result2["pending_trigger_watchers_rearmed"] == 0
         assert watcher2._pending == []
         assert len(broker.session.posts) == 1
