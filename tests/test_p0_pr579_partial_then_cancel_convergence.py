@@ -148,7 +148,7 @@ class _FakePM:
     with the exit order's local_order_id, and only when a fill delta
     with a valid timestamp is present.
     """
-    def __init__(self, converge_result: str = "APPLIED"):
+    def __init__(self, converge_result: str = "APPLIED_FULL"):
         self.converge_calls: list = []
         self._converge_result = converge_result
 

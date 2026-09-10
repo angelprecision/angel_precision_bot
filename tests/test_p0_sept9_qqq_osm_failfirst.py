@@ -641,8 +641,8 @@ class TestSept9AfterFix:
         import ap_reconciler as ar_mod
         from ap_reconciler import APBrokerReconciler, _empty_summary
 
-        monkeypatch.setattr(ar_mod, "conn",           h.conn)
-        monkeypatch.setattr(ar_mod, "run_with_retry", lambda fn, **kw: fn())
+        # ap_reconciler imports from ap.db inside functions; db_mod is already
+        # patched by the postgres_harness fixture — no separate ar_mod patch needed.
 
         broker_mock = MagicMock()
         pm_shared   = APPositionManager(CLIENT_ID)
