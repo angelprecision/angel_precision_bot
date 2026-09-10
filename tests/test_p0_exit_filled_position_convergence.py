@@ -407,7 +407,7 @@ def test_qqq_exact_exit_fill_converges_and_replays_idempotently(postgres_harness
     )["n"] == 1
     assert APPositionManager(CLIENT_ID).open_count() == 0
 
-    
+
 def test_broker_repair_valid_entry_evidence_converges(postgres_harness):
     """Positive control: the fallback uses one exact durable ENTRY fill."""
     harness = postgres_harness
