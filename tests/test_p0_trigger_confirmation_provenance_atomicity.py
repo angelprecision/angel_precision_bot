@@ -269,6 +269,39 @@ def test_legacy_timestamp_only_row_is_not_repaired_by_new_confirmation_writer():
     assert set(osm.row["meta"]) == {"trigger_crossed_at"}
 
 
+class _SecondCasLossOSM(_ReadbackOSM):
+    def update_order_meta(self, local_order_id, patch, **kwargs):
+        self.calls.append((local_order_id, dict(patch), dict(kwargs)))
+        return False
+
+
+def test_response_loss_second_cas_failure_does_not_publish_in_memory_authority():
+    signal = _signal(local_order_id="local-confirm-603-second-cas-loss")
+    durable_provenance = {
+        "canonical_signal_id": signal["canonical_signal_id"],
+        "client_id": signal["client_id"],
+        "execution_mode": "paper",
+        "local_order_id": signal["local_order_id"],
+    }
+    osm = _SecondCasLossOSM(
+        _row(
+            signal,
+            meta={
+                "trigger_crossed_at": "2026-09-09T20:00:00Z",
+                "trigger_crossed_at_provenance": durable_provenance,
+            },
+        )
+    )
+    watcher = _AuditWatcher(MagicMock(), order_state_machine=osm, mode="PAPER")
+    watched = WatchedSignal(signal, overnight=False)
+    watched._watcher_ref = watcher
+
+    assert watcher._persist_trigger_confirmation_authority(watched) is False
+    assert not getattr(watched, "_trigger_authority_persisted", False)
+    assert not hasattr(watched, "_durable_trigger_crossed_at_raw")
+    assert not hasattr(watched, "_durable_trigger_crossed_at_provenance")
+
+
 def test_response_loss_readback_normalizes_z_and_preserves_durable_spelling():
     signal = _signal(local_order_id="local-confirm-603-z")
     durable_timestamp = "2026-09-09T20:00:00Z"
