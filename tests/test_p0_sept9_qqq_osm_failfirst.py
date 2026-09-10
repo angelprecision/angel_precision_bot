@@ -132,6 +132,7 @@ def postgres_harness(monkeypatch):
     import ap.db as db_mod
     import ap.position_manager as pm_mod
     import ap.order_state_machine as osm_mod
+    import ap.observability as obs_mod
 
     harness = _PGHarness(connection, extras.RealDictCursor, _ConnWrapper)
     try:
@@ -233,6 +234,8 @@ def postgres_harness(monkeypatch):
         monkeypatch.setattr(pm_mod,  "run_with_retry", lambda fn, **kw: fn())
         monkeypatch.setattr(osm_mod, "conn",           harness.conn)
         monkeypatch.setattr(osm_mod, "run_with_retry", lambda fn, **kw: fn())
+        monkeypatch.setattr(obs_mod, "conn",           harness.conn)
+        monkeypatch.setattr(obs_mod, "run_with_retry", lambda fn, **kw: fn())
 
         # Earlier P0 tests reload/patch ap.order_state_machine.  The class
         # collected by this module can therefore retain a different globals
@@ -247,6 +250,10 @@ def postgres_harness(monkeypatch):
         )
         monkeypatch.setitem(pm_method_globals, "conn", harness.conn)
         monkeypatch.setitem(pm_method_globals, "run_with_retry", lambda fn, **kw: fn())
+
+        obs_method_globals = obs_mod.emit_decision_event.__globals__
+        monkeypatch.setitem(obs_method_globals, "conn", harness.conn)
+        monkeypatch.setitem(obs_method_globals, "run_with_retry", lambda fn, **kw: fn())
         yield harness
     finally:
         connection.rollback()
@@ -810,7 +817,7 @@ class TestSept9CapacityRelease:
         self, postgres_harness, monkeypatch
     ):
         h = postgres_harness
-        _seed_sept9_shape(h, position_avg_fill=ENTRY_PRICE, exit_status="EXIT_REQUESTED")
+        _seed_sept9_shape(h, position_avg_fill=ENTRY_PRICE, exit_status="EXIT_PARTIAL_FILL")
 
         pm = APPositionManager(CLIENT_ID)
         assert pm.open_count() >= 1, "Pre-condition: at least 1 open position"
