@@ -1257,6 +1257,83 @@ def test_postgres_claim_deferred_materialization_writes_complete_provenance_and_
             "local_order_id": local_order_id,
         }
 
+        preserved_id = f"pr603-claim-preserved-{uuid.uuid4().hex}"
+        preserved_raw = "2026-09-09T20:00:00Z"
+        preserved_provenance = {
+            "canonical_signal_id": canonical_signal_id,
+            "client_id": client_id,
+            "execution_mode": mode,
+            "local_order_id": preserved_id,
+        }
+        with scoped.conn() as connection:
+            connection.execute(
+                """
+                INSERT INTO orders (
+                    local_order_id, client_id, kind, status, execution_mode,
+                    signal_id, canonical_signal_id, meta
+                ) VALUES (%s,%s,'ENTRY','PENDING_TRIGGER',%s,%s,%s,%s::jsonb)
+                """,
+                (
+                    preserved_id,
+                    client_id,
+                    mode,
+                    signal_id,
+                    canonical_signal_id,
+                    json.dumps({
+                        "lifecycle_state": "RETRY_WAIT",
+                        "trigger_crossed_at": preserved_raw,
+                        "trigger_crossed_at_provenance": preserved_provenance,
+                    }),
+                ),
+            )
+        assert osm.claim_deferred_materialization(
+            preserved_id,
+            owner="claim-owner",
+            new_generation=1,
+            lease_until=lease_until,
+            trigger_crossed_at="2026-09-09T20:00:00+00:00",
+            trigger_price=100.0,
+            observed_underlying_price=101.0,
+            signal_id=signal_id,
+            execution_mode=mode,
+        )
+        preserved_meta = dict(_read_order(url, schema, preserved_id)["meta"] or {})
+        assert preserved_meta["trigger_crossed_at"] == preserved_raw
+        assert preserved_meta["trigger_crossed_at_provenance"] == preserved_provenance
+
+        timestamp_only_id = f"pr603-claim-timestamp-only-{uuid.uuid4().hex}"
+        with scoped.conn() as connection:
+            connection.execute(
+                """
+                INSERT INTO orders (
+                    local_order_id, client_id, kind, status, execution_mode,
+                    signal_id, canonical_signal_id, meta
+                ) VALUES (%s,%s,'ENTRY','PENDING_TRIGGER',%s,%s,%s,%s::jsonb)
+                """,
+                (
+                    timestamp_only_id,
+                    client_id,
+                    mode,
+                    signal_id,
+                    canonical_signal_id,
+                    json.dumps({"trigger_crossed_at": trigger_crossed_at}),
+                ),
+            )
+        assert not osm.claim_deferred_materialization(
+            timestamp_only_id,
+            owner="claim-owner",
+            new_generation=1,
+            lease_until=lease_until,
+            trigger_crossed_at=trigger_crossed_at,
+            trigger_price=100.0,
+            observed_underlying_price=101.0,
+            signal_id=signal_id,
+            execution_mode=mode,
+        )
+        assert (_read_order(url, schema, timestamp_only_id)["meta"] or {}) == {
+            "trigger_crossed_at": trigger_crossed_at
+        }
+
         missing_id = f"pr603-claim-missing-{uuid.uuid4().hex}"
         with scoped.conn() as connection:
             connection.execute(

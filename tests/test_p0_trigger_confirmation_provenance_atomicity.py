@@ -298,8 +298,8 @@ def test_response_loss_second_cas_failure_does_not_publish_in_memory_authority()
 
     assert watcher._persist_trigger_confirmation_authority(watched) is False
     assert not getattr(watched, "_trigger_authority_persisted", False)
-    assert not hasattr(watched, "_durable_trigger_crossed_at_raw")
-    assert not hasattr(watched, "_durable_trigger_crossed_at_provenance")
+    assert getattr(watched, "_durable_trigger_crossed_at_raw", None) is None
+    assert getattr(watched, "_durable_trigger_crossed_at_provenance", None) is None
 
 
 def test_response_loss_readback_normalizes_z_and_preserves_durable_spelling():

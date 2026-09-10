@@ -3151,6 +3151,16 @@ class APOrderStateMachine:
         _crossed_at = str(trigger_crossed_at or "").strip()
         if not _crossed_at:
             return False
+        try:
+            _crossed_dt = datetime.fromisoformat(
+                _crossed_at[:-1] + "+00:00"
+                if _crossed_at.endswith(("Z", "z"))
+                else _crossed_at
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if _crossed_dt.tzinfo is None or _crossed_dt.utcoffset() is None:
+            return False
 
         _now = now_utc_iso()
         _patch = {
@@ -3173,7 +3183,6 @@ class APOrderStateMachine:
             "materialization_lease_until": str(lease_until or ""),
             "materialization_started_at": _now,
             "selector_started_at": _now,
-            "trigger_crossed_at": _crossed_at,
             "breach_received_at": _now,
             "trigger_price": float(trigger_price or 0),
             "observed_underlying_price": float(observed_underlying_price or 0),
@@ -3296,7 +3305,23 @@ class APOrderStateMachine:
                 cur = c.execute(
                     """
                     UPDATE orders
-                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb
+                               || jsonb_build_object(
+                                    'trigger_crossed_at', COALESCE(
+                                        NULLIF(meta->>'trigger_crossed_at', ''),
+                                        %s
+                                    ),
+                                    'trigger_crossed_at_provenance',
+                                    jsonb_build_object(
+                                        'canonical_signal_id', COALESCE(
+                                            NULLIF(TRIM(canonical_signal_id), ''),
+                                            NULLIF(TRIM(meta->>'canonical_signal_id'), '')
+                                        ),
+                                        'client_id', LOWER(TRIM(client_id)),
+                                        'execution_mode', LOWER(TRIM(execution_mode)),
+                                        'local_order_id', local_order_id
+                                    )
+                               ),
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
@@ -3317,10 +3342,35 @@ class APOrderStateMachine:
                            OR NULLIF(TRIM(meta->>'canonical_signal_id'), '') IS NULL
                            OR NULLIF(TRIM(canonical_signal_id), '') =
                               NULLIF(TRIM(meta->>'canonical_signal_id'), ''))
+                      AND (
+                            (NOT (COALESCE(meta, '{}'::jsonb) ? 'trigger_crossed_at')
+                             AND NOT (COALESCE(meta, '{}'::jsonb) ?
+                                      'trigger_crossed_at_provenance'))
+                         OR (
+                                jsonb_typeof(
+                                    COALESCE(meta, '{}'::jsonb)->
+                                    'trigger_crossed_at_provenance'
+                                ) = 'object'
+                            AND COALESCE(meta, '{}'::jsonb)->
+                                'trigger_crossed_at_provenance' =
+                                jsonb_build_object(
+                                    'canonical_signal_id', COALESCE(
+                                        NULLIF(TRIM(canonical_signal_id), ''),
+                                        NULLIF(TRIM(meta->>'canonical_signal_id'), '')
+                                    ),
+                                    'client_id', LOWER(TRIM(client_id)),
+                                    'execution_mode', LOWER(TRIM(execution_mode)),
+                                    'local_order_id', local_order_id
+                                )
+                            AND NULLIF(meta->>'trigger_crossed_at', '') IS NOT NULL
+                            AND meta->>'trigger_crossed_at' ~* '(z|[+-][0-9]{2}:?[0-9]{2})$'
+                            AND (meta->>'trigger_crossed_at')::timestamptz IS NOT NULL
+                         )
+                      )
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                     """ + _attempt_predicate,
                     (
-                        _patch_json, local_order_id, self.client_id,
+                        _patch_json, _crossed_at, local_order_id, self.client_id,
                         _signal_id, _mode, _now, _expected_previous_generation,
                         *_attempt_params,
                     ),
