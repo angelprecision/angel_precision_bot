@@ -42,7 +42,6 @@ def fill(**kw):
 def summary():
     return {"orders_corrected":0,"orders_alerted":0,"errors":[],"positions_imported":0}
 
-
 class _RowsConn:
     def __init__(self, rows):
         self.rows = rows
@@ -125,8 +124,6 @@ def test_osm_missing_timestamp_rejected_before_db_write(monkeypatch):
     assert events[-1]["decision"] == "HOLD"
     assert events[-1]["reason_code"] == "EXIT_FILL_TIMESTAMP_MISSING_OR_INVALID"
     assert events[-1]["extra_inputs"]["order_terminalized"] is False
-
-
 def test_stale_ack_exit_fill_propagates_exact_timestamp(monkeypatch):
     stale = order(submitted_ts=FILL_TS, updated_ts=FILL_TS, age_sec=30.0)
     _install_stale_rows(monkeypatch, [stale])

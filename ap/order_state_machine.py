@@ -92,6 +92,25 @@ def _normalize_broker_submitted_ts(value) -> str | None:
         raise ValueError("broker_submitted_ts must be timezone-aware")
     return parsed.astimezone(timezone.utc).isoformat()
 
+
+def _normalize_broker_filled_ts(value) -> str | None:
+    """Normalize an exact timezone-aware broker execution timestamp."""
+    if value is None or str(value).strip() == "":
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    try:
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return None
+
 # P0 client-parity (2026-06-04): canonical_signal_id groups the same
 # market opportunity across every active eligible client account so the
 # parity ledger and audit queries can detect fanout failures.
@@ -1109,6 +1128,7 @@ class APOrderStateMachine:
         old_status  = str(current.get("status") or "")
         kind        = str(current.get("kind") or "")
         prev_filled = self._safe_int(current.get("filled_qty"), 0)
+        incoming_filled = None
         same_state_fill_update = False
         same_state_identity_update = False
 
@@ -1129,6 +1149,50 @@ class APOrderStateMachine:
                     fill_price=fill_price, last_error=last_error,
                 )
                 return False
+
+        effective_filled = incoming_filled if incoming_filled is not None else prev_filled
+        if (
+            kind.upper() == "EXIT"
+            and new_status in (OrderStatus.EXIT_PARTIAL_FILL, OrderStatus.EXIT_FILLED)
+            and effective_filled > 0
+        ):
+            normalized_filled_ts = _normalize_broker_filled_ts(filled_ts)
+            if normalized_filled_ts is None:
+                reason = "EXIT_FILL_TIMESTAMP_MISSING_OR_INVALID"
+                log.critical(
+                    "[%s] %s | order=%s broker=%s position=%s contract=%s "
+                    "status=%s->%s filled_qty=%s fill_price=%s action=HOLD "
+                    "position_mutated=false order_terminalized=false",
+                    self.client_id, reason, local_order_id,
+                    broker_order_id or current.get("broker_order_id") or "?",
+                    position_id or current.get("position_id") or "?",
+                    current.get("contract") or current.get("symbol") or "?",
+                    old_status, new_status, effective_filled, fill_price,
+                )
+                self._emit_transition_event(
+                    local_order_id=local_order_id,
+                    old_status=old_status,
+                    new_status=new_status,
+                    order=current,
+                    decision="HOLD",
+                    reason_code=reason,
+                    explanation=(
+                        "Refusing positive EXIT fill before durable mutation: "
+                        "an exact timezone-aware broker execution timestamp is required."
+                    ),
+                    broker_order_id=broker_order_id,
+                    filled_qty=effective_filled,
+                    fill_price=fill_price,
+                    last_error=last_error,
+                    extra_inputs={
+                        "position_id": position_id or current.get("position_id"),
+                        "action": "HOLD",
+                        "position_mutated": False,
+                        "order_terminalized": False,
+                    },
+                )
+                return False
+            filled_ts = normalized_filled_ts
 
         if old_status == new_status:
             if new_status in (OrderStatus.PARTIAL_FILL, OrderStatus.EXIT_PARTIAL_FILL):
