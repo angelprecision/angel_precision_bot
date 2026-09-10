@@ -1031,6 +1031,21 @@ def build_intelligence_context_payload(
             provenance=point_in_time.get("provenance") or {},
             observation=payload["underlying_observation"],
         )
+        from ap.intelligence_breach_market_structure import freeze_breach_market_structure
+        payload["market_structure"] = freeze_breach_market_structure(
+            evaluation_signal,
+            candles_by_tf=(data_sources.get("candles") or {}),
+            fvg_context=fvg_context,
+            data_as_of=payload.get("data_as_of"),
+        )
+        # Keep research timing classification inside breach evidence if present.
+        readiness = (payload.get("breach_evidence") or {}).get("entry_readiness_observe_only")
+        if isinstance(readiness, dict):
+            payload["entry_timing_candidate_observe_only"] = {
+                **readiness,
+                "observe_only": True,
+                "affected_eligibility": False,
+            }
     payload["input_hash"] = str(input_hash or _stable_hash(
         {
             "phase": phase,
