@@ -820,6 +820,40 @@ def _directional_confirmation(rows: list[dict[str, Any]], side: str, *, source: 
     }
 
 
+
+def _freeze_breach_market_structure_observe_only(
+    signal: dict[str, Any],
+    *,
+    data_sources: dict[str, Any],
+    provenance: dict[str, Any],
+    data_as_of: Any = None,
+) -> dict[str, Any]:
+    """Observe-only 4H/1H FVG geometry + relationship freeze for BREACH evidence."""
+    try:
+        from ap.intelligence_breach_market_structure import freeze_breach_market_structure
+    except Exception as exc:  # never break materialization
+        return {
+            "schema_version": "market_structure_v1",
+            "observe_only": True,
+            "affected_eligibility": False,
+            "status": "ERROR",
+            "error": f"{type(exc).__name__}:{exc}",
+        }
+    candles = dict((data_sources or {}).get("candles") or {})
+    provider = str(
+        (provenance or {}).get("intraday")
+        or (provenance or {}).get("fifteen_minute")
+        or "frozen_breach_candles"
+    )
+    return freeze_breach_market_structure(
+        signal,
+        market_context={"candles": candles},
+        data_as_of=data_as_of,
+        source_provider=provider,
+        volume_imbalance=(signal.get("volume_imbalance") if isinstance(signal, dict) else None),
+    )
+
+
 def _build_breach_evidence(
     signal: dict[str, Any], *, data_sources: dict[str, Any],
     provenance: dict[str, Any], observation: dict[str, Any]
@@ -867,6 +901,21 @@ def _build_breach_evidence(
             "approximation_allowed": False,
         },
     }
+    # Observe-only market_structure freeze (4H/1H FVG geometry + relationship).
+    # Prefer caller-supplied data_as_of via signal trigger_crossed_at.
+    market_structure = _freeze_breach_market_structure_observe_only(
+        signal,
+        data_sources=data_sources,
+        provenance=provenance,
+        data_as_of=(
+            signal.get("trigger_crossed_at")
+            or signal.get("data_as_of")
+            or (observation or {}).get("observed_at")
+        ),
+    )
+    evidence["market_structure"] = market_structure
+    if isinstance(market_structure.get("volume_imbalance"), dict):
+        evidence["volume_imbalance"] = market_structure["volume_imbalance"]
     evidence["entry_readiness_observe_only"] = classify_entry_readiness_observe_only(
         signal, evidence=evidence
     )
@@ -1031,14 +1080,11 @@ def build_intelligence_context_payload(
             provenance=point_in_time.get("provenance") or {},
             observation=payload["underlying_observation"],
         )
-        from ap.intelligence_breach_market_structure import freeze_breach_market_structure
-        payload["market_structure"] = freeze_breach_market_structure(
-            evaluation_signal,
-            candles_by_tf=(data_sources.get("candles") or {}),
-            fvg_context=fvg_context,
-            data_as_of=payload.get("data_as_of"),
-        )
-        # Keep research timing classification inside breach evidence if present.
+        # Stable observe-only key: mirror frozen structure from breach_evidence
+        # (single freeze inside _build_breach_evidence; no second detector).
+        ms = (payload.get("breach_evidence") or {}).get("market_structure")
+        if isinstance(ms, dict):
+            payload["market_structure"] = ms
         readiness = (payload.get("breach_evidence") or {}).get("entry_readiness_observe_only")
         if isinstance(readiness, dict):
             payload["entry_timing_candidate_observe_only"] = {
