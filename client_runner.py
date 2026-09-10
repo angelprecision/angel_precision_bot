@@ -730,12 +730,14 @@ class ClientRunner(threading.Thread):
         # forcing a duplicate recovery pass after startup recovery.
         self.deferred_recovery_scheduler_ready = threading.Event()
         # Startup readiness is a one-way gate for the first permission unlock.
-        # Once the normal money path has opened, later scheduler health faults
-        # belong to the deferred-recovery subsystem and must not become a
-        # global unrelated-entry halt.
+        # After that, a scheduler liveness fault requests one controlled
+        # runner replacement; it never launches an overlapping child.
         self._deferred_recovery_scheduler_startup_gate_open = False
         self.deferred_recovery_scheduler_healthy = threading.Event()
         self.deferred_recovery_scheduler_health_reasons: set[str] = set()
+        self._deferred_recovery_supervisor_restart_requested = False
+        self._deferred_recovery_supervisor_restart_reason = ""
+        self._deferred_recovery_supervisor_restart_lock = threading.Lock()
         self.failure_reason: str = ""
         self._overnight_reeval_attempt_lock = threading.Lock()
         self._overnight_reeval_state_date = None
@@ -1692,9 +1694,9 @@ class ClientRunner(threading.Thread):
         # Entry permission is the canonical money-path gate.  Before the
         # first unlock, every caller must prove the independent deferred-
         # recovery consumer is live, ready, and within its heartbeat budget.
-        # After startup has opened the gate, scheduler health remains a
-        # separate deferred-recovery diagnostic and does not halt unrelated
-        # fresh entries globally.
+        # After startup has opened the gate, a deferred scheduler liveness
+        # fault requests one controlled supervisor replacement. The runner
+        # is held during that replacement; no in-runner scheduler is spawned.
         _startup_gate_open = bool(
             getattr(self, "_deferred_recovery_scheduler_startup_gate_open", False)
         )
@@ -2801,8 +2803,10 @@ class ClientRunner(threading.Thread):
         readiness handshake is therefore the minimum prerequisite for the
         first entry unlock; no initial recovery tick is added here, which
         avoids replaying the same broad recovery boundary immediately after
-        startup recovery.  After that unlock, scheduler health is scoped to
-        deferred lifecycles and is not a global fresh-entry permission gate.
+        startup recovery.  After that unlock, a dead or stale scheduler
+        requests one controlled replacement of this runner through the
+        existing supervisor. No in-runner replacement is created and no second
+        recovery executor can overlap the old one.
         Durable CAS in the canonical recovery/execution path remains the
         authority; this thread is only a timer and caller boundary.
         """
@@ -2922,10 +2926,10 @@ class ClientRunner(threading.Thread):
             finally:
                 # A scheduler that exits for any reason other than an explicit
                 # runner shutdown must publish a critical deferred-recovery
-                # health fault.  Before the first entry unlock the direct
+                # health fault. Before the first entry unlock the direct
                 # permission gate turns that fault into a startup hold; after
-                # startup it remains scoped to deferred lifecycles and does
-                # not clear unrelated fresh-entry permission.
+                # startup the health path requests one controlled supervisor
+                # replacement and never starts an overlapping child here.
                 _ready_event.clear()
                 if not self.stopping.is_set() and not self.stopped.is_set() and not self.failed.is_set():
                     self._mark_deferred_recovery_scheduler_unhealthy(
@@ -2958,7 +2962,7 @@ class ClientRunner(threading.Thread):
         _ready_event.wait(_ready_timeout)
 
     def _mark_deferred_recovery_scheduler_unhealthy(self, reason: str) -> None:
-        """Publish scheduler health without changing post-startup entry authority."""
+        """Publish scheduler health and preserve one-runner restart ownership."""
         _reason = str(reason)
         _lock = getattr(self, "_degraded_lock", None)
 
@@ -2988,11 +2992,46 @@ class ClientRunner(threading.Thread):
         if _first:
             logger.critical(
                 "[%s] %s — deferred recovery scheduler unhealthy; "
-                "deferred lifecycles remain held and unrelated entry permission "
-                "is unchanged after startup; no overlapping scheduler will be started",
+                "deferred lifecycles remain held and no overlapping scheduler "
+                "will be started",
                 self.email,
                 _reason.upper(),
             )
+
+    def _request_deferred_recovery_supervisor_restart(self, reason: str) -> bool:
+        """Stop this runner once so the existing supervisor can replace it.
+
+        The scheduler is a child consumer, so the supervisor cannot observe its
+        death while the ClientRunner itself remains alive.  Marking the runner
+        for supervisor replacement keeps restart ownership outside this class;
+        this method never constructs or starts another scheduler.  The flag is
+        also used by the supervisor to keep a stale scheduler tombstone in the
+        registry until that child has actually exited, preventing overlap.
+        """
+        _lock = getattr(self, "_deferred_recovery_supervisor_restart_lock", None)
+        if _lock is None:
+            with _registry_lock:
+                _lock = getattr(
+                    self, "_deferred_recovery_supervisor_restart_lock", None
+                )
+                if _lock is None:
+                    _lock = threading.Lock()
+                    self._deferred_recovery_supervisor_restart_lock = _lock
+
+        with _lock:
+            if getattr(self, "_deferred_recovery_supervisor_restart_requested", False):
+                return False
+            self._deferred_recovery_supervisor_restart_requested = True
+            self._deferred_recovery_supervisor_restart_reason = str(reason or "unknown")
+
+        logger.critical(
+            "[%s] DEFERRED_RECOVERY_SUPERVISOR_RESTART_REQUESTED reason=%s — "
+            "stopping this runner for one controlled supervisor replacement",
+            self.email,
+            reason,
+        )
+        self.stop()
+        return True
 
     def _clear_deferred_recovery_scheduler_health_reasons(
         self,
@@ -3063,11 +3102,11 @@ class ClientRunner(threading.Thread):
         *,
         startup_required: bool = False,
     ) -> bool:
-        """Check the one scheduler, gating only the first entry unlock."""
+        """Check the one scheduler and request one supervised replacement on liveness loss."""
         _scope = (
             "blocking the initial entry unlock"
             if startup_required
-            else "holding deferred lifecycles while leaving unrelated entry permission unchanged"
+            else "requesting one controlled supervisor replacement without an overlapping scheduler"
         )
 
         def _fault(reason: str, message: str, *args) -> bool:
@@ -3075,6 +3114,12 @@ class ClientRunner(threading.Thread):
             self._mark_deferred_recovery_scheduler_unhealthy(reason)
             if startup_required:
                 self._enter_degraded_mode(reason, stop_runner=False)
+            elif reason in {
+                "deferred_recovery_scheduler_dead",
+                "deferred_recovery_scheduler_not_ready",
+                "deferred_recovery_scheduler_stale",
+            }:
+                self._request_deferred_recovery_supervisor_restart(reason)
             return False
 
         _thread = getattr(self, "deferred_recovery_thread", None)
@@ -3294,8 +3339,26 @@ class ClientRunner(threading.Thread):
             self._cleanup()
             with _registry_lock:
                 current = _active_runners.get(self.email)
-                if current is self:
+                _deferred_child_alive = bool(
+                    getattr(self, "deferred_recovery_thread", None)
+                    and self.deferred_recovery_thread.is_alive()
+                )
+                _restart_wait = (
+                    getattr(
+                        self,
+                        "_deferred_recovery_supervisor_restart_requested",
+                        False,
+                    )
+                    and _deferred_child_alive
+                )
+                if current is self and not _restart_wait:
                     _active_runners.pop(self.email, None)
+                elif current is self and _restart_wait:
+                    logger.warning(
+                        "[%s] retaining stopped runner registry tombstone until "
+                        "deferred scheduler exits before supervisor replacement",
+                        self.email,
+                    )
             logger.info("[%s] ClientRunner stopped.", self.email)
 
     def _run_inner(self):
@@ -5432,6 +5495,15 @@ def _fetch_active_members(sb: Client) -> list[dict]:
         return []
 
 
+def _deferred_restart_waiting(runner: ClientRunner) -> bool:
+    """True while a stopped runner's old deferred scheduler is still alive."""
+    return bool(
+        getattr(runner, "_deferred_recovery_supervisor_restart_requested", False)
+        and getattr(runner, "deferred_recovery_thread", None)
+        and runner.deferred_recovery_thread.is_alive()
+    )
+
+
 def _sync_runners(sb: Client):
     members = _fetch_active_members(sb)
     active_emails = {m["email"] for m in members}
@@ -5450,6 +5522,13 @@ def _sync_runners(sb: Client):
 
         for email, runner in list(_active_runners.items()):
             if not runner.is_alive():
+                if _deferred_restart_waiting(runner):
+                    logger.warning(
+                        "[%s] deferred scheduler still exiting; supervisor will "
+                        "delay replacement to prevent overlapping recovery consumers",
+                        email,
+                    )
+                    continue
                 logger.warning("Removing dead runner from registry: %s", email)
                 _active_runners.pop(email, None)
 
@@ -5467,6 +5546,14 @@ def _sync_runners(sb: Client):
                         email
                     )
                 continue
+            if existing and _deferred_restart_waiting(existing):
+                logger.warning(
+                    "[%s] replacement deferred until the prior scheduler exits",
+                    email,
+                )
+                continue
+            if existing and not existing.is_alive():
+                _active_runners.pop(email, None)
             logger.info("Starting runner for %s", email)
             runner = ClientRunner(member)
             _active_runners[email] = runner

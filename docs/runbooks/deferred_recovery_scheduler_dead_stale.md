@@ -20,14 +20,17 @@ When unsafe, the runner must:
 1. publish a critical scheduler-health diagnostic;
 2. before the first startup unlock, keep `entries_allowed` cleared and enter
    degraded mode with the scheduler-specific reason;
-3. after startup, keep affected deferred lifecycles held while leaving
-   unrelated fresh-entry permission under its normal gates;
-4. never launch an overlapping replacement scheduler;
+3. after startup, keep affected deferred lifecycles held and request one
+   controlled replacement of the owning `ClientRunner` through the existing
+   supervisor;
+4. never launch an overlapping replacement scheduler or runner while the old
+   scheduler child is still alive;
 5. preserve existing durable order state for forensic recovery.
 
 The startup hold is an entry halt.  A post-startup scheduler fault is a
 deferred-recovery subsystem incident, not proof that an incident row has
-healed or a reason to clear unrelated `entries_allowed`.
+healed. The affected runner is stopped for controlled supervisor replacement;
+the replacement's normal startup gates decide when entries can reopen.
 
 ## Detection
 
@@ -59,19 +62,19 @@ Never combine LIVE and PAPER evidence in one incident record.
 ## Recovery procedure
 
 1. Confirm the affected client and mode from the runner manifest and logs.
-2. If startup has not yet opened the entry gate, confirm `entries_allowed` is
-   cleared. If startup already completed, confirm unrelated entry permission
-   remains governed by its normal gates and treat the event as a deferred-
-   recovery subsystem incident.
+2. Confirm `entries_allowed` is cleared while the affected runner is being
+   replaced. Treat the event as a deferred-recovery subsystem incident, not as
+   evidence that any durable row healed.
 3. Confirm whether the scheduler thread is dead or merely stale.
 4. Do not manually invoke a second recovery executor in the same runner.
-5. Stop and restart the affected runner through the normal deployment/process supervisor.
-6. Confirm startup recovery completes before scheduler readiness is published.
-7. Confirm exactly one scheduler thread is alive and ready.
-8. Confirm the first health check reports a fresh completed-tick heartbeat.
+5. Confirm the runner emitted `DEFERRED_RECOVERY_SUPERVISOR_RESTART_REQUESTED`.
+   If the supervisor is unavailable, stop and restart the affected runner
+   through the normal deployment/process supervisor.
+6. Confirm the old scheduler child exits before the replacement runner starts.
+7. Confirm startup recovery completes before scheduler readiness is published.
+8. Confirm exactly one scheduler thread is alive and ready.
 9. Confirm startup entry permission is restored only after the scheduler
-   readiness gate passes; a post-startup fault must not clear unrelated entry
-   permission.
+   readiness gate passes.
 10. Re-read the affected durable row using exact client, mode, local order, signal, canonical signal, generation, lifecycle, and broker-evidence predicates.
 11. For a CCEP/deferred row, verify whether it is still `PENDING_TRIGGER`/`RETRY_WAIT`, `BROKER_READY`, terminal, or has broker submit evidence.
 12. Compare liveness (`last_deferred_recovery_completed_ts`) separately from
@@ -125,6 +128,6 @@ Required response:
 - Do not manually mark a row `BROKER_READY`, `SUBMITTED`, or `FILLED`.
 - Do not add broker IDs from memory or logs without exact broker/client/mode/order proof.
 - Do not clear scheduler health reasons while the thread is dead or stale.
-- Do not convert a post-startup scheduler fault into a global fresh-entry
-  halt unless an independent entry gate fails.
+- Do not start an in-runner scheduler replacement or bypass the supervisor's
+  old-child exit check.
 - Do not treat a successful process restart as proof that the original CCEP incident healed.

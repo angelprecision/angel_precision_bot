@@ -377,9 +377,11 @@ def test_runtime_scheduler_handle_is_never_replaced_after_exit(monkeypatch):
     assert runner.deferred_recovery_thread is first
 
 
-def test_runtime_scheduler_health_is_scoped_without_clearing_entry_permission():
-    """Post-startup faults hold deferred work, not unrelated fresh entries."""
+def test_runtime_scheduler_health_requests_one_supervised_runner_restart():
+    """Post-startup liveness faults restart the owning runner once."""
     runner = _runner()
+    runner.stopping = threading.Event()
+    runner.stopped = threading.Event()
     runner.entries_allowed = threading.Event()
     runner.entries_allowed.set()
     runner._deferred_recovery_scheduler_startup_gate_open = True
@@ -387,9 +389,10 @@ def test_runtime_scheduler_health_is_scoped_without_clearing_entry_permission():
     dead = types.SimpleNamespace(is_alive=lambda: False)
     runner.deferred_recovery_thread = dead
     assert runner._check_deferred_recovery_scheduler_health(now=100.0) is False
-    assert runner.entries_allowed.is_set()
-    assert not runner.degraded.is_set()
-    assert runner.degraded_reasons == set()
+    assert not runner.entries_allowed.is_set()
+    assert runner.stopping.is_set()
+    assert runner.stopped.is_set()
+    assert runner._deferred_recovery_supervisor_restart_requested is True
     assert runner.deferred_recovery_scheduler_health_reasons == {
         "deferred_recovery_scheduler_dead"
     }
@@ -401,7 +404,8 @@ def test_runtime_scheduler_health_is_scoped_without_clearing_entry_permission():
     runner.last_deferred_recovery_completed_ts = 20.0
     runner.deferred_recovery_heartbeat_max_sec = 5.0
     assert runner._check_deferred_recovery_scheduler_health(now=100.0) is False
-    assert runner.entries_allowed.is_set()
+    assert not runner.entries_allowed.is_set()
+    assert runner._deferred_recovery_supervisor_restart_requested is True
     assert runner.degraded_reasons == set()
     assert runner.deferred_recovery_scheduler_health_reasons == {
         "deferred_recovery_scheduler_dead",
@@ -409,16 +413,43 @@ def test_runtime_scheduler_health_is_scoped_without_clearing_entry_permission():
     }
 
 
-def test_runtime_set_entry_permission_keeps_unrelated_entries_after_scheduler_fault():
-    """The canonical permission caller cannot turn a runtime fault global."""
+def test_runtime_stale_scheduler_requests_supervised_runner_restart_without_dead_handle():
+    """A live but stale child is restarted once; it is never overlapped."""
+    runner = _runner()
+    runner.stopping = threading.Event()
+    runner.stopped = threading.Event()
+    runner.entries_allowed = threading.Event()
+    runner.entries_allowed.set()
+    runner._deferred_recovery_scheduler_startup_gate_open = True
+    runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.deferred_recovery_scheduler_ready.set()
+    runner.deferred_recovery_started_ts = 10.0
+    runner.last_deferred_recovery_completed_ts = 20.0
+    runner.deferred_recovery_heartbeat_max_sec = 5.0
+
+    assert runner._check_deferred_recovery_scheduler_health(now=100.0) is False
+    assert not runner.entries_allowed.is_set()
+    assert runner.stopping.is_set()
+    assert runner.stopped.is_set()
+    assert runner._deferred_recovery_supervisor_restart_requested is True
+    assert runner.deferred_recovery_scheduler_health_reasons == {
+        "deferred_recovery_scheduler_stale"
+    }
+
+
+def test_runtime_set_entry_permission_requests_supervised_replacement_after_scheduler_fault():
+    """The canonical permission caller requests supervised replacement."""
     runner = _permission_runner()
+    runner.stopping = threading.Event()
+    runner.stopped = threading.Event()
     runner._deferred_recovery_scheduler_startup_gate_open = True
     runner.entries_allowed.set()
     runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: False)
 
-    assert runner._set_entry_permission() is True
-    assert runner.entries_allowed.is_set()
-    assert not runner.degraded.is_set()
+    assert runner._set_entry_permission() is False
+    assert not runner.entries_allowed.is_set()
+    assert runner.stopping.is_set()
+    assert runner.stopped.is_set()
     assert "deferred_recovery_scheduler_dead" in (
         runner.deferred_recovery_scheduler_health_reasons
     )
@@ -427,6 +458,8 @@ def test_runtime_set_entry_permission_keeps_unrelated_entries_after_scheduler_fa
 def test_runtime_scheduler_fault_holds_deferred_work_without_replacement_or_broker_side_effects():
     """A dead scheduler does not run a deferred row or create a replacement."""
     runner = _runner()
+    runner.stopping = threading.Event()
+    runner.stopped = threading.Event()
     runner._deferred_recovery_scheduler_startup_gate_open = True
     runner.entries_allowed.set()
     runner.broker = MagicMock()
@@ -440,9 +473,56 @@ def test_runtime_scheduler_fault_holds_deferred_work_without_replacement_or_brok
 
     assert runner.deferred_recovery_thread is dead
     recovery.assert_not_called()
-    assert runner.entries_allowed.is_set()
+    assert not runner.entries_allowed.is_set()
+    assert runner.stopping.is_set()
+    assert runner.stopped.is_set()
     assert not runner.broker.submit_order.called
     assert not runner.broker.submit_entry.called
+
+
+def test_supervisor_waits_for_old_deferred_scheduler_before_replacement(monkeypatch):
+    """A controlled restart never overlaps the prior recovery consumer."""
+    email = "jasoncosby1@gmail.com"
+    old_runner = _runner()
+    old_runner.email = email
+    old_runner.is_alive = lambda: False
+    old_runner.stopping = threading.Event()
+    old_runner.stopping.set()
+    old_runner._deferred_recovery_supervisor_restart_requested = True
+    scheduler_alive = [True]
+    old_runner.deferred_recovery_thread = types.SimpleNamespace(
+        is_alive=lambda: scheduler_alive[0]
+    )
+    monkeypatch.setattr(cr, "_active_runners", {email: old_runner})
+    monkeypatch.setattr(
+        cr,
+        "_fetch_active_members",
+        lambda _sb: [{"email": email}],
+    )
+
+    created: list[object] = []
+
+    class _Replacement:
+        def __init__(self, member):
+            self.email = member["email"]
+            created.append(self)
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return True
+
+    monkeypatch.setattr(cr, "ClientRunner", _Replacement)
+
+    cr._sync_runners(object())
+    assert created == []
+    assert cr._active_runners[email] is old_runner
+
+    scheduler_alive[0] = False
+    cr._sync_runners(object())
+    assert len(created) == 1
+    assert cr._active_runners[email] is created[0]
 
 
 def _permission_runner() -> object:
