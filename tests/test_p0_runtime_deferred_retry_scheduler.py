@@ -8,6 +8,7 @@ not call the execution-core retry method directly.
 from __future__ import annotations
 
 import os
+import inspect
 import sys
 import threading
 import time
@@ -132,6 +133,12 @@ def _runner() -> object:
     runner.stopping = _PulseEvent()
     runner.failed = _PulseEvent()
     runner.initialized = types.SimpleNamespace(is_set=lambda: True)
+    runner.degraded = threading.Event()
+    runner.entries_allowed = threading.Event()
+    runner.degraded_reasons = set()
+    runner._degraded_lock = threading.Lock()
+    runner.deferred_recovery_scheduler_ready = threading.Event()
+    runner.is_alive = lambda: True
     runner.broker = object()
     runner.position_manager = object()
     runner.order_state_machine = object()
@@ -251,12 +258,93 @@ def test_scheduler_health_dead_or_stale_fails_closed_without_restart():
     runner.degraded_reasons.clear()
     runner.entries_allowed.set()
     runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.deferred_recovery_scheduler_ready.set()
     runner.deferred_recovery_started_ts = 10.0
     runner.last_deferred_recovery_completed_ts = 20.0
     runner.deferred_recovery_heartbeat_max_sec = 5.0
     assert runner._check_deferred_recovery_scheduler_health(now=100.0) is False
     assert not runner.entries_allowed.is_set()
     assert "deferred_recovery_scheduler_stale" in runner.degraded_reasons
+
+
+def _permission_runner() -> object:
+    runner = _runner()
+    runner.worker_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.fill_monitor_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner._is_market_hours_now = lambda: False
+    runner._quote_monitor_healthy = lambda: True
+    runner.core = types.SimpleNamespace(exit_eng=object())
+    return runner
+
+
+def test_run_inner_starts_scheduler_before_first_entry_permission_gate():
+    """Startup ordering cannot reintroduce the pre-health-loop fail-open."""
+    source = inspect.getsource(cr.ClientRunner._run_inner)
+    assert source.index("self._start_deferred_breach_lifecycle_scheduler()") < source.index(
+        "self._set_entry_permission()"
+    )
+
+
+@pytest.mark.parametrize("scheduler_state", ("absent", "dead", "not_ready", "stale"))
+def test_set_entry_permission_requires_live_ready_nonstale_scheduler(
+    scheduler_state,
+):
+    """No direct caller can bypass the deferred-recovery money-path gate."""
+    runner = _permission_runner()
+    runner.entries_allowed.set()
+
+    if scheduler_state == "dead":
+        runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: False)
+    elif scheduler_state == "not_ready":
+        runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+        runner.deferred_recovery_started_ts = time.time()
+        runner.deferred_recovery_heartbeat_max_sec = 60.0
+    elif scheduler_state == "stale":
+        runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+        runner.deferred_recovery_scheduler_ready.set()
+        runner.deferred_recovery_started_ts = 1.0
+        runner.last_deferred_recovery_completed_ts = 1.0
+        runner.deferred_recovery_heartbeat_max_sec = 0.1
+
+    assert runner._set_entry_permission() is False
+    assert not runner.entries_allowed.is_set()
+
+
+def test_scheduler_dies_immediately_before_health_tick_keeps_entries_blocked(monkeypatch):
+    """A startup child that exits before the first health tick fails closed."""
+    runner = _permission_runner()
+    runner.broker = MagicMock()
+    runner.stopped = _PulseEvent([True])
+    runner.stopping = _PulseEvent([False])
+    runner.failed = _PulseEvent([False])
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_READY_TIMEOUT_SEC", "0.1")
+
+    class _DyingThread:
+        def __init__(self, *, target, daemon, name):
+            self._target = target
+            self.daemon = daemon
+            self.name = name
+
+        def start(self):
+            self._target()
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(cr.threading, "Thread", _DyingThread)
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+
+    assert runner.deferred_recovery_thread is not None
+    assert not runner.deferred_recovery_thread.is_alive()
+    assert runner._set_entry_permission() is False
+    assert not runner.entries_allowed.is_set()
+    assert not runner.broker.submit_order.called
+    assert not runner.broker.submit_entry.called
+    assert "deferred_recovery_scheduler_dead" in runner.degraded_reasons
 
 
 def test_runtime_scheduler_serializes_a_slow_tick_without_overlap(monkeypatch):

@@ -512,6 +512,188 @@ def _run_recovery_pair(monkeypatch, *, actor_two):
         _drop_schema(url, schema)
 
 
+def _build_broker_ready_execution_core(osm, *, client_id, mode):
+    """Build the real execution-core recovery boundary without broker POST."""
+    from ap_execution_core import APExecutionCore
+
+    core = APExecutionCore.__new__(APExecutionCore)
+    core.client_id = client_id
+    core.email = client_id
+    core.execution_mode = mode
+    core.mode = mode
+    core.order_state_machine = osm
+    core.entry_watcher = None
+    core.broker = MagicMock()
+    core.store = MagicMock()
+    core._on_entry_trigger = MagicMock(return_value=None)
+    return core
+
+
+def _broad_recovery_meta(
+    *, local_order_id, client_id, mode, signal_id, canonical_signal_id,
+    lifecycle, contract, trigger_crossed_at, due_at,
+):
+    meta = {
+        "lifecycle_state": lifecycle,
+        "materialization_status": "SELECTED" if lifecycle == "BROKER_READY" else "PROOF_RETRY",
+        "materialization_in_flight": False,
+        "materialization_generation": 8,
+        "retry_attempt": 3,
+        "retry_max_attempts": 5,
+        "materialization_attempts": 3,
+        "broker_ready": lifecycle == "BROKER_READY",
+        "materialization_owner": f"prior-owner:{local_order_id}",
+        "current_owner": f"prior-owner:{local_order_id}",
+        "selected_contract": contract,
+        "selected_limit": 1.25,
+        "selected_qty": 1,
+        "trigger_crossed_at": trigger_crossed_at,
+        "trigger_crossed_at_provenance": {
+            "canonical_signal_id": canonical_signal_id,
+            "client_id": client_id,
+            "execution_mode": mode,
+            "local_order_id": local_order_id,
+        },
+        "signal_id": signal_id,
+        "canonical_signal_id": canonical_signal_id,
+        "client_id": client_id,
+        "execution_mode": mode,
+        "local_order_id": local_order_id,
+        "trigger_price": 100,
+        "observed_underlying_price": 101,
+        "proof_retry_attempt": 0,
+        "proof_retry_max_attempts": 3,
+        "proof_retry_next_at": due_at,
+        "proof_retry_deadline": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+        "selected_at": trigger_crossed_at,
+        "selected_quote_at": trigger_crossed_at,
+    }
+    return meta
+
+
+def _run_broad_recovery_race(monkeypatch, *, lifecycle):
+    """Race startup recovery against the exact recurring runtime boundary."""
+    from ap.order_state_machine import APOrderStateMachine
+    import client_runner as client_runner_module
+    import ap_recovery
+
+    url = _postgres_url_or_skip()
+    schema = f"pr603_broad_{lifecycle.lower()}_{uuid.uuid4().hex}"
+    client_id = f"broad-{lifecycle.lower()}@example.com"
+    mode = "paper"
+    local_order_id = f"pr603-broad-{uuid.uuid4().hex}"
+    signal_id = f"signal-broad-{uuid.uuid4().hex}"
+    canonical_signal_id = f"canonical-broad-{uuid.uuid4().hex}"
+    contract = "AAPL240101C00100000"
+    now = datetime.now(timezone.utc)
+    trigger_crossed_at = (now - timedelta(seconds=5)).isoformat()
+    due_at = (now - timedelta(seconds=2)).isoformat()
+
+    _create_orders_schema(url, schema)
+    scoped = _ScopedPostgres(url, schema)
+    try:
+        _patch_postgres_modules(monkeypatch, scoped)
+        monkeypatch.setenv("DEFERRED_RECOVERY_RETRY_DELAY_SECONDS", "60")
+        monkeypatch.setenv("PRE_SUBMIT_PROOF_RETRY_DELAY_SECONDS", "60")
+        meta = _broad_recovery_meta(
+            local_order_id=local_order_id,
+            client_id=client_id,
+            mode=mode,
+            signal_id=signal_id,
+            canonical_signal_id=canonical_signal_id,
+            lifecycle=lifecycle,
+            contract=contract,
+            trigger_crossed_at=trigger_crossed_at,
+            due_at=due_at,
+        )
+        _insert_order(
+            scoped,
+            local_order_id=local_order_id,
+            client_id=client_id,
+            mode=mode,
+            signal_id=signal_id,
+            meta=meta,
+            contract=contract,
+        )
+        before = _read_side_effect_counts(url, schema)
+
+        osm_one = APOrderStateMachine(client_id)
+        osm_two = APOrderStateMachine(client_id)
+        core_one = _build_broker_ready_execution_core(
+            osm_one, client_id=client_id, mode=mode
+        )
+        core_two = _build_broker_ready_execution_core(
+            osm_two, client_id=client_id, mode=mode
+        )
+        recovery_one = _recovery(
+            osm=osm_one, core=core_one, client_id=client_id, mode=mode
+        )
+
+        monkeypatch.setattr(
+            client_runner_module,
+            "APStartupRecovery",
+            ap_recovery.APStartupRecovery,
+        )
+        runner = object.__new__(client_runner_module.ClientRunner)
+        runner.email = client_id
+        runner.mode = mode.upper()
+        runner.stopping = threading.Event()
+        runner.stopped = threading.Event()
+        runner.failed = threading.Event()
+        runner.broker = core_two.broker
+        runner.core = core_two
+        runner.position_manager = object()
+        runner.order_state_machine = osm_two
+        runner.master_control = SimpleNamespace(mode=mode.upper())
+
+        outcomes = []
+        barrier = threading.Barrier(2)
+
+        def _startup_actor():
+            barrier.wait(timeout=10)
+            outcomes.append(recovery_one.recover_deferred_lifecycles())
+
+        def _runtime_actor():
+            barrier.wait(timeout=10)
+            outcomes.append(runner._run_deferred_breach_lifecycle_recovery())
+
+        startup_thread = threading.Thread(target=_startup_actor)
+        runtime_thread = threading.Thread(target=_runtime_actor)
+        startup_thread.start()
+        runtime_thread.start()
+        startup_thread.join(timeout=20)
+        runtime_thread.join(timeout=20)
+        assert not startup_thread.is_alive()
+        assert not runtime_thread.is_alive()
+        assert len(outcomes) == 2
+
+        final = _read_order(url, schema, local_order_id)
+        final_meta = dict(final["meta"] or {})
+        assert final["client_id"] == client_id
+        assert final["execution_mode"] == mode
+        assert final["status"] == "PENDING_TRIGGER"
+        assert final["broker_order_id"] is None
+        assert final["submitted_ts"] is None
+        # The canonical recovery scaffold claims one durable recovery-submit
+        # owner, but the test callback intentionally stops before submit-intent
+        # or broker POST.  A peer must lose this CAS rather than create a
+        # second recovery authority.
+        assert final_meta["recovery_submit_owner"]
+        assert final_meta["current_owner"] == final_meta["recovery_submit_owner"]
+        assert not final_meta.get("submit_intent_at")
+        assert final_meta["materialization_generation"] == (8 if lifecycle == "BROKER_READY" else 9)
+        assert final_meta["lifecycle_state"] == "BROKER_READY"
+        assert final_meta["broker_ready"] is True
+        assert sum(core._on_entry_trigger.call_count for core in (core_one, core_two)) == 1
+        assert not core_one.broker.submit_order.called
+        assert not core_one.broker.submit_entry.called
+        assert not core_two.broker.submit_order.called
+        assert not core_two.broker.submit_entry.called
+        assert _read_side_effect_counts(url, schema) == before
+    finally:
+        _drop_schema(url, schema)
+
+
 def test_postgres_recovery_race_startup_vs_startup_has_one_owner(monkeypatch):
     """Two independent startup-shaped recovery processes share one CAS winner."""
     _run_recovery_pair(monkeypatch, actor_two="startup")
@@ -525,6 +707,14 @@ def test_postgres_recovery_race_startup_vs_runtime_tick_has_one_owner(monkeypatc
 def test_postgres_recovery_race_watcher_callback_vs_runtime_tick_has_one_owner(monkeypatch):
     """A watcher callback and runtime recovery share the real durable CAS."""
     _run_recovery_pair(monkeypatch, actor_two="watcher")
+
+
+@pytest.mark.parametrize("lifecycle", ("BROKER_READY", "PRE_SUBMIT_PROOF_RETRY"))
+def test_postgres_broad_runtime_recovery_race_has_one_owner_without_broker_work(
+    monkeypatch, lifecycle
+):
+    """The recurring broad pass cannot duplicate broker-ready/proof ownership."""
+    _run_broad_recovery_race(monkeypatch, lifecycle=lifecycle)
 
 
 def test_postgres_confirmation_restart_reconstructs_authority_without_duplicate_callback(
