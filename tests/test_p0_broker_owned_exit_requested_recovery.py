@@ -49,6 +49,21 @@ class _FakeDB:
         self.rows = {str(row["local_order_id"]): row for row in rows}
 
 
+def _install_exact_exit_fill_timestamp(osm, filled_ts):
+    """Adapt legacy broker fixtures to #579's explicit OSM timestamp contract."""
+    original_transition = osm.transition
+
+    def _transition(local_order_id, new_status, **kwargs):
+        if str(new_status or "").upper() in {
+            "EXIT_PARTIAL_FILL",
+            "EXIT_FILLED",
+        }:
+            kwargs.setdefault("filled_ts", filled_ts)
+        return original_transition(local_order_id, new_status, **kwargs)
+
+    osm.transition = _transition
+
+
 class _FakeCursor:
     def __init__(self, db: _FakeDB):
         self.db = db
@@ -670,6 +685,7 @@ def test_fill_monitor_orcl_replay_adopts_then_uses_canonical_fill_path(
             "exec_quantity": 4,
             "avg_fill_price": 1.25,
             "quantity": 4,
+            "filled_at": "2026-08-08T13:31:00+00:00",
         }
     )
     monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
@@ -724,6 +740,7 @@ def test_fill_monitor_recovery_uses_existing_status_reducer(
             "exec_quantity": raw_qty,
             "avg_fill_price": 1.25,
             "quantity": 4,
+            "filled_at": "2026-08-08T13:31:00+00:00",
         }
     )
     monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
@@ -910,6 +927,8 @@ class _CanonicalExitEngine:
 def test_orcl_replay_uses_real_osm_transition_and_applies_close_once(
     fake_osm_db, monkeypatch
 ):
+    from ap.position_manager import ConvergenceResult
+
     db, osm = fake_osm_db
     db.rows["exit-orcl-1"]["broker_order_id"] = "36661364"
     engine = _CanonicalExitEngine()
@@ -918,12 +937,24 @@ def test_orcl_replay_uses_real_osm_transition_and_applies_close_once(
         osm, APOrderStateMachine
     )
     osm._finalize_position_from_exit_order = MagicMock()
+    osm._converge_durable_exit_order = MagicMock(
+        return_value=ConvergenceResult(
+            disposition="APPLIED_FULL",
+            applied_delta_qty=4,
+            cumulative_applied_qty=4,
+            terminal=True,
+            position_id="position-orcl-1",
+            broker_order_id="36661364",
+            exit_price=1.25,
+        )
+    )
     broker = _Broker(
         {
             "status": "FILLED",
             "exec_quantity": 4,
             "avg_fill_price": 1.25,
             "quantity": 4,
+            "filled_at": "2026-08-08T13:31:00+00:00",
         }
     )
     monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
@@ -954,6 +985,8 @@ def test_orcl_replay_uses_real_osm_transition_and_applies_close_once(
 def test_partial_exit_replay_preserves_exact_exit_quantity_and_remaining_position(
     fake_osm_db, monkeypatch
 ):
+    from ap.position_manager import ConvergenceResult
+
     db, osm = fake_osm_db
     db.rows["exit-orcl-1"].update(
         broker_order_id="partial-broker-425",
@@ -969,12 +1002,25 @@ def test_partial_exit_replay_preserves_exact_exit_quantity_and_remaining_positio
         osm, APOrderStateMachine
     )
     osm._finalize_position_from_exit_order = MagicMock()
+    osm._converge_durable_exit_order = MagicMock(
+        return_value=ConvergenceResult(
+            disposition="APPLIED_PARTIAL",
+            applied_delta_qty=3,
+            cumulative_applied_qty=3,
+            terminal=False,
+            position_id="position-partial-1",
+            broker_order_id="partial-broker-425",
+            exit_price=1.25,
+            applied_delta_price=1.25,
+        )
+    )
     broker = _Broker(
         {
             "status": "FILLED",
             "exec_quantity": 3,
             "avg_fill_price": 1.25,
             "quantity": 3,
+            "filled_at": "2026-08-08T13:31:00+00:00",
         }
     )
     monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
@@ -1281,6 +1327,10 @@ def test_pr566_real_durable_restart_recovery_and_manual_close_ownership(monkeypa
         osm_b = APOrderStateMachine("tradefluence")
         for state_machine in (osm_a, osm_b):
             state_machine._emit_transition_event = lambda **kwargs: None
+            _install_exact_exit_fill_timestamp(
+                state_machine,
+                "2026-08-08T13:31:00+00:00",
+            )
 
         monkeypatch.setattr(
             "ap.performance_tracker.record_trade_outcome_from_position",
@@ -1309,6 +1359,7 @@ def test_pr566_real_durable_restart_recovery_and_manual_close_ownership(monkeypa
                     "exec_quantity": 4,
                     "avg_fill_price": 1.25,
                     "quantity": 4,
+                    "filled_at": "2026-08-08T13:31:00+00:00",
                 }
 
             def submit_order(self, *args, **kwargs):
@@ -1435,6 +1486,10 @@ def test_pr566_real_durable_restart_recovery_and_manual_close_ownership(monkeypa
 
         replay_osm = APOrderStateMachine("tradefluence")
         replay_osm._emit_transition_event = lambda **kwargs: None
+        _install_exact_exit_fill_timestamp(
+            replay_osm,
+            "2026-08-08T13:31:00+00:00",
+        )
         fm.process_pending_order(
             _ReplayBroker(),
             dict(original_order),
@@ -1514,10 +1569,10 @@ def test_pr566_real_durable_restart_recovery_and_manual_close_ownership(monkeypa
                     (id, client_id, status, quantity_remaining, qty, avg_fill,
                      entry_price, contract, underlying, ticker, side, direction,
                      entry_ts, execution_mode, local_order_id)
-                VALUES
-                    (%s, 'tradefluence', 'OPEN', 4, 4, 1.00, 1.00,
-                     %s, 'AAPL', 'AAPL', 'AAPL', 'PUT',
-                     %s, 'paper', %s)
+                    VALUES
+                        (%s, 'tradefluence', 'OPEN', 4, 4, 1.00, 1.00,
+                         %s, 'AAPL', 'AAPL', 'PUT', 'PUT',
+                         %s, 'paper', %s)
                 """,
                 (
                     recovered_position_id,
@@ -1729,7 +1784,7 @@ def test_pr566_real_durable_restart_recovery_and_manual_close_ownership(monkeypa
             "broker_order_id": recovered_broker_id,
             "exit_price": recovered_position_row["exit_price"],
             "exit_ts": recovered_position_row["exit_ts"],
-            "close_source": "broker_exit_fill",
+            "close_source": "durable_exit_fill_convergence",
         }
         assert float(recovered_position_row["exit_price"]) == 1.25
         assert len(recovered_lifecycle) == 1
@@ -3494,8 +3549,14 @@ def test_f7_recovered_fill_keeps_canonical_exit_filled_reason_code(monkeypatch):
         lambda o, **kw: emitted.append(kw) or True,
     )
     monkeypatch.setattr(
-        fm, "check_order_with_broker",
-        lambda broker, o: {"status": "EXIT_FILLED", "filled_qty": 4, "fill_price": 1.25},
+        fm,
+        "check_order_with_broker",
+        lambda broker, o: {
+            "status": "EXIT_FILLED",
+            "filled_qty": 4,
+            "fill_price": 1.25,
+            "filled_ts": "2026-08-08T13:31:00+00:00",
+        },
     )
     monkeypatch.setattr(fm, "reduce_position_on_fill", MagicMock(), raising=False)
 

@@ -20,20 +20,307 @@
 from __future__ import annotations
 
 import logging
+import json
 import math
 import os
 import re
 import uuid
+from dataclasses import dataclass, replace
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 from ap.db import conn, run_with_retry
+from ap.manual_close_reconciliation import parse_broker_fill_timestamp
 from ap.utils import now_utc_iso
 
 log = logging.getLogger("ap.position_manager")
 ET = ZoneInfo("America/New_York")
 _OCC_CONTRACT_RE = re.compile(r"^[A-Z0-9.]{1,6}\d{6}[CP]\d{8}$")
+
+
+@dataclass(frozen=True)
+class ConvergenceResult:
+    """Driver-facing result for one durable bot-owned EXIT projection.
+
+    The disposition is intentionally more precise than a boolean.  Callers
+    must be able to distinguish a committed quantity delta from an idempotent
+    replay and from a fail-closed hold that remains available for recovery.
+    """
+
+    disposition: str
+    applied_delta_qty: int = 0
+    applied_delta_notional: float = 0.0
+    remaining_qty: Optional[int] = None
+    terminal: bool = False
+    position_id: str = ""
+    broker_order_id: str = ""
+    cumulative_applied_qty: int = 0
+    cumulative_applied_notional: float = 0.0
+    exit_price: Optional[float] = None
+    applied_delta_price: Optional[float] = None
+    realized_pnl: Optional[float] = None
+    realized_pnl_pct: Optional[float] = None
+    reason: str = ""
+    proof_pending: bool = False
+
+    @property
+    def applied(self) -> bool:
+        return self.disposition in {"APPLIED_PARTIAL", "APPLIED_FULL"}
+
+
+_PROJECTION_WATERMARK_KEY = "position_projection_v1"
+_VALID_EXECUTION_MODES = {"live", "paper"}
+_DECIMAL_EPSILON = Decimal("0.000001")
+_PLACEHOLDER_BROKER_IDS = {
+    "",
+    "0",
+    "-",
+    "none",
+    "null",
+    "unknown",
+    "n/a",
+    "na",
+}
+
+
+def _convergence_hold(disposition: str, reason: str = "", **kwargs) -> ConvergenceResult:
+    return ConvergenceResult(disposition=disposition, reason=reason, **kwargs)
+
+
+def _resolve_entry_cost_basis(
+    c,
+    *,
+    position_id: str,
+    client_id: str,
+    execution_mode: str,
+    occ_contract: str,
+    exit_filled_ts,
+) -> Optional[Decimal]:
+    """Read-only helper: resolve entry fill price from exactly one durable ENTRY order.
+
+    Resolves cost basis for broker-repair canonical positions where avg_fill /
+    entry_price are NULL.  Fail-closed on every edge case; zero mutation.
+
+    Requirements for a valid candidate:
+      * kind='ENTRY', status='FILLED'
+      * client_id, position_id, execution_mode, and OCC contract must match exactly
+      * the selected ENTRY contract normalizes to the EXIT/position OCC
+      * positive integer filled_qty > 0
+      * positive finite fill_price > 0
+      * broker_order_id passes the shared placeholder validator
+      * ENTRY filled_ts passes the strict timezone-aware parser
+      * ENTRY filled_ts is no later than the exact EXIT filled_ts
+
+    Returns:
+      Decimal fill price on unique, fully-proven candidate.
+      None on missing, ambiguous, malformed, or identity-mismatched evidence.
+    """
+    try:
+        c.execute(
+            """
+            SELECT contract, fill_price, filled_qty, broker_order_id, filled_ts, execution_mode
+            FROM orders
+            WHERE position_id = %s
+              AND client_id   = %s
+              AND kind        = 'ENTRY'
+              AND status      = 'FILLED'
+              AND COALESCE(filled_qty, 0) > 0
+              AND fill_price IS NOT NULL
+              AND fill_price > 0
+            LIMIT 3
+            """,
+            (position_id, client_id),
+        )
+        rows = c.fetchall() or []
+    except Exception as exc:
+        log.error(
+            "[%s] _resolve_entry_cost_basis: query failed pos=%s: %s",
+            client_id, position_id, exc,
+        )
+        return None
+
+    # Exactly one candidate required
+    if len(rows) == 0:
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: no FILLED ENTRY order found pos=%s",
+            client_id, position_id,
+        )
+        return None
+    if len(rows) > 1:
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: ambiguous ENTRY orders pos=%s count=%d",
+            client_id, position_id, len(rows),
+        )
+        return None
+
+    row = dict(rows[0])
+
+    # Validate both OCC authorities after normalization.  The query must
+    # return the contract so a wrong or missing ENTRY contract cannot hide
+    # behind a cost-basis match on position_id/client_id alone.
+    expected_contract = _normalize_proof_contract(occ_contract)
+    entry_contract = _normalize_proof_contract(row.get("contract"))
+    if (
+        not _OCC_CONTRACT_RE.fullmatch(expected_contract)
+        or not _OCC_CONTRACT_RE.fullmatch(entry_contract)
+        or entry_contract != expected_contract
+    ):
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: ENTRY OCC mismatch pos=%s expected=%s got=%s",
+            client_id, position_id, expected_contract, entry_contract,
+        )
+        return None
+
+    # Validate execution mode
+    row_mode = str(row.get("execution_mode") or "").strip().lower()
+    if row_mode not in _VALID_EXECUTION_MODES or row_mode != execution_mode:
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: mode mismatch pos=%s expected=%s got=%s",
+            client_id, position_id, execution_mode, row_mode,
+        )
+        return None
+
+    # Validate broker identity through the shared fail-closed validator.
+    broker_id = row.get("broker_order_id")
+    if _is_placeholder_broker_id(broker_id):
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: blank/placeholder broker_order_id pos=%s",
+            client_id, position_id,
+        )
+        return None
+
+    # Both timestamps must be explicit broker execution timestamps.  The
+    # shared parser rejects missing, malformed, naive, and otherwise
+    # non-authoritative values; no local fallback or fabrication is allowed.
+    entry_dt = parse_broker_fill_timestamp(row.get("filled_ts"))
+    exit_dt = parse_broker_fill_timestamp(exit_filled_ts)
+    if entry_dt is None:
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: invalid ENTRY filled_ts pos=%s",
+            client_id, position_id,
+        )
+        return None
+    if exit_dt is None:
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: invalid EXIT filled_ts pos=%s",
+            client_id, position_id,
+        )
+        return None
+    if entry_dt > exit_dt:
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: ENTRY filled_ts after EXIT pos=%s",
+            client_id, position_id,
+        )
+        return None
+
+    # Validate fill economics
+    try:
+        price = Decimal(str(row["fill_price"]))
+    except (InvalidOperation, TypeError, ValueError):
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: malformed fill_price=%r pos=%s",
+            client_id, row.get("fill_price"), position_id,
+        )
+        return None
+    if not price.is_finite() or price <= 0:
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: invalid fill_price=%s pos=%s",
+            client_id, price, position_id,
+        )
+        return None
+
+    qty = _strict_integral(row.get("filled_qty"), positive=True)
+    if qty is None:
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: zero/negative filled_qty=%r pos=%s",
+            client_id, row.get("filled_qty"), position_id,
+        )
+        return None
+
+    log.info(
+        "[%s] _resolve_entry_cost_basis: resolved entry price=%s qty=%d "
+        "from ENTRY order pos=%s",
+        client_id, price, qty, position_id,
+    )
+    return price
+
+
+def _strict_decimal(value, *, positive: bool = False, nonnegative: bool = False) -> Optional[Decimal]:
+    """Parse a finite numeric value without accepting booleans or junk text."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = Decimal(str(value).strip())
+    except (InvalidOperation, AttributeError, TypeError, ValueError):
+        return None
+    if not parsed.is_finite():
+        return None
+    if positive and parsed <= 0:
+        return None
+    if nonnegative and parsed < 0:
+        return None
+    return parsed
+
+
+def _strict_integral(value, *, positive: bool = False, nonnegative: bool = False) -> Optional[int]:
+    parsed = _strict_decimal(value, nonnegative=nonnegative)
+    if parsed is None or parsed != parsed.to_integral_value():
+        return None
+    result = int(parsed)
+    if positive and result <= 0:
+        return None
+    if nonnegative and result < 0:
+        return None
+    return result
+
+
+def _exact_aware_timestamp(value) -> tuple[Optional[datetime], Optional[str]]:
+    """Return a UTC-normalized timestamp only when broker chronology is proven."""
+    if value is None or value == "":
+        return None, None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None, None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None, None
+    else:
+        return None, None
+    try:
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None, None
+        normalized = parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None, None
+    return normalized, normalized.isoformat()
+
+
+def _projection_meta(raw_meta) -> tuple[Optional[dict], str]:
+    """Decode orders.meta, preserving a distinction between missing and malformed."""
+    if raw_meta is None:
+        return {}, "missing"
+    if isinstance(raw_meta, dict):
+        return dict(raw_meta), "ok"
+    if isinstance(raw_meta, str):
+        try:
+            parsed = json.loads(raw_meta)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None, "malformed"
+        return (dict(parsed), "ok") if isinstance(parsed, dict) else (None, "malformed")
+    return None, "malformed"
+
+
+def _is_placeholder_broker_id(value) -> bool:
+    if isinstance(value, bool):
+        return True
+    text = str(value or "").strip()
+    return not text or text.lower() in _PLACEHOLDER_BROKER_IDS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -667,6 +954,818 @@ class APPositionManager:
         """Force column-cache refresh after running migrations in a live process."""
         self._position_columns_cache = None
         self._position_columns()
+
+    # ── PR #579: shared fail-closed entry cost-basis resolver ─────────────────
+
+    def _resolve_entry_cost_basis(
+        self,
+        c,
+        *,
+        position_id: str,
+        execution_mode: str,
+        occ_contract: str,
+        exit_filled_ts=None,
+    ) -> Optional[Decimal]:
+        """Resolve entry fill price from exactly one durable ENTRY order.
+
+        Called only when the canonical position lacks avg_fill / entry_price
+        (broker-repair shape).  Returns None (HOLD) on any ambiguity,
+        malformation, or identity mismatch.  Never uses EXIT fill price or
+        fabricated timestamps as entry cost basis.
+
+        Caller is responsible for all position/watermark mutation; this method
+        is read-only and performs zero writes.
+        """
+        return _resolve_entry_cost_basis(
+            c,
+            position_id=position_id,
+            client_id=self.client_id,
+            execution_mode=execution_mode,
+            occ_contract=occ_contract,
+            exit_filled_ts=exit_filled_ts,
+        )
+
+    def converge_position_from_durable_exit_order(
+        self,
+        *,
+        exit_local_order_id: str,
+        expected_execution_mode: str,
+    ) -> ConvergenceResult:
+        """Project one exact bot-owned EXIT order into its canonical position.
+
+        ``orders.filled_qty`` is a cumulative broker quantity and the
+        versioned watermark lives on that exact order.  The order is locked
+        first and the position second; the position update and watermark write
+        therefore commit (or roll back) together.  This method deliberately
+        does not accept caller-supplied fill economics so OSM and restart
+        recovery cannot develop separate arithmetic authorities.
+        """
+        local_order_id = str(exit_local_order_id or "").strip()
+        expected_mode = str(expected_execution_mode or "").strip().lower()
+        if not local_order_id:
+            return _convergence_hold("HOLD_IDENTITY", "missing_exit_local_order_id")
+        if expected_mode not in _VALID_EXECUTION_MODES:
+            return _convergence_hold(
+                "HOLD_IDENTITY", "missing_or_invalid_expected_execution_mode"
+            )
+
+        def _table_columns(c, table_name: str) -> set[str]:
+            # Resolve the relation through the active search_path.  This is
+            # important for legacy deployments and for session-scoped/temp
+            # tables: information_schema can report a different same-named
+            # relation than the one the UPDATE will actually target.
+            c.execute(
+                """
+                SELECT attname AS column_name
+                FROM pg_attribute
+                WHERE attrelid = to_regclass(%s)
+                  AND attnum > 0
+                  AND NOT attisdropped
+                """,
+                (table_name,),
+            )
+            return {str(row.get("column_name")) for row in (c.fetchall() or [])}
+
+        def _field_text(row: dict, key: str) -> str:
+            return str(row.get(key) or "").strip()
+
+        def _meta_mode(meta: dict) -> tuple[Optional[str], str]:
+            if "execution_mode" not in meta or meta.get("execution_mode") in (None, ""):
+                return None, ""
+            raw = str(meta.get("execution_mode") or "").strip().lower()
+            if raw not in _VALID_EXECUTION_MODES:
+                return None, "invalid_meta_execution_mode"
+            return raw, ""
+
+        def _fn() -> ConvergenceResult:
+            with conn() as c:
+                # Lock order is intentional and must remain order -> position.
+                c.execute(
+                    """
+                    SELECT *
+                    FROM orders
+                    WHERE local_order_id=%s AND client_id=%s
+                    FOR UPDATE
+                    """,
+                    (local_order_id, self.client_id),
+                )
+                order_row = c.fetchone()
+                if not order_row:
+                    return _convergence_hold(
+                        "HOLD_IDENTITY", "exit_order_not_found"
+                    )
+                order = dict(order_row)
+
+                if _field_text(order, "local_order_id") != local_order_id:
+                    return _convergence_hold(
+                        "HOLD_IDENTITY", "exit_local_order_id_disagrees"
+                    )
+                if _field_text(order, "client_id") != self.client_id:
+                    return _convergence_hold("HOLD_IDENTITY", "client_id_disagrees")
+
+                order_kind = _field_text(order, "kind").upper()
+                order_status = _field_text(order, "status").upper()
+                if order_kind != "EXIT":
+                    return _convergence_hold(
+                        "HOLD_IDENTITY", f"wrong_order_kind:{order_kind or 'missing'}"
+                    )
+                if order_status not in {"EXIT_PARTIAL_FILL", "EXIT_FILLED"}:
+                    return _convergence_hold(
+                        "HOLD_STATE", f"non_fill_order_status:{order_status or 'missing'}"
+                    )
+
+                order_mode = _field_text(order, "execution_mode").lower()
+                if order_mode not in _VALID_EXECUTION_MODES:
+                    return _convergence_hold(
+                        "HOLD_IDENTITY", "missing_or_invalid_order_execution_mode"
+                    )
+                if order_mode != expected_mode:
+                    return _convergence_hold(
+                        "HOLD_IDENTITY", "order_execution_mode_mismatch"
+                    )
+
+                meta, _meta_state = _projection_meta(order.get("meta"))
+                if meta is None:
+                    return _convergence_hold("HOLD_WATERMARK", "malformed_order_meta")
+                meta_mode, meta_mode_error = _meta_mode(meta)
+                if meta_mode_error:
+                    return _convergence_hold("HOLD_IDENTITY", meta_mode_error)
+                if meta_mode is not None and meta_mode != order_mode:
+                    return _convergence_hold(
+                        "HOLD_IDENTITY", "order_column_meta_mode_mismatch"
+                    )
+                if _field_text(order, "local_order_id").lower().startswith("external-exit:"):
+                    return _convergence_hold("HOLD_IDENTITY", "external_exit_order")
+                external_marker = meta.get("external_broker_order")
+                if str(external_marker or "").strip().lower() == "true":
+                    return _convergence_hold("HOLD_IDENTITY", "external_broker_exit_order")
+
+                position_id = _field_text(order, "position_id")
+                if not position_id:
+                    return _convergence_hold("HOLD_IDENTITY", "missing_order_position_id")
+
+                order_contract = _normalize_proof_contract(order.get("contract"))
+                if not _OCC_CONTRACT_RE.fullmatch(order_contract):
+                    return _convergence_hold("HOLD_IDENTITY", "invalid_order_occ_contract")
+                broker_order_id = _field_text(order, "broker_order_id")
+                if _is_placeholder_broker_id(broker_order_id):
+                    return _convergence_hold("HOLD_IDENTITY", "missing_or_placeholder_broker_order_id")
+
+                requested_qty = _strict_integral(order.get("qty"), positive=True)
+                cumulative_qty = _strict_integral(order.get("filled_qty"), positive=True)
+                if requested_qty is None:
+                    return _convergence_hold("HOLD_ECONOMICS", "invalid_order_quantity")
+                if cumulative_qty is None:
+                    return _convergence_hold("HOLD_ECONOMICS", "invalid_cumulative_filled_quantity")
+                if cumulative_qty > requested_qty:
+                    return _convergence_hold("HOLD_WATERMARK", "cumulative_fill_exceeds_order_quantity")
+                fill_price = _strict_decimal(order.get("fill_price"), positive=True)
+                if fill_price is None:
+                    return _convergence_hold("HOLD_ECONOMICS", "invalid_order_fill_price")
+                fill_dt, fill_ts = _exact_aware_timestamp(order.get("filled_ts"))
+                if fill_dt is None or fill_ts is None:
+                    return _convergence_hold("HOLD_TIMESTAMP", "missing_or_invalid_exact_fill_timestamp")
+
+                watermark_present = _PROJECTION_WATERMARK_KEY in meta
+                previous_qty = 0
+                previous_notional = Decimal("0")
+                previous_fill_dt = None
+                if watermark_present:
+                    watermark = meta.get(_PROJECTION_WATERMARK_KEY)
+                    if not isinstance(watermark, dict):
+                        return _convergence_hold("HOLD_WATERMARK", "malformed_projection_watermark")
+                    required_watermark_fields = {
+                        "position_id",
+                        "client_id",
+                        "execution_mode",
+                        "contract",
+                        "broker_order_id",
+                        "applied_cumulative_qty",
+                        "applied_cumulative_notional",
+                        "last_applied_filled_ts",
+                    }
+                    if not required_watermark_fields.issubset(watermark):
+                        return _convergence_hold("HOLD_WATERMARK", "incomplete_projection_watermark")
+                    if str(watermark.get("position_id") or "").strip() != position_id:
+                        return _convergence_hold("HOLD_WATERMARK", "watermark_position_id_mismatch")
+                    if str(watermark.get("client_id") or "").strip() != self.client_id:
+                        return _convergence_hold("HOLD_WATERMARK", "watermark_client_id_mismatch")
+                    if str(watermark.get("execution_mode") or "").strip().lower() != order_mode:
+                        return _convergence_hold("HOLD_WATERMARK", "watermark_execution_mode_mismatch")
+                    if _normalize_proof_contract(watermark.get("contract")) != order_contract:
+                        return _convergence_hold("HOLD_WATERMARK", "watermark_contract_mismatch")
+                    if str(watermark.get("broker_order_id") or "").strip() != broker_order_id:
+                        return _convergence_hold("HOLD_WATERMARK", "watermark_broker_order_id_mismatch")
+                    previous_qty = _strict_integral(
+                        watermark.get("applied_cumulative_qty"), nonnegative=True
+                    )
+                    previous_notional = _strict_decimal(
+                        watermark.get("applied_cumulative_notional"), nonnegative=True
+                    )
+                    if previous_qty is None or previous_notional is None:
+                        return _convergence_hold("HOLD_WATERMARK", "invalid_projection_watermark_numbers")
+                    if (previous_qty == 0 and previous_notional != 0) or (
+                        previous_qty > 0 and previous_notional <= 0
+                    ):
+                        return _convergence_hold("HOLD_WATERMARK", "projection_watermark_qty_notional_mismatch")
+                    previous_fill_dt, _ = _exact_aware_timestamp(
+                        watermark.get("last_applied_filled_ts")
+                    )
+                    if previous_qty > 0 and previous_fill_dt is None:
+                        return _convergence_hold("HOLD_WATERMARK", "invalid_projection_watermark_timestamp")
+                    if previous_qty > cumulative_qty:
+                        return _convergence_hold("HOLD_WATERMARK", "watermark_qty_exceeds_cumulative_fill")
+
+                current_notional = Decimal(cumulative_qty) * fill_price
+                if previous_notional > current_notional:
+                    return _convergence_hold("HOLD_WATERMARK", "watermark_notional_exceeds_cumulative_fill")
+                if previous_qty == cumulative_qty:
+                    if abs(current_notional - previous_notional) > _DECIMAL_EPSILON:
+                        return _convergence_hold("HOLD_ECONOMICS", "same_qty_changed_cumulative_notional")
+                if previous_fill_dt is not None and fill_dt < previous_fill_dt:
+                    return _convergence_hold("HOLD_TIMESTAMP", "fill_timestamp_regressed")
+
+                # The exact position_id is the only position lookup authority.
+                c.execute(
+                    """
+                    SELECT *
+                    FROM positions
+                    WHERE id=%s AND client_id=%s
+                    FOR UPDATE
+                    """,
+                    (position_id, self.client_id),
+                )
+                position_row = c.fetchone()
+                if not position_row:
+                    return _convergence_hold(
+                        "HOLD_IDENTITY", "canonical_position_not_found", position_id=position_id
+                    )
+                position = dict(position_row)
+                if _field_text(position, "id") != position_id:
+                    return _convergence_hold("HOLD_IDENTITY", "position_id_disagrees", position_id=position_id)
+                if _field_text(position, "client_id") != self.client_id:
+                    return _convergence_hold("HOLD_IDENTITY", "position_client_id_disagrees", position_id=position_id)
+                position_mode = _field_text(position, "execution_mode").lower()
+                if position_mode not in _VALID_EXECUTION_MODES or position_mode != order_mode:
+                    return _convergence_hold("HOLD_IDENTITY", "position_execution_mode_mismatch", position_id=position_id)
+                position_contract = _normalize_proof_contract(position.get("contract"))
+                if not _OCC_CONTRACT_RE.fullmatch(position_contract):
+                    return _convergence_hold("HOLD_IDENTITY", "invalid_position_occ_contract", position_id=position_id)
+                if position_contract != order_contract:
+                    return _convergence_hold("HOLD_IDENTITY", "position_order_contract_mismatch", position_id=position_id)
+
+                # Preserve the identity dimensions that exist in the deployed
+                # row shape.  Missing optional metadata remains legacy-compatible,
+                # but conflicting authorities are never allowed to project money.
+                for identity_key in ("signal_id", "canonical_signal_id"):
+                    order_identity = _field_text(order, identity_key)
+                    position_identity = _field_text(position, identity_key)
+                    if order_identity and position_identity and order_identity != position_identity:
+                        return _convergence_hold(
+                            "HOLD_IDENTITY",
+                            f"{identity_key}_mismatch",
+                            position_id=position_id,
+                        )
+
+                order_generation_raw = meta.get("materialization_generation")
+                if order_generation_raw is not None:
+                    order_generation = _strict_integral(order_generation_raw, positive=True)
+                    if order_generation is None:
+                        return _convergence_hold(
+                            "HOLD_IDENTITY",
+                            "invalid_materialization_generation",
+                            position_id=position_id,
+                        )
+                    position_generation_raw = position.get("materialization_generation")
+                    if position_generation_raw is None:
+                        position_meta, _ = _projection_meta(position.get("meta"))
+                        if position_meta:
+                            position_generation_raw = position_meta.get("materialization_generation")
+                    if position_generation_raw is not None:
+                        position_generation = _strict_integral(
+                            position_generation_raw,
+                            positive=True,
+                        )
+                        if position_generation is None:
+                            return _convergence_hold(
+                                "HOLD_IDENTITY",
+                                "invalid_position_materialization_generation",
+                                position_id=position_id,
+                            )
+                        if position_generation != order_generation:
+                            return _convergence_hold(
+                                "HOLD_IDENTITY",
+                                "materialization_generation_mismatch",
+                                position_id=position_id,
+                            )
+
+                position_qty = _strict_integral(position.get("qty"), positive=True)
+                avg_fill = _strict_decimal(
+                    position.get("avg_fill") if position.get("avg_fill") is not None
+                    else position.get("entry_price"),
+                    positive=True,
+                )
+                if position_qty is None or avg_fill is None:
+                    # PR #579: broker-repair positions may lack a persisted
+                    # avg_fill / entry_price because the original ENTRY fill
+                    # was not captured when the repair position was created.
+                    # Resolve cost basis from the ONE exact durable ENTRY order.
+                    # Any ambiguity, malformation, or identity mismatch HOLDs —
+                    # never fabricate entry economics.
+                    avg_fill = self._resolve_entry_cost_basis(
+                        c,
+                        position_id=position_id,
+                        execution_mode=order_mode,
+                        occ_contract=order_contract,
+                        exit_filled_ts=fill_dt,
+                    )
+                    if avg_fill is None or position_qty is None:
+                        return _convergence_hold(
+                            "HOLD_ECONOMICS",
+                            "invalid_position_cost_basis",
+                            position_id=position_id,
+                        )
+                if requested_qty > position_qty:
+                    return _convergence_hold(
+                        "HOLD_STATE", "order_quantity_exceeds_position_quantity", position_id=position_id
+                    )
+
+                raw_remaining = position.get("quantity_remaining")
+                if raw_remaining is None:
+                    if watermark_present:
+                        return _convergence_hold(
+                            "HOLD_WATERMARK", "legacy_null_remaining_with_projection_watermark", position_id=position_id
+                        )
+                    remaining_qty = position_qty
+                else:
+                    remaining_qty = _strict_integral(raw_remaining, nonnegative=True)
+                    if remaining_qty is None or remaining_qty > position_qty:
+                        return _convergence_hold("HOLD_STATE", "invalid_position_remaining_quantity", position_id=position_id)
+
+                position_status = _field_text(position, "status").upper()
+                if position_status not in PositionStatus.TERMINAL | PositionStatus.ACTIVE:
+                    return _convergence_hold(
+                        "HOLD_STATE", "invalid_position_status", position_id=position_id
+                    )
+
+                entry_timestamp_raw = (
+                    position.get("entry_ts")
+                    or position.get("opened_at")
+                    or position.get("created_at")
+                )
+                if entry_timestamp_raw not in (None, ""):
+                    entry_dt, _entry_ts = _exact_aware_timestamp(entry_timestamp_raw)
+                    if entry_dt is None:
+                        return _convergence_hold(
+                            "HOLD_TIMESTAMP",
+                            "invalid_position_entry_timestamp",
+                            position_id=position_id,
+                        )
+                    if fill_dt < entry_dt:
+                        return _convergence_hold(
+                            "HOLD_TIMESTAMP",
+                            "exit_timestamp_before_entry",
+                            position_id=position_id,
+                        )
+
+                pending_exit_local_id = _field_text(
+                    position, "pending_exit_local_order_id"
+                )
+                pending_exit_broker_id = _field_text(
+                    position, "pending_exit_broker_order_id"
+                )
+                # PR #579 amendment (2026-09-06): pending-exit identity
+                # is a position-mutation authority fence and requires
+                # INDEPENDENT agreement on BOTH sides. The prior AND-
+                # combined form let split-identity conflicts through
+                # whenever ONE of the two identifiers matched — that is,
+                #
+                #   local matches, broker conflicts  → PASSED
+                #   broker matches, local conflicts  → PASSED
+                #
+                # Either shape is enough to route a durable exit onto
+                # the wrong position. A non-blank durable identity that
+                # disagrees on EITHER side is now an authoritative HOLD.
+                # Blank durable identity (no prior owner recorded) still
+                # allows convergence — the first exit against a
+                # position has no owner to conflict with.
+                if pending_exit_local_id and pending_exit_local_id != local_order_id:
+                    return _convergence_hold(
+                        "HOLD_IDENTITY",
+                        "pending_exit_local_owner_mismatch",
+                        position_id=position_id,
+                    )
+                if pending_exit_broker_id and pending_exit_broker_id != broker_order_id:
+                    return _convergence_hold(
+                        "HOLD_IDENTITY",
+                        "pending_exit_broker_owner_mismatch",
+                        position_id=position_id,
+                    )
+
+                position_terminal = position_status in PositionStatus.TERMINAL
+                if position_terminal and remaining_qty > 0:
+                    return _convergence_hold("HOLD_STATE", "terminal_position_has_remaining_quantity", position_id=position_id)
+                if not position_terminal and remaining_qty == 0:
+                    return _convergence_hold("HOLD_STATE", "nonterminal_position_has_zero_remaining", position_id=position_id)
+                if not watermark_present and remaining_qty < position_qty:
+                    return _convergence_hold(
+                        "HOLD_WATERMARK", "legacy_partial_position_without_projection_watermark", position_id=position_id
+                    )
+                if position_terminal and remaining_qty == 0 and not watermark_present:
+                    return _convergence_hold(
+                        "HOLD_WATERMARK", "terminal_position_without_projection_watermark", position_id=position_id
+                    )
+                if watermark_present:
+                    expected_remaining = position_qty - previous_qty
+                    if remaining_qty != expected_remaining:
+                        return _convergence_hold(
+                            "HOLD_STATE",
+                            "position_remaining_disagrees_with_projection_watermark",
+                            position_id=position_id,
+                        )
+
+                prior_closed_qty = position_qty - remaining_qty
+                prior_exit_price = Decimal("0")
+                if prior_closed_qty > 0:
+                    prior_exit_price = _strict_decimal(
+                        position.get("exit_price"), positive=True
+                    )
+                    if prior_exit_price is None:
+                        return _convergence_hold(
+                            "HOLD_ECONOMICS",
+                            "missing_prior_cumulative_exit_price",
+                            position_id=position_id,
+                        )
+
+                delta_qty = cumulative_qty - previous_qty
+                delta_notional = current_notional - previous_notional
+                if delta_qty < 0:
+                    return _convergence_hold("HOLD_WATERMARK", "cumulative_fill_regression", position_id=position_id)
+                if delta_qty == 0:
+                    persisted_exit_price = _strict_decimal(
+                        position.get("exit_price"), positive=True
+                    )
+                    persisted_realized_pnl = _strict_decimal(position.get("realized_pnl"))
+                    persisted_realized_pnl_pct = _strict_decimal(
+                        position.get("realized_pnl_pct")
+                    )
+                    return ConvergenceResult(
+                        disposition="ALREADY_APPLIED",
+                        remaining_qty=remaining_qty,
+                        terminal=position_terminal and remaining_qty == 0,
+                        position_id=position_id,
+                        broker_order_id=broker_order_id,
+                        cumulative_applied_qty=previous_qty,
+                        cumulative_applied_notional=float(previous_notional),
+                        exit_price=(float(persisted_exit_price) if persisted_exit_price is not None else None),
+                        realized_pnl=(
+                            float(persisted_realized_pnl)
+                            if persisted_realized_pnl is not None
+                            else None
+                        ),
+                        realized_pnl_pct=(
+                            float(persisted_realized_pnl_pct)
+                            if persisted_realized_pnl_pct is not None
+                            else None
+                        ),
+                    )
+                if delta_qty > remaining_qty:
+                    return _convergence_hold(
+                        "HOLD_STATE", "cumulative_fill_exceeds_position_remaining", position_id=position_id
+                    )
+                if delta_notional <= 0:
+                    return _convergence_hold("HOLD_ECONOMICS", "nonpositive_delta_fill_notional", position_id=position_id)
+                delta_fill_price = delta_notional / Decimal(delta_qty)
+                if not delta_fill_price.is_finite() or delta_fill_price <= 0:
+                    return _convergence_hold("HOLD_ECONOMICS", "invalid_delta_fill_price", position_id=position_id)
+
+                cumulative_applied_qty = previous_qty + delta_qty
+                if cumulative_applied_qty > position_qty:
+                    return _convergence_hold("HOLD_WATERMARK", "cumulative_projection_exceeds_position_qty", position_id=position_id)
+                if previous_qty == 0 and not watermark_present and prior_closed_qty == 0:
+                    # A full remaining position with no projection watermark
+                    # is the known legacy blind spot: persisted nullable exit
+                    # economics are not prior durable truth.
+                    prior_realized_pnl = Decimal("0")
+                else:
+                    prior_realized_pnl = _strict_decimal(position.get("realized_pnl"))
+                    if prior_realized_pnl is None:
+                        return _convergence_hold("HOLD_ECONOMICS", "missing_prior_cumulative_realized_pnl", position_id=position_id)
+
+                delta_realized_pnl = (delta_fill_price - avg_fill) * Decimal(delta_qty) * Decimal("100")
+                realized_pnl = (prior_realized_pnl + delta_realized_pnl).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+                new_closed_qty = prior_closed_qty + delta_qty
+                weighted_exit_price = (
+                    (prior_exit_price * Decimal(prior_closed_qty)) + delta_notional
+                ) / Decimal(new_closed_qty)
+                pnl_denominator = avg_fill * Decimal(new_closed_qty) * Decimal("100")
+                realized_pnl_pct = (
+                    (realized_pnl / pnl_denominator) * Decimal("100")
+                ).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+                new_remaining = remaining_qty - delta_qty
+                new_terminal = new_remaining == 0
+                new_status = PositionStatus.CLOSED if new_terminal else PositionStatus.CLOSING
+                position_columns = _table_columns(c, "positions")
+                order_columns = _table_columns(c, "orders")
+                required_position_columns = {
+                    "id",
+                    "client_id",
+                    "execution_mode",
+                    "contract",
+                    "status",
+                    "qty",
+                    "avg_fill",
+                    "quantity_remaining",
+                    "exit_price",
+                    "realized_pnl",
+                    "realized_pnl_pct",
+                    "exit_ts",
+                }
+                missing_position_columns = required_position_columns - position_columns
+                if missing_position_columns or "meta" not in order_columns:
+                    return _convergence_hold(
+                        "DB_ERROR",
+                        "projection_schema_missing:" + ",".join(sorted(missing_position_columns or {"orders.meta"})),
+                        position_id=position_id,
+                    )
+
+                position_sets = [
+                    "status=%s",
+                    "quantity_remaining=%s",
+                    "exit_price=%s",
+                    "realized_pnl=%s",
+                    "realized_pnl_pct=%s",
+                    "exit_ts=%s",
+                ]
+                position_values = [
+                    new_status,
+                    new_remaining,
+                    float(weighted_exit_price),
+                    float(realized_pnl),
+                    float(realized_pnl_pct),
+                    fill_dt,
+                ]
+                current_order_remaining = requested_qty - cumulative_qty
+                partial_owner_active = (
+                    order_status == "EXIT_PARTIAL_FILL"
+                    and current_order_remaining > 0
+                )
+                ownership_updates = (
+                    {
+                        "exit_in_flight": True,
+                        "pending_exit_qty": current_order_remaining,
+                        "pending_exit_local_order_id": local_order_id,
+                        "pending_exit_broker_order_id": broker_order_id,
+                    }
+                    if partial_owner_active
+                    else {
+                        "exit_in_flight": False,
+                        "pending_exit_action": None,
+                        "pending_exit_reason": None,
+                        "pending_exit_qty": None,
+                        "pending_exit_local_order_id": None,
+                        "pending_exit_broker_order_id": None,
+                    }
+                )
+                optional_position_updates = {
+                    # This is the position-wide exited quantity.  The
+                    # watermark quantity is scoped to this exact EXIT order.
+                    "contracts_exited": position_qty - new_remaining,
+                    "exit_reason": "exit_filled",
+                    "close_source": "durable_exit_fill_convergence",
+                    "close_confidence": "HIGH",
+                    **ownership_updates,
+                }
+                for column, value in optional_position_updates.items():
+                    if column in position_columns:
+                        position_sets.append(f"{column}=%s")
+                        position_values.append(value)
+                if "broker_order_id" in position_columns:
+                    position_sets.append("broker_order_id=COALESCE(broker_order_id,%s)")
+                    position_values.append(broker_order_id)
+                if "updated_at" in position_columns:
+                    position_sets.append("updated_at=NOW()")
+                elif "updated_ts" in position_columns:
+                    position_sets.append("updated_ts=NOW()")
+                position_values.extend([
+                    position_id,
+                    self.client_id,
+                    order_mode,
+                    order_contract,
+                ])
+                c.execute(
+                    f"""
+                    UPDATE positions
+                    SET {', '.join(position_sets)}
+                    WHERE id=%s
+                      AND client_id=%s
+                      AND LOWER(TRIM(execution_mode))=%s
+                      AND UPPER(REPLACE(BTRIM(contract), ' ', ''))=%s
+                    RETURNING *
+                    """,
+                    tuple(position_values),
+                )
+                persisted_position_row = c.fetchone()
+                if not persisted_position_row:
+                    raise RuntimeError("projection_position_update_no_row")
+
+                new_watermark = {
+                    "position_id": position_id,
+                    "client_id": self.client_id,
+                    "execution_mode": order_mode,
+                    "contract": order_contract,
+                    "broker_order_id": broker_order_id,
+                    "applied_cumulative_qty": cumulative_applied_qty,
+                    "applied_cumulative_notional": float(previous_notional + delta_notional),
+                    "last_applied_filled_ts": fill_ts,
+                }
+                updated_meta = dict(meta)
+                updated_meta[_PROJECTION_WATERMARK_KEY] = new_watermark
+                order_sets = ["meta=%s::jsonb"]
+                order_values = [json.dumps(updated_meta, separators=(",", ":"), sort_keys=True)]
+                if "updated_ts" in order_columns:
+                    order_sets.append("updated_ts=NOW()")
+                elif "updated_at" in order_columns:
+                    order_sets.append("updated_at=NOW()")
+                order_values.extend([
+                    local_order_id,
+                    self.client_id,
+                    position_id,
+                    order_mode,
+                    order_contract,
+                ])
+                c.execute(
+                    f"""
+                    UPDATE orders
+                    SET {', '.join(order_sets)}
+                    WHERE local_order_id=%s
+                      AND client_id=%s
+                      AND position_id=%s
+                      AND kind='EXIT'
+                      AND status IN ('EXIT_PARTIAL_FILL', 'EXIT_FILLED')
+                      AND LOWER(TRIM(execution_mode))=%s
+                      AND UPPER(REPLACE(BTRIM(contract), ' ', ''))=%s
+                    RETURNING local_order_id
+                    """,
+                    tuple(order_values),
+                )
+                persisted_order_row = c.fetchone()
+                if not persisted_order_row:
+                    raise RuntimeError("projection_watermark_update_no_row")
+
+                return ConvergenceResult(
+                    disposition="APPLIED_FULL" if new_terminal else "APPLIED_PARTIAL",
+                    applied_delta_qty=delta_qty,
+                    applied_delta_notional=float(delta_notional),
+                    remaining_qty=new_remaining,
+                    terminal=new_terminal,
+                    position_id=position_id,
+                    broker_order_id=broker_order_id,
+                    cumulative_applied_qty=cumulative_applied_qty,
+                    cumulative_applied_notional=float(previous_notional + delta_notional),
+                    exit_price=float(weighted_exit_price),
+                    applied_delta_price=float(delta_fill_price),
+                    realized_pnl=float(realized_pnl),
+                    realized_pnl_pct=float(realized_pnl_pct),
+                )
+
+        try:
+            result = run_with_retry(_fn)
+        except Exception as exc:
+            log.error(
+                "[%s] durable EXIT position convergence failed | order=%s err=%s",
+                self.client_id,
+                local_order_id,
+                exc,
+                exc_info=True,
+            )
+            return _convergence_hold("DB_ERROR", f"{type(exc).__name__}:{exc}")
+
+        # Proof materialization belongs to the dedicated proof-recovery path
+        # (PR #581).  This seam may synchronize one already-bound proof row,
+        # but it must never create a missing proof row while projecting an
+        # EXIT fill.  A missing proof remains discoverable for #581.
+        if result.terminal and result.disposition in {"APPLIED_FULL", "ALREADY_APPLIED"}:
+            try:
+                proof_ok, proof_reason = self._synchronize_convergence_proof(
+                    result,
+                    expected_execution_mode=expected_mode,
+                )
+            except Exception as exc:
+                proof_ok, proof_reason = False, f"proof_sync_exception:{type(exc).__name__}"
+            if not proof_ok:
+                log.critical(
+                    "[%s] durable EXIT position committed but proof remains pending | "
+                    "order=%s pos=%s reason=%s",
+                    self.client_id,
+                    local_order_id,
+                    result.position_id,
+                    proof_reason,
+                )
+                return replace(result, proof_pending=True, reason=f"proof_pending:{proof_reason}")
+        return result
+
+    def _synchronize_convergence_proof(
+        self,
+        result: ConvergenceResult,
+        *,
+        expected_execution_mode: str,
+    ) -> tuple[bool, str]:
+        """Update one already-bound proof row from committed position truth."""
+        expected_mode = str(expected_execution_mode or "").strip().lower()
+        if result.position_id == "" or expected_mode not in _VALID_EXECUTION_MODES:
+            return False, "proof_sync_identity_invalid"
+        if (
+            result.cumulative_applied_qty <= 0
+            or result.exit_price is None
+            or result.realized_pnl is None
+            or result.realized_pnl_pct is None
+        ):
+            return False, "proof_sync_evidence_incomplete"
+
+        def _fn():
+            with conn() as c:
+                c.execute(
+                    """
+                    SELECT id
+                    FROM proof_trades
+                    WHERE client_email=%s AND position_id=%s
+                    ORDER BY id
+                    FOR UPDATE
+                    """,
+                    (self.client_id, result.position_id),
+                )
+                candidates = c.fetchall() or []
+                if len(candidates) != 1:
+                    return False, f"proof_row_cardinality:{len(candidates)}"
+
+                c.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name='proof_trades'
+                    """
+                )
+                proof_columns = {
+                    str(row.get("column_name")) for row in (c.fetchall() or [])
+                }
+                sets = []
+                values = []
+                if "exit_option_price" in proof_columns:
+                    sets.append("exit_option_price=%s")
+                    values.append(float(result.exit_price))
+                if "exit_fill_price" in proof_columns:
+                    sets.append("exit_fill_price=%s")
+                    values.append(float(result.exit_price))
+                if "option_pnl_pct" in proof_columns:
+                    sets.append("option_pnl_pct=%s")
+                    values.append(float(result.realized_pnl_pct))
+                if "win" in proof_columns:
+                    # The persisted position is authoritative; the proof
+                    # logger's historical breakeven rule is retained here.
+                    pnl = float(result.realized_pnl)
+                    pnl_pct = float(result.realized_pnl_pct)
+                    win = pnl_pct > 0
+                    if not win and abs(pnl) < float(os.getenv("BREAKEVEN_DOLLAR_THRESHOLD", "10")) \
+                            and abs(pnl_pct) < float(os.getenv("BREAKEVEN_PCT_THRESHOLD", "3.0")):
+                        win = True
+                    sets.append("win=%s")
+                    values.append(win)
+                if "broker_reconciled" in proof_columns:
+                    sets.append("broker_reconciled=%s")
+                    values.append(True)
+                if "exit_reason" in proof_columns:
+                    sets.append("exit_reason=CASE WHEN exit_reason IS NULL OR exit_reason='' THEN %s ELSE exit_reason END")
+                    values.append("exit_filled")
+                if not sets:
+                    return True, "proof_bound_no_sync_columns"
+
+                values.extend([candidates[0].get("id"), self.client_id])
+                c.execute(
+                    f"""
+                    UPDATE proof_trades
+                    SET {', '.join(sets)}
+                    WHERE id=%s AND client_email=%s
+                    RETURNING id
+                    """,
+                    tuple(values),
+                )
+                if not c.fetchone():
+                    raise RuntimeError("proof_sync_update_no_row")
+                return True, "proof_synchronized"
+
+        try:
+            return run_with_retry(_fn)
+        except Exception as exc:
+            log.error(
+                "[%s] durable EXIT proof synchronization failed | pos=%s err=%s",
+                self.client_id,
+                result.position_id,
+                exc,
+            )
+            return False, f"proof_sync_db_error:{type(exc).__name__}"
 
     def _proof_row_exists(self, *, position_id: str = "", local_order_id: str = "") -> Optional[bool]:
         state = self._proof_row_binding_state(position_id=position_id, local_order_id=local_order_id)

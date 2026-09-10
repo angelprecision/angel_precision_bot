@@ -481,6 +481,33 @@ class APOrderStateMachine:
                 return pos
         return None
 
+    def _converge_durable_exit_order(self, local_order_id: str):
+        """Run the single durable EXIT -> position projection authority."""
+        from ap.position_manager import APPositionManager, ConvergenceResult
+
+        local_id = str(local_order_id or "").strip()
+        if not local_id:
+            return ConvergenceResult("HOLD_IDENTITY", reason="missing_exit_local_order_id")
+        try:
+            order = self._get_order(local_id)
+            if not order:
+                return ConvergenceResult("HOLD_IDENTITY", reason="exit_order_not_found")
+            expected_mode = str(order.get("execution_mode") or "").strip().lower()
+            if expected_mode not in {"live", "paper"}:
+                return ConvergenceResult(
+                    "HOLD_IDENTITY", reason="missing_or_invalid_order_execution_mode"
+                )
+            return APPositionManager(self.client_id).converge_position_from_durable_exit_order(
+                exit_local_order_id=local_id,
+                expected_execution_mode=expected_mode,
+            )
+        except Exception as exc:
+            log.error(
+                "[%s] durable EXIT convergence invocation failed | order=%s err=%s",
+                self.client_id, local_id, exc, exc_info=True,
+            )
+            return ConvergenceResult("DB_ERROR", reason=f"{type(exc).__name__}:{exc}")
+
     # ------------------------------------------------------------------
     # Observability
     # ------------------------------------------------------------------
@@ -1163,8 +1190,14 @@ class APOrderStateMachine:
             updates.append("submitted_ts=%s"); params.append(submitted_ts)
         if position_id:
             updates.append("position_id=%s"); params.append(position_id)
-        if new_status in (OrderStatus.FILLED, OrderStatus.EXIT_FILLED):
+        if new_status == OrderStatus.FILLED:
+            # ENTRY retains its historical local fallback semantics.  EXIT
+            # chronology is broker authority: a missing callback timestamp
+            # must remain NULL so the durable position converger can HOLD
+            # instead of turning processing time into execution time.
             updates.append("filled_ts=%s"); params.append(filled_ts or now_utc_iso())
+        elif new_status in (OrderStatus.EXIT_PARTIAL_FILL, OrderStatus.EXIT_FILLED) and filled_ts:
+            updates.append("filled_ts=%s"); params.append(filled_ts)
         if kind.upper() == "ENTRY" and OrderStatus.is_terminal(new_status):
             updates.append(
                 "meta=COALESCE(meta, '{}'::jsonb) "
@@ -1339,12 +1372,37 @@ class APOrderStateMachine:
                 "[%s] opportunity ledger notify failed (non-fatal): %s",
                 self.client_id, _ledger_exc,
             )
-        self._handle_exit_engine_hooks(
+        exit_hook_result = self._handle_exit_engine_hooks(
             current=current, new_status=new_status, position_id=position_id,
             filled_qty=filled_qty, fill_price=fill_price,
             broker_order_id=broker_order_id or current.get("broker_order_id"),
             local_order_id=local_order_id,
         )
+        if (
+            kind.upper() == "EXIT"
+            and new_status in (
+                OrderStatus.EXIT_PARTIAL_FILL,
+                OrderStatus.EXIT_FILLED,
+            )
+            and exit_hook_result is False
+        ):
+            self._emit_transition_event(
+                local_order_id=local_order_id,
+                old_status=old_status,
+                new_status=new_status,
+                order=current,
+                decision="HOLD",
+                reason_code="EXIT_CONVERGENCE_HOLD",
+                explanation=(
+                    "Durable EXIT fill was persisted but canonical position "
+                    "convergence did not prove exact fill authority."
+                ),
+                broker_order_id=broker_order_id,
+                filled_qty=filled_qty,
+                fill_price=fill_price,
+                last_error=last_error,
+            )
+            return False
         return True
 
     def adopt_broker_owned_exit_request(
@@ -1866,7 +1924,7 @@ class APOrderStateMachine:
         fill_price=None,
         broker_order_id=None,
         local_order_id=None,
-    ) -> None:
+    ) -> bool | None:
         if new_status not in (
             OrderStatus.EXIT_SUBMITTED, OrderStatus.EXIT_FILLED,
             OrderStatus.EXIT_PARTIAL_FILL, OrderStatus.CANCELED,
@@ -1879,7 +1937,41 @@ class APOrderStateMachine:
         if not _pos_id or _kind != "EXIT":
             return
 
+        _local_id = local_order_id or current.get("local_order_id")
+        _broker_id = broker_order_id or current.get("broker_order_id")
+
         try:
+            # Durable broker fills converge before any in-memory exit-engine
+            # mutation. OSM consumes only this result and does not maintain a
+            # second position-delta arithmetic authority.
+            _durable_result = None
+            if new_status in (OrderStatus.EXIT_PARTIAL_FILL, OrderStatus.EXIT_FILLED):
+                _durable_result = self._converge_durable_exit_order(str(_local_id or ""))
+                _broker_id = (
+                    getattr(_durable_result, "broker_order_id", "")
+                    or _broker_id
+                )
+                _durable_disposition = str(
+                    getattr(_durable_result, "disposition", "") or ""
+                )
+                if _durable_disposition not in {
+                    "APPLIED_PARTIAL", "APPLIED_FULL", "ALREADY_APPLIED",
+                }:
+                    log.critical(
+                        "[%s] EXIT runtime hook held behind durable convergence | "
+                        "order=%s pos=%s status=%s disposition=%s reason=%s",
+                        self.client_id,
+                        _local_id,
+                        _pos_id,
+                        new_status,
+                        _durable_disposition,
+                        getattr(_durable_result, "reason", ""),
+                    )
+                    # A durable convergence hold is a real control-flow
+                    # failure: the order status may be durable, but no
+                    # position/runtime mutation is authorized.
+                    return False
+
             _ee = _get_exit_engine_for_client(self.client_id)
             if not _ee:
                 log.warning(
@@ -1889,18 +1981,17 @@ class APOrderStateMachine:
                 )
                 return
 
-            _local_id    = local_order_id or current.get("local_order_id")
-            _broker_id   = broker_order_id or current.get("broker_order_id")
             _order_qty   = self._safe_int(current.get("qty"), 0)
-            _prev_filled = self._safe_int(current.get("filled_qty"), 0)
-            _cum_filled  = self._safe_int(filled_qty, None)  # FIX-E: None means "not provided"
-
-            if _cum_filled is not None and _cum_filled < _prev_filled:
-                log.critical(
-                    "[%s] INVALID EXIT CUMULATIVE FILL | order=%s pos=%s new=%s prev=%s",
-                    self.client_id, _local_id, _pos_id, _cum_filled, _prev_filled,
-                )
-                return
+            _cum_filled = (
+                getattr(_durable_result, "cumulative_applied_qty", None)
+                if _durable_result is not None
+                else self._safe_int(filled_qty, None)
+            )
+            _applied_delta = (
+                int(getattr(_durable_result, "applied_delta_qty", 0) or 0)
+                if _durable_result is not None
+                else 0
+            )
 
             # ── EXIT_SUBMITTED ─────────────────────────────────────────────
             if new_status == OrderStatus.EXIT_SUBMITTED:
@@ -1931,17 +2022,31 @@ class APOrderStateMachine:
 
             # ── EXIT_PARTIAL_FILL ───────────────────────────────────────────
             if new_status == OrderStatus.EXIT_PARTIAL_FILL:
-                if _cum_filled is None:
-                    log.warning(
-                        "[%s] EXIT_PARTIAL_FILL missing filled_qty | order=%s pos=%s -- not applying",
-                        self.client_id, _local_id, _pos_id,
-                    )
-                    return
-                _delta = max(0, _cum_filled - _prev_filled)
-                if _delta > 0:
+                if (
+                    _durable_result is not None
+                    and _durable_result.disposition == "APPLIED_PARTIAL"
+                    and _applied_delta > 0
+                ):
                     self._call_exit_engine(
-                        _ee, "note_partial_exit_fill", _pos_id, _delta,
-                        fill_price=fill_price,
+                        _ee, "note_partial_exit_fill", _pos_id, _applied_delta,
+                        fill_price=(
+                            getattr(_durable_result, "applied_delta_price", None)
+                            or getattr(_durable_result, "exit_price", None)
+                        ),
+                        local_order_id=str(_local_id or ""),
+                        broker_order_id=str(_broker_id or ""),
+                        cumulative_filled=_cum_filled,
+                    )
+                elif (
+                    _durable_result is not None
+                    and _durable_result.disposition == "APPLIED_FULL"
+                    and _durable_result.terminal
+                ):
+                    self._call_exit_engine(
+                        _ee, "mark_position_closed", str(_pos_id),
+                        reason="EXIT_PARTIAL_FILL",
+                        qty_filled=_applied_delta,
+                        fill_price=getattr(_durable_result, "exit_price", None),
                         local_order_id=str(_local_id or ""),
                         broker_order_id=str(_broker_id or ""),
                         cumulative_filled=_cum_filled,
@@ -1950,95 +2055,52 @@ class APOrderStateMachine:
 
             # ── EXIT_FILLED ─────────────────────────────────────────────────
             if new_status == OrderStatus.EXIT_FILLED:
-                if _cum_filled is None or _cum_filled <= 0:
-                    _cum_filled = _order_qty
-
-                # FIX-H: zero qty → quarantine, not clear
-                if _cum_filled <= 0:
-                    log.critical(
-                        "[%s] EXIT_FILLED with zero/unknown quantity -- QUARANTINING | "
-                        "order=%s pos=%s | broker fill data unreliable",
-                        self.client_id, _local_id, _pos_id,
-                    )
+                if _durable_result.disposition == "APPLIED_PARTIAL":
                     self._call_exit_engine(
-                        _ee, "set_pending_exit_order", _pos_id,
-                        local_order_id=str(_local_id or ""),
-                        broker_order_id=str(_broker_id or ""),
-                        qty=0,
-                        reason="EXIT_FILLED_ZERO_QTY_QUARANTINE",
-                        identity_quarantine=True,
-                    )
-                    return
-
-                _delta = max(0, _cum_filled - _prev_filled)
-                # AUDIT-2: _get_position_remaining_from_db is now a proper method
-                # (not dead code). This call correctly returns the DB quantity.
-                _remaining_before = self._get_position_remaining_from_db(_pos_id)
-                if _remaining_before is None:
-                    _pos_obj = self._get_exit_engine_position(_ee, str(_pos_id))
-                    _remaining_before = (
-                        self._safe_int(getattr(_pos_obj, "quantity_remaining", None), None)
-                        if _pos_obj else None
-                    )
-
-                if _delta <= 0:
-                    log.info(
-                        "[%s] EXIT_FILLED duplicate callback -- no new qty | "
-                        "order=%s pos=%s prev_filled=%s cum=%s; clearing in-flight (safe: prev>0)",
-                        self.client_id, _local_id, _pos_id, _prev_filled, _cum_filled,
-                    )
-                    self._call_exit_engine(
-                        _ee, "clear_exit_in_flight", _pos_id,
-                        local_order_id=str(_local_id or ""),
-                        broker_order_id=str(_broker_id or ""),
-                    )
-                    return
-
-                if _remaining_before is None:
-                    log.critical(
-                        "[%s] EXIT_FILLED remaining size unknown -- conservative partial handling | "
-                        "order=%s pos=%s delta=%s",
-                        self.client_id, _local_id, _pos_id, _delta,
-                    )
-                    self._call_exit_engine(
-                        _ee, "note_partial_exit_fill", _pos_id, _delta,
-                        fill_price=fill_price,
+                        _ee, "note_partial_exit_fill", _pos_id, _applied_delta,
+                        fill_price=(
+                            getattr(_durable_result, "applied_delta_price", None)
+                            or getattr(_durable_result, "exit_price", None)
+                        ),
                         local_order_id=str(_local_id or ""),
                         broker_order_id=str(_broker_id or ""),
                         cumulative_filled=_cum_filled,
                     )
                     return
-
-                if _delta < int(_remaining_before):
+                if (
+                    _durable_result.disposition == "ALREADY_APPLIED"
+                    and not _durable_result.terminal
+                ):
                     log.info(
-                        "[%s] EXIT_FILLED treated as completed scale-out | order=%s pos=%s "
-                        "delta=%s remaining_before=%s",
-                        self.client_id, _local_id, _pos_id, _delta, _remaining_before,
-                    )
-                    self._call_exit_engine(
-                        _ee, "note_partial_exit_fill", _pos_id, _delta,
-                        fill_price=fill_price,
-                        local_order_id=str(_local_id or ""),
-                        broker_order_id=str(_broker_id or ""),
-                        cumulative_filled=_cum_filled,
+                        "[%s] EXIT_FILLED already projected as nonterminal partial | "
+                        "order=%s pos=%s remaining=%s",
+                        self.client_id,
+                        _local_id,
+                        _pos_id,
+                        getattr(_durable_result, "remaining_qty", None),
                     )
                     return
-
-                # Full close: delta >= remaining
                 log.info(
-                    "[%s] EXIT_FILLED treated as full close | order=%s pos=%s "
-                    "delta=%s remaining_before=%s",
-                    self.client_id, _local_id, _pos_id, _delta, _remaining_before,
+                    "[%s] EXIT_FILLED durable convergence terminal | order=%s pos=%s "
+                    "disposition=%s delta=%s",
+                    self.client_id, _local_id, _pos_id,
+                    _durable_result.disposition, _applied_delta,
                 )
-                # FIX-F: record performance before removing from engine
-                _pos_for_perf = self._get_exit_engine_position(_ee, str(_pos_id))
+                # Existing performance/runtime hooks run only after the
+                # durable position commit. A replay with no new delta does
+                # not create a second performance outcome.
+                _pos_for_perf = (
+                    self._get_exit_engine_position(_ee, str(_pos_id))
+                    if _durable_result.disposition == "APPLIED_FULL"
+                    else None
+                )
                 if _pos_for_perf is not None:
                     try:
                         from ap.performance_tracker import record_trade_outcome_from_position
                         record_trade_outcome_from_position(
                             _pos_for_perf,
-                            qty_filled=_delta,
-                            fill_price=fill_price,
+                            qty_filled=_applied_delta,
+                            fill_price=getattr(_durable_result, "exit_price", None),
                             reason="EXIT_FILLED",
                             supabase_client=getattr(_ee, "sb", None) or getattr(_ee, "supabase", None),
                         )
@@ -2048,16 +2110,12 @@ class APOrderStateMachine:
                 self._call_exit_engine(
                     _ee, "mark_position_closed", str(_pos_id),
                     reason="EXIT_FILLED",
-                    qty_filled=_delta,
-                    fill_price=fill_price,
+                    qty_filled=_applied_delta,
+                    fill_price=getattr(_durable_result, "exit_price", None),
                     local_order_id=str(_local_id or ""),
                     broker_order_id=str(_broker_id or ""),
                     cumulative_filled=_cum_filled,
                 )
-                # Finalize position row from confirmed broker fill truth.
-                # This is the canonical write path: orders → positions → dashboard.
-                # Runs after mark_position_closed so exit engine state is updated first.
-                self._finalize_position_from_exit_order(str(_local_id or ""), fill_price=fill_price, filled_qty=_delta)
                 return
 
             # ── CANCELED / EXPIRED / REJECTED ───────────────────────────────
@@ -2123,6 +2181,7 @@ class APOrderStateMachine:
         cumulative_filled: int,
         fill_price=None,
         broker_order_id=None,
+        filled_ts=None,
     ) -> bool:
         order = self._get_order(local_order_id)
         if not order:
@@ -2145,6 +2204,7 @@ class APOrderStateMachine:
             broker_order_id=broker_order_id or order.get("broker_order_id"),
             filled_qty=cumulative_filled,
             fill_price=fill_price,
+            filled_ts=filled_ts,
         )
 
     def increment_retry(self, local_order_id: str):
@@ -7376,55 +7436,53 @@ class APOrderStateMachine:
         fill_price: float | None = None,
         filled_qty: int | None = None,
         pm=None,  # accept shared APPositionManager if caller has one
-    ) -> None:
+    ):
         """
-        Copy confirmed broker fill truth from orders → positions after EXIT_FILLED.
+        Compatibility wrapper for the single durable EXIT convergence seam.
 
-        Production rule: broker fill > order row > position row > dashboard.
-        Called immediately after mark_position_closed so the position row is
-        finalized with real fill price, P&L, and close metadata.
-        Non-fatal — any error is logged and swallowed; it never blocks the exit path.
+        ``fill_price`` and ``filled_qty`` remain accepted for old callers, but
+        are intentionally ignored.  The locked method rereads the exact
+        durable order and owns all identity, timestamp, watermark, and delta
+        validation.
         """
         try:
             order = self._get_order(local_order_id)
             if not order:
                 log.warning("[%s] _finalize_position_from_exit_order: order not found %s",
                             self.client_id, local_order_id)
-                return
-
-            position_id    = str(order.get("position_id") or "")
-            _fill_price    = fill_price if fill_price is not None else order.get("fill_price")
-            _filled_qty    = filled_qty if filled_qty is not None else order.get("filled_qty")
-            _filled_ts     = order.get("filled_ts")
-            _broker_id     = str(order.get("broker_order_id") or "")
-
-            if not position_id or _fill_price is None or int(_filled_qty or 0) <= 0:
-                log.warning(
-                    "[%s] _finalize_position_from_exit_order skipped — incomplete fill data | "
-                    "order=%s pos=%s price=%r qty=%r",
-                    self.client_id, local_order_id, position_id, _fill_price, _filled_qty,
-                )
-                return
+                return None
 
             if pm is None:
                 from ap.position_manager import APPositionManager
                 pm = APPositionManager(self.client_id)
-            pm.close_position_from_exit_fill(
-                position_id=position_id,
-                exit_price=float(_fill_price),
-                filled_qty=int(_filled_qty),
-                filled_ts=str(_filled_ts) if _filled_ts else now_utc_iso(),
-                local_order_id=local_order_id,
-                broker_order_id=_broker_id,
-                close_source="broker_exit_fill",
-                close_confidence="HIGH",
-                exit_reason="exit_filled",
+            expected_mode = str(order.get("execution_mode") or "").strip().lower()
+            converge = getattr(pm, "converge_position_from_durable_exit_order", None)
+            if not callable(converge):
+                from ap.position_manager import APPositionManager
+                pm = APPositionManager(self.client_id)
+                converge = pm.converge_position_from_durable_exit_order
+            result = converge(
+                exit_local_order_id=str(local_order_id or ""),
+                expected_execution_mode=expected_mode,
             )
+            if getattr(result, "disposition", "") not in {
+                "APPLIED_PARTIAL", "APPLIED_FULL", "ALREADY_APPLIED",
+            }:
+                log.critical(
+                    "[%s] _finalize_position_from_exit_order held | order=%s "
+                    "disposition=%s reason=%s",
+                    self.client_id,
+                    local_order_id,
+                    getattr(result, "disposition", ""),
+                    getattr(result, "reason", ""),
+                )
+            return result
         except Exception as exc:
             log.error(
                 "[%s] _finalize_position_from_exit_order failed | order=%s | %s",
                 self.client_id, local_order_id, exc, exc_info=True,
             )
+            return None
 
     def _get_order(self, local_order_id: str):
         def _fn():

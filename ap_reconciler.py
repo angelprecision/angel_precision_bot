@@ -1049,15 +1049,17 @@ class APBrokerReconciler:
 
     def _heal_exit_filled_positions_from_orders(self, summary: dict) -> None:
         """
-        Backup fill-truth repair. If any bot-owned EXIT order is EXIT_FILLED with a
-        confirmed fill_price, but the linked position is still missing exit_price /
-        realized_pnl / realized_pnl_pct, finalize the position from the order row.
+        Backup durable EXIT projection. Discover bot-owned EXIT fill rows whose
+        linked position still retains quantity (or has a legacy NULL remaining
+        value), then delegate all identity, timestamp, economics, and
+        idempotency decisions to APPositionManager's locked converger.
 
         External/manual EXIT rows are deliberately excluded. The manual-close
         reconciler owns those rows and must finalize their complete weighted
         fill aggregate under the external-close quantity/ownership fence.
 
-        Catches: manual exits, restart gaps, fill monitor delays, OSM misses.
+        Catches: restart gaps, fill monitor delays, and OSM misses. External
+        manual EXIT rows remain owned by manual_close_reconciliation.
         Production rule: orders table receives broker truth first.
                          positions table is finalized from orders table.
                          dashboard reads positions only after broker truth is copied.
@@ -1098,25 +1100,16 @@ class APBrokerReconciler:
                         JOIN positions p ON p.id = o.position_id AND p.client_id = o.client_id
                         WHERE o.client_id = %s
                           AND o.kind = 'EXIT'
-                          AND o.status = 'EXIT_FILLED'
+                          AND o.status IN ('EXIT_PARTIAL_FILL', 'EXIT_FILLED')
                           AND COALESCE(o.local_order_id, '') NOT LIKE %s
                           AND LOWER(COALESCE(o.meta->>'external_broker_order', 'false')) <> 'true'
                           AND LOWER(TRIM(COALESCE(p.execution_mode, ''))) = %s
+                          AND LOWER(TRIM(COALESCE(o.execution_mode, ''))) = %s
                           AND (
-                              NULLIF(TRIM(COALESCE(o.execution_mode, '')), '') IS NULL
-                              OR LOWER(TRIM(o.execution_mode)) = %s
-                          )
-                          AND o.fill_price IS NOT NULL
-                          AND COALESCE(o.filled_qty, 0) > 0
-                          AND p.avg_fill IS NOT NULL
-                          AND p.avg_fill > 0
-                          AND (
-                              p.exit_price IS NULL
-                              OR p.realized_pnl IS NULL
-                              OR p.realized_pnl_pct IS NULL
+                              COALESCE(p.quantity_remaining, 0) > 0
                               OR p.quantity_remaining IS NULL
                           )
-                        ORDER BY o.filled_ts DESC
+                          ORDER BY o.filled_ts DESC
                         LIMIT 50
                         """,
                         (
@@ -1153,7 +1146,7 @@ class APBrokerReconciler:
                 ).strip().lower()
                 if (
                     position_mode != expected_mode
-                    or (raw_order_mode and raw_order_mode != expected_mode)
+                    or raw_order_mode != expected_mode
                 ):
                     summary.setdefault("errors", []).append(
                         "reconciler_exit_fill_execution_mode_mismatch"
@@ -1176,18 +1169,29 @@ class APBrokerReconciler:
             pm = APPositionManager(self.client_id)
             healed = 0
             for row in rows:
-                ok = pm.close_position_from_exit_fill(
-                    position_id=str(row["position_id"]),
-                    exit_price=float(row["fill_price"]),
-                    filled_qty=int(row["filled_qty"]),
-                    filled_ts=str(row["filled_ts"]) if row.get("filled_ts") else None,
-                    local_order_id=str(row.get("local_order_id") or ""),
-                    broker_order_id=str(row.get("broker_order_id") or ""),
-                    close_source="reconciler_broker_exit_fill",
-                    close_confidence="HIGH",
+                result = pm.converge_position_from_durable_exit_order(
+                    exit_local_order_id=str(row.get("local_order_id") or ""),
+                    expected_execution_mode=expected_mode,
                 )
-                if ok:
+                disposition = str(getattr(result, "disposition", "") or "")
+                if disposition in {"APPLIED_PARTIAL", "APPLIED_FULL"}:
                     healed += 1
+                elif disposition not in {"ALREADY_APPLIED"}:
+                    summary.setdefault("errors", []).append(
+                        f"reconciler_exit_fill_{disposition.lower() or 'hold'}"
+                    )
+                    summary["positions_alerted"] = int(
+                        summary.get("positions_alerted") or 0
+                    ) + 1
+                    log.critical(
+                        "[%s] EXIT durable projection held | order=%s pos=%s "
+                        "disposition=%s reason=%s",
+                        self.client_id,
+                        row.get("local_order_id"),
+                        row.get("position_id"),
+                        disposition,
+                        getattr(result, "reason", ""),
+                    )
 
             if healed:
                 summary["positions_corrected"] = int(summary.get("positions_corrected") or 0) + healed

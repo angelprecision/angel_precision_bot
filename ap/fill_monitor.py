@@ -48,6 +48,7 @@ from ap.logger import get_logger
 from ap.config import Config
 from ap.state import release_equity, release_symbol_lock
 from ap.broker import BrokerAdapter
+from ap.manual_close_reconciliation import order_filled_at
 from ap.observability import emit_decision_event, get_git_commit
 
 log = get_logger("ap.fill_monitor")
@@ -826,10 +827,33 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
 
         avg_fill = float(raw.get("avg_fill_price") or raw.get("price") or 0.0)
 
+        # PR #579 amendment (2026-09-06): also extract the broker
+        # execution timestamp when the mapped state is terminal
+        # (CANCELED / REJECTED / EXPIRED) but exec_quantity > 0. Those
+        # contracts really executed and carry a real broker timestamp,
+        # and the terminal-failure branch downstream needs that
+        # timestamp to converge the executed delta before terminalizing
+        # the remainder. Without this the delta is silently dropped
+        # (see September 4 2026 audit note on partial-then-cancel).
+        broker_filled_at = None
+        _extract_ts = our in {"FILLED", "PARTIAL_FILL", "EXIT_FILLED", "EXIT_PARTIAL_FILL"}
+        if not _extract_ts and our in {"CANCELED", "REJECTED", "EXPIRED"} and int(filled_qty or 0) > 0:
+            _extract_ts = True
+        if _extract_ts:
+            try:
+                broker_filled_at = order_filled_at(raw)
+            except Exception:
+                broker_filled_at = None
+
         result = {
             "status": our,
             "filled_qty": filled_qty,
             "avg_fill": avg_fill,
+            "filled_ts": (
+                broker_filled_at.astimezone(timezone.utc).isoformat()
+                if broker_filled_at is not None
+                else None
+            ),
             "reason": raw.get("reason") or status,
             "raw": raw,
         }
@@ -2659,6 +2683,49 @@ def process_pending_order(
         )
         return
 
+    # EXIT position mutation requires an exact broker execution timestamp.
+    # Do not let OSM persist a new cumulative fill that the canonical
+    # convergence seam cannot chronologically prove.  A later poll or the
+    # reconciler may retry the same broker-confirmed order.
+    if (
+        kind == "EXIT"
+        and mapped in {"EXIT_FILLED", "EXIT_PARTIAL_FILL"}
+        and not result.get("filled_ts")
+    ):
+        reason = "EXIT_FILL_TIMESTAMP_MISSING_OR_INVALID"
+        payload = {
+            "local_order_id": local_id,
+            "broker_order_id": broker_id,
+            "status": mapped,
+            "filled_qty": new_filled,
+            "raw_timestamp_fields": {
+                key: result.get("raw", {}).get(key)
+                for key in (
+                    "last_fill_date",
+                    "filled_at",
+                    "filled_ts",
+                    "fill_ts",
+                    "transaction_date",
+                )
+                if key in (result.get("raw") or {})
+            },
+        }
+        log.critical("[%s] %s | %s", client_id, reason, payload)
+        audit(client_id, "CRITICAL", reason, payload)
+        emit_fill_event(
+            order,
+            decision="HOLD",
+            reason_code=reason,
+            explanation=(
+                "Broker confirmed an EXIT fill without an exact timezone-aware "
+                "execution timestamp; no OSM, position, proof, or runtime "
+                "projection is authorized."
+            ),
+            result=result,
+            extra_context=payload,
+        )
+        return
+
     # ── FILLED / EXIT_FILLED ────────────────────────────────────────────────
     if mapped in ("FILLED", "EXIT_FILLED"):
         emit_fill_event(
@@ -2688,6 +2755,7 @@ def process_pending_order(
                     filled_qty=new_filled,
                     fill_price=result.get("avg_fill"),
                     broker_order_id=broker_id,
+                    filled_ts=result.get("filled_ts"),
                 )
             except Exception as exc:
                 log.error("[%s] OSM transition %s failed for %s: %s", client_id, mapped, local_id, exc)
@@ -2798,8 +2866,8 @@ def process_pending_order(
 
         audit(
             client_id,
-            "INFO",
-            "ORDER_FILLED",
+            "INFO" if ok else "WARNING",
+            "ORDER_FILLED" if ok else "ORDER_FILL_HELD",
             {
                 "local_order_id": local_id,
                 "broker_order_id": broker_id,
@@ -2827,21 +2895,26 @@ def process_pending_order(
             try:
                 current_status = str(order.get("status") or "").upper()
                 if current_status == mapped and current_status in ("PARTIAL_FILL", "EXIT_PARTIAL_FILL"):
-                    osm.apply_fill_update(
-                        local_order_id=local_id,
-                        cumulative_filled=new_filled,
-                        fill_price=result.get("avg_fill"),
-                        broker_order_id=broker_id,
+                    partial_applied = bool(
+                        osm.apply_fill_update(
+                            local_order_id=local_id,
+                            cumulative_filled=new_filled,
+                            fill_price=result.get("avg_fill"),
+                            broker_order_id=broker_id,
+                            filled_ts=result.get("filled_ts"),
+                        )
                     )
                 else:
-                    osm.transition(
-                        local_id,
-                        mapped,
-                        filled_qty=new_filled,
-                        fill_price=result.get("avg_fill"),
-                        broker_order_id=broker_id,
+                    partial_applied = bool(
+                        osm.transition(
+                            local_id,
+                            mapped,
+                            filled_qty=new_filled,
+                            fill_price=result.get("avg_fill"),
+                            broker_order_id=broker_id,
+                            filled_ts=result.get("filled_ts"),
+                        )
                     )
-                partial_applied = True
             except Exception as exc:
                 log.error("[%s] OSM partial update %s failed for %s: %s", client_id, mapped, local_id, exc)
         else:
@@ -2861,8 +2934,8 @@ def process_pending_order(
 
         audit(
             client_id,
-            "INFO",
-            "ORDER_PARTIAL",
+            "INFO" if partial_applied else "WARNING",
+            "ORDER_PARTIAL" if partial_applied else "ORDER_PARTIAL_HELD",
             {
                 "local_order_id": local_id,
                 "broker_order_id": broker_id,
@@ -2889,6 +2962,228 @@ def process_pending_order(
 
     # ── TERMINAL FAILURES ────────────────────────────────────────────────
     if mapped in TERMINAL_FAILURE_STATUSES:
+        # ── PR #579 amendment: converge-or-hold executed delta first ──
+        #
+        # A bot-owned EXIT that terminalizes with broker cumulative
+        # filled > durable applied has executed contracts that must be
+        # projected into the canonical position BEFORE the remainder is
+        # terminalized. Without this, the executed delta is silently
+        # discarded and local position drifts above broker position —
+        # the leak the September 4 2026 audit called out.
+        #
+        # Rules:
+        #   filled_ts present → advance OSM cumulative + converge
+        #     position exactly once, then fall through to the ordinary
+        #     terminal handling so the remainder cancels.
+        #   filled_ts missing → HOLD the whole terminalization; a
+        #     later poll or the reconciler resolves. Never fabricate
+        #     a timestamp — chronology is the whole point of #579.
+        #   ENTRY orders → out of scope; the entry-fill path owns that
+        #     class of defect.
+        if (
+            kind == "EXIT"
+            and int(new_filled or 0) > int(prev_filled or 0)
+        ):
+            _delta = int(new_filled) - int(prev_filled)
+            _payload_terminal_delta = {
+                "local_order_id": local_id,
+                "broker_order_id": broker_id,
+                "terminal_status": mapped,
+                "prev_filled_qty": int(prev_filled),
+                "new_filled_qty": int(new_filled),
+                "unresolved_delta": _delta,
+                "has_filled_ts": bool(result.get("filled_ts")),
+            }
+            if not result.get("filled_ts"):
+                # HOLD — cannot converge without proven chronology, and
+                # cannot terminalize without losing the executed delta.
+                reason = "EXIT_TERMINAL_WITH_UNRESOLVED_EXECUTED_DELTA_HOLD"
+                log.critical("[%s] %s | %s", client_id, reason, _payload_terminal_delta)
+                audit(client_id, "CRITICAL", reason, _payload_terminal_delta)
+                emit_fill_event(
+                    order,
+                    decision="HOLD",
+                    reason_code=reason,
+                    explanation=(
+                        f"Broker returned {mapped} with cumulative executed "
+                        f"quantity {new_filled} > durable applied {prev_filled} "
+                        f"but no exact broker execution timestamp. Cannot "
+                        f"terminalize (would drop the executed delta) and "
+                        f"cannot converge (would fabricate chronology). "
+                        f"Awaiting next broker poll or reconciler pass."
+                    ),
+                    result=result,
+                    extra_context=_payload_terminal_delta,
+                )
+                if osm:
+                    # Retry cadence increments so the poller does not
+                    # spin on a fixed schedule waiting for a timestamp
+                    # that requires exchange settlement to arrive.
+                    try:
+                        osm.increment_retry(local_id)
+                    except Exception:
+                        pass
+                return
+
+            # Timestamp present — advance OSM cumulative and converge
+            # the delta into the canonical position, then fall through
+            # to the ordinary terminal handling for the remainder.
+            fill_applied = False
+            if osm:
+                try:
+                    current_status = str(order.get("status") or "").strip().upper()
+                    fill_kwargs = {
+                        "local_order_id": local_id,
+                        "cumulative_filled": new_filled,
+                        "fill_price": result.get("avg_fill"),
+                        "broker_order_id": broker_id,
+                        "filled_ts": result.get("filled_ts"),
+                    }
+                    if current_status in {"PARTIAL_FILL", "EXIT_PARTIAL_FILL"}:
+                        # Same-state updates are legal only after the durable
+                        # lifecycle is already partial.
+                        fill_applied = bool(osm.apply_fill_update(**fill_kwargs))
+                    else:
+                        # Recovery-shaped path: first durably enter the legal
+                        # EXIT_PARTIAL_FILL state, which also gives production
+                        # OSM its canonical convergence hook. Calling
+                        # apply_fill_update from EXIT_SUBMITTED/ACKNOWLEDGED
+                        # is refused by OSM and would strand the executed delta.
+                        fill_applied = bool(
+                            osm.transition(
+                                local_id,
+                                "EXIT_PARTIAL_FILL",
+                                filled_qty=new_filled,
+                                fill_price=result.get("avg_fill"),
+                                broker_order_id=broker_id,
+                                filled_ts=result.get("filled_ts"),
+                            )
+                        )
+                except Exception as exc:
+                    log.error(
+                        "[%s] OSM pre-terminal partial transition/update failed "
+                        "for %s: %s",
+                        client_id, local_id, exc,
+                    )
+            else:
+                # Legacy path parity — advance cumulative locally.
+                _legacy_update_order_status(local_id, "EXIT_PARTIAL_FILL", filled_qty=new_filled)
+                fill_applied = True
+
+            if not fill_applied:
+                # OSM refused the fill update — safest response is HOLD.
+                # The executed delta remains unresolved; terminalizing
+                # now would still drop it. Retry on next poll.
+                reason = "EXIT_TERMINAL_PRE_CONVERGENCE_FILL_APPLY_REFUSED"
+                log.critical("[%s] %s | %s", client_id, reason, _payload_terminal_delta)
+                audit(client_id, "CRITICAL", reason, _payload_terminal_delta)
+                emit_fill_event(
+                    order,
+                    decision="HOLD",
+                    reason_code=reason,
+                    explanation=(
+                        "OSM refused the pre-terminal cumulative fill "
+                        "update; deferring terminalization to preserve "
+                        "the executed delta."
+                    ),
+                    result=result,
+                    extra_context=_payload_terminal_delta,
+                )
+                if osm:
+                    try:
+                        osm.increment_retry(local_id)
+                    except Exception:
+                        pass
+                return
+
+            # Converge the just-applied durable delta into the position.
+            # position_manager reads the order row directly — that is why the
+            # OSM update happens first.
+            #
+            # PR #579: convergence failure is NOT non-fatal here.
+            # If the canonical position cannot consume the executed delta,
+            # terminalizing the remainder drops that delta permanently.
+            # HOLD until convergence is proven.
+            if pm is None:
+                reason = "EXIT_TERMINAL_PRE_CONVERGENCE_NO_POSITION_MANAGER"
+                log.critical("[%s] %s | %s", client_id, reason, _payload_terminal_delta)
+                audit(client_id, "CRITICAL", reason, _payload_terminal_delta)
+                emit_fill_event(
+                    order,
+                    decision="HOLD",
+                    reason_code=reason,
+                    explanation=(
+                        "No position manager available for pre-terminal convergence; "
+                        "cannot safely terminalize without losing the executed delta."
+                    ),
+                    result=result,
+                    extra_context=_payload_terminal_delta,
+                )
+                if osm:
+                    try:
+                        osm.increment_retry(local_id)
+                    except Exception:
+                        pass
+                return
+
+            try:
+                _exec_mode_for_converge = str(
+                    order.get("execution_mode")
+                    or runtime_execution_mode
+                    or (getattr(exit_engine, "execution_mode", "") if exit_engine else "")
+                    or ""
+                ).strip().lower()
+                _converge = pm.converge_position_from_durable_exit_order(
+                    exit_local_order_id=local_id,
+                    expected_execution_mode=_exec_mode_for_converge,
+                )
+                _converge_disp = str(getattr(_converge, "disposition", "") or "")
+            except Exception as exc:
+                _converge_disp = "DB_ERROR"
+                log.error(
+                    "[%s] Pre-terminal position convergence raised for %s: %s",
+                    client_id, local_id, exc,
+                )
+
+            if _converge_disp not in {"APPLIED_PARTIAL", "APPLIED_FULL", "ALREADY_APPLIED"}:
+                reason = "EXIT_TERMINAL_PRE_CONVERGENCE_HOLD"
+                _ctx = {**_payload_terminal_delta, "converge_disposition": _converge_disp}
+                log.critical("[%s] %s | %s", client_id, reason, _ctx)
+                audit(client_id, "CRITICAL", reason, _ctx)
+                emit_fill_event(
+                    order,
+                    decision="HOLD",
+                    reason_code=reason,
+                    explanation=(
+                        f"Canonical position convergence returned {_converge_disp!r} "
+                        f"for pre-terminal delta {_delta}; "
+                        "cannot terminalize the remainder until the executed "
+                        "delta is durably applied. Awaiting next poll or "
+                        "reconciler pass."
+                    ),
+                    result=result,
+                    extra_context=_ctx,
+                )
+                if osm:
+                    try:
+                        osm.increment_retry(local_id)
+                    except Exception:
+                        pass
+                return
+
+            emit_fill_event(
+                order,
+                decision="PARTIAL_FILL",
+                reason_code="EXIT_TERMINAL_DELTA_CONVERGED",
+                explanation=(
+                    f"Executed delta {_delta} converged before "
+                    f"{mapped} terminalization of remainder."
+                ),
+                result={**result, "status": "EXIT_PARTIAL_FILL", "filled_qty": new_filled},
+                extra_context={**_payload_terminal_delta, "converge_disposition": _converge_disp},
+            )
+            # Convergence proven — fall through to terminalize the remainder.
+
         emit_fill_event(
             order,
             decision="REJECT",
@@ -2912,7 +3207,9 @@ def process_pending_order(
             _legacy_update_order_status(local_id, mapped, error=result.get("reason"))
 
         # IMPORTANT: no direct positions table mutation here.
-        # EXIT failure repair is handled by OSM + exit-engine hooks.
+        # EXIT failure repair is handled by OSM + exit-engine hooks,
+        # plus (PR #579 amendment above) the pre-terminal convergence
+        # of any unresolved executed delta.
 
         if kind == "ENTRY":
             _release_entry_guards(order)
@@ -3049,6 +3346,25 @@ def _sync_exit_price(order: dict, result: dict):
     Runs directly against Supabase proof_trades — no dashboard API hop needed.
     """
     try:
+        if str(order.get("kind") or "").strip().upper() == "EXIT":
+            # Bot-owned EXIT position/proof mutation belongs to OSM/PM. This
+            # compatibility function may only keep the dashboard mirror warm;
+            # it must never become a second proof or position authority.
+            pos_id = order.get("position_id")
+            avg_fill = result.get("avg_fill")
+            if pos_id and avg_fill is not None:
+                try:
+                    from ap.exit_price_sync import sync_exit_price_to_dashboard
+                    sync_exit_price_to_dashboard(
+                        position_id=str(pos_id),
+                        exit_avg_fill=float(avg_fill),
+                        entry_price=None,
+                        ticker=str(order.get("symbol") or "").upper(),
+                    )
+                except Exception:
+                    pass
+            return
+
         pos_id      = order.get("position_id")
         avg_fill    = result.get("avg_fill")
         entry_price = float(order.get("entry_price") or order.get("fill_price") or 0)

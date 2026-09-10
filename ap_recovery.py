@@ -42,6 +42,7 @@ from ap_entry_watcher import (
 )
 from ap.pending_trigger_classifier import is_active_materialization_in_flight
 from ap.pending_trigger_restart_recovery import _RecoveryPlan
+from ap.manual_close_reconciliation import order_filled_at
 
 log = logging.getLogger("ap.recovery")
 
@@ -134,6 +135,22 @@ def _extract_avg_fill_price(raw: dict) -> Optional[float]:
         except Exception:
             continue
     return None
+
+
+def _extract_broker_fill_timestamp(raw: dict) -> Optional[str]:
+    """Return only an explicit timezone-aware broker execution timestamp."""
+    try:
+        filled_at = order_filled_at(raw)
+    except Exception:
+        return None
+    if not isinstance(filled_at, datetime):
+        return None
+    try:
+        if filled_at.tzinfo is None or filled_at.utcoffset() is None:
+            return None
+        return filled_at.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return None
 
 
 def _write_fill_truth_blocked_meta(
@@ -792,6 +809,7 @@ class APStartupRecovery:
                         local_id, new_status,
                         filled_qty=filled_qty,
                         fill_price=avg_fill,
+                        filled_ts=_extract_broker_fill_timestamp(broker_raw),
                     )
                     if ok:
                         result["entries_corrected"] += 1
@@ -1053,11 +1071,19 @@ class APStartupRecovery:
             if broker_status in BROKER_FILLED:
                 filled_qty = _extract_explicit_fill_qty(broker_raw)
                 avg_fill   = _extract_avg_fill_price(broker_raw)
-                if not filled_qty or filled_qty <= 0 or not avg_fill or avg_fill <= 0:
+                filled_ts  = _extract_broker_fill_timestamp(broker_raw)
+                if (
+                    not filled_qty
+                    or filled_qty <= 0
+                    or not avg_fill
+                    or avg_fill <= 0
+                    or not filled_ts
+                ):
                     msg = (
                         f"RECOVERY_EXIT_FILL_TRUTH_MISSING local={local_id} "
                         f"broker={broker_oid} pos={pos_id} broker_status={broker_status} "
-                        "missing explicit filled_qty/avg_fill; keeping CLOSING for reconciler/fill_monitor"
+                        "missing explicit filled_qty/avg_fill/exact_filled_ts; "
+                        "keeping CLOSING for reconciler/fill_monitor"
                     )
                     log.critical("[%s] %s", self.client_id, msg)
                     result.setdefault("errors", []).append(msg)
@@ -1083,6 +1109,7 @@ class APStartupRecovery:
                         exit_status,
                         filled_qty=filled_qty,
                         fill_price=avg_fill,
+                        filled_ts=filled_ts,
                     )
                 except Exception as e:
                     log.error("[%s] RECOVERY: %s transition failed: %s",
@@ -1137,29 +1164,262 @@ class APStartupRecovery:
                 continue
 
             if broker_status in BROKER_TERMINAL:
-                try:
-                    self.osm.transition(
-                        local_id, BROKER_TO_OSM.get(broker_status, "CANCELED"),
-                        last_error=f"recovery: broker_status={broker_status}",
-                    )
-                    # Revert position
-                    from ap.db import conn as _conn, run_with_retry
+                # PR #579 (Step 6): terminal broker status does NOT mean the
+                # broker executed zero contracts.  A CANCELED or REJECTED order
+                # can still carry executed quantity.  Converge any executed
+                # delta first; only then handle the unfilled remainder.
+                # Never reopen a position that already had a prior partial
+                # convergence applied — check quantity_remaining first.
+                exec_qty   = _extract_explicit_fill_qty(broker_raw)
+                exec_price = _extract_avg_fill_price(broker_raw)
+                exec_ts    = _extract_broker_fill_timestamp(broker_raw)
+                durable_qty = int((exit_order or {}).get("filled_qty") or 0)
 
-                    def _revert(pid=pos_id):
-                        with _conn() as c:
-                            c.execute(
-                                "UPDATE positions SET status='OPEN', exit_reason=NULL, "
-                                "updated_ts=NOW() WHERE id=%s AND client_id=%s",
-                                (pid, self.client_id),
+                if exec_qty and exec_qty > 0:
+                    # Any positive broker execution requires a position manager
+                    # and a successful durable partial transition before the
+                    # order may be terminalized. A missing PM or a False OSM
+                    # result is a HOLD; neither is permission to fall through
+                    # to CANCELED/REJECTED/EXPIRED.
+                    if self.pm is None or not callable(getattr(self.osm, "transition", None)):
+                        msg = (
+                            f"RECOVERY_TERMINAL_EXECUTED_DELTA_HOLD "
+                            f"local={local_id} pos={pos_id} "
+                            f"broker_status={broker_status} "
+                            f"exec_qty={exec_qty} durable_qty={durable_qty} "
+                            "missing position manager or OSM transition"
+                        )
+                        log.critical("[%s] %s", self.client_id, msg)
+                        result.setdefault("errors", []).append(msg)
+                        continue
+
+                    # Broker reports executed contracts that are not yet
+                    # durably applied. Require exact economics.
+                    if not exec_ts or not exec_price or exec_price <= 0:
+                        msg = (
+                            f"RECOVERY_TERMINAL_EXECUTED_DELTA_HOLD "
+                            f"local={local_id} pos={pos_id} "
+                            f"broker_status={broker_status} "
+                            f"exec_qty={exec_qty} durable_qty={durable_qty} "
+                            "missing exec_ts/exec_price — holding; "
+                            "reconciler/fill_monitor will retry"
+                        )
+                        log.critical("[%s] %s", self.client_id, msg)
+                        result.setdefault("errors", []).append(msg)
+                        continue
+
+                    if exec_qty < durable_qty:
+                        msg = (
+                            f"RECOVERY_TERMINAL_EXECUTED_DELTA_HOLD "
+                            f"local={local_id} pos={pos_id} "
+                            f"broker_status={broker_status} "
+                            f"exec_qty={exec_qty} durable_qty={durable_qty} "
+                            "broker cumulative quantity regressed"
+                        )
+                        log.critical("[%s] %s", self.client_id, msg)
+                        result.setdefault("errors", []).append(msg)
+                        continue
+
+                    if exec_qty > durable_qty:
+                        # Persist the executed partial fill, then require the
+                        # OSM transition to prove that the durable row reached
+                        # EXIT_PARTIAL_FILL. OSM may write the row and still
+                        # return False when its canonical convergence hook
+                        # holds; False is never permission to terminalize.
+                        try:
+                            partial_transition_ok = bool(
+                                self.osm.transition(
+                                    local_id,
+                                    "EXIT_PARTIAL_FILL",
+                                    filled_qty=exec_qty,
+                                    fill_price=exec_price,
+                                    filled_ts=exec_ts,
+                                )
                             )
+                        except Exception as e:
+                            partial_transition_ok = False
+                            log.error(
+                                "[%s] RECOVERY: terminal executed-delta OSM transition "
+                                "failed local=%s: %s",
+                                self.client_id, local_id, e,
+                            )
+                            result.setdefault("errors", []).append(
+                                f"terminal_exec_delta_osm:{local_id}:{e}"
+                            )
+                        if not partial_transition_ok:
+                            msg = (
+                                f"RECOVERY_TERMINAL_EXECUTED_DELTA_HOLD "
+                                f"local={local_id} pos={pos_id} "
+                                "OSM refused/held EXIT_PARTIAL_FILL"
+                            )
+                            log.critical("[%s] %s", self.client_id, msg)
+                            result.setdefault("errors", []).append(msg)
+                            continue
 
-                    run_with_retry(_revert)
+                    # Re-read the durable row after the transition. This
+                    # prevents a mocked or raced success from authorizing
+                    # terminalization without the intended cumulative fill.
+                    persisted_order = self._load_persisted_exit_order(local_id)
+                    persisted_status = str((persisted_order or {}).get("status") or "").upper()
+                    persisted_qty = _safe_int((persisted_order or {}).get("filled_qty"), 0)
+                    if (
+                        persisted_status != "EXIT_PARTIAL_FILL"
+                        or persisted_qty != int(exec_qty)
+                    ):
+                        msg = (
+                            f"RECOVERY_TERMINAL_EXECUTED_DELTA_HOLD "
+                            f"local={local_id} pos={pos_id} "
+                            f"durable_status={persisted_status or 'MISSING'} "
+                            f"durable_qty={persisted_qty} expected_qty={exec_qty}"
+                        )
+                        log.critical("[%s] %s", self.client_id, msg)
+                        result.setdefault("errors", []).append(msg)
+                        continue
+
+                    # Reconcile positive broker execution even when the
+                    # cumulative quantity was already durable. This makes
+                    # terminalization depend on canonical convergence, not
+                    # merely on a filled_qty column that may have survived an
+                    # earlier OSM/convergence failure.
+                    try:
+                        partial_result = self.pm.converge_position_from_durable_exit_order(
+                            exit_local_order_id=local_id,
+                            expected_execution_mode=str(
+                                (persisted_order or exit_order or {}).get("execution_mode") or ""
+                            ).strip().lower(),
+                        )
+                    except Exception as e:
+                        partial_result = None
+                        log.critical(
+                            "[%s] RECOVERY: terminal executed-delta convergence failed "
+                            "local=%s: %s",
+                            self.client_id, local_id, e,
+                        )
+                        result.setdefault("errors", []).append(
+                            f"terminal_exec_delta_convergence:{local_id}:{e}"
+                        )
+                    if partial_result is None or str(
+                        getattr(partial_result, "disposition", "")
+                    ) not in {"APPLIED_PARTIAL", "APPLIED_FULL", "ALREADY_APPLIED"}:
+                        disposition = getattr(partial_result, "disposition", "UNKNOWN")
+                        log.critical(
+                            "[%s] RECOVERY: terminal executed-delta convergence HOLD "
+                            "local=%s pos=%s disposition=%s — not terminalizing",
+                            self.client_id, local_id, pos_id, disposition,
+                        )
+                        result.setdefault("errors", []).append(
+                            f"terminal_exec_delta_convergence_hold:{local_id}"
+                        )
+                        continue
+
+                    # Only a successful canonical convergence may authorize
+                    # terminalization of the broker remainder. Check the
+                    # terminal transition's boolean result too; a False
+                    # leaves the partial row retryable rather than claiming
+                    # recovery succeeded.
+                    terminal_status = BROKER_TO_OSM.get(broker_status, "CANCELED")
+                    try:
+                        terminal_ok = bool(
+                            self.osm.transition(
+                                local_id,
+                                terminal_status,
+                                last_error=(
+                                    f"recovery: broker_status={broker_status} "
+                                    f"exec_qty={exec_qty} applied"
+                                ),
+                            )
+                        )
+                    except Exception as e:
+                        terminal_ok = False
+                        log.error(
+                            "[%s] RECOVERY: terminal OSM transition failed "
+                            "local=%s: %s",
+                            self.client_id, local_id, e,
+                        )
+                    if not terminal_ok:
+                        result.setdefault("errors", []).append(
+                            f"terminal_exec_delta_terminalize_failed:{local_id}"
+                        )
+                        continue
+
                     log.warning(
-                        "[%s] RECOVERY: exit was canceled during downtime | "
-                        "pos=%s %s reverted to OPEN — EXIT MUST BE RETRIED",
-                        self.client_id, pos_id, underlying,
+                        "[%s] RECOVERY: terminal exit with executed delta | "
+                        "pos=%s %s exec_qty=%d — delta converged, remainder "
+                        "terminalized",
+                        self.client_id, pos_id, underlying, exec_qty,
                     )
                     result["exits_reattached"] += 1
+                    continue
+
+                # Zero or no executed quantity — pure cancel.
+                # Only reopen if the position has not already had a partial
+                # convergence applied (quantity_remaining < original qty would
+                # indicate prior partial; do not reset to full OPEN in that case).
+                from ap.db import conn as _conn, run_with_retry as _rwr
+
+                def _can_reopen(pid=pos_id, client=self.client_id):
+                    with _conn() as c:
+                        c.execute(
+                            "SELECT status, qty, quantity_remaining "
+                            "FROM positions WHERE id=%s AND client_id=%s",
+                            (pid, client),
+                        )
+                        row = c.fetchone()
+                        if not row:
+                            return False
+                        row = dict(row)
+                        status = str(row.get("status") or "").upper()
+                        if status in ("CLOSED", "EXPIRED"):
+                            return False  # already terminal — never reopen
+                        qty = int(row.get("qty") or 0)
+                        remaining = row.get("quantity_remaining")
+                        if remaining is None:
+                            remaining = qty
+                        remaining = int(remaining or 0)
+                        # A prior partial was applied if remaining < qty;
+                        # do not reset position quantity to OPEN original.
+                        return remaining >= qty
+
+                try:
+                    terminalized = bool(
+                        self.osm.transition(
+                            local_id, BROKER_TO_OSM.get(broker_status, "CANCELED"),
+                            last_error=f"recovery: broker_status={broker_status}",
+                        )
+                    )
+                    if not terminalized:
+                        msg = (
+                            f"RECOVERY_TERMINAL_OSM_TRANSITION_HOLD "
+                            f"local={local_id} pos={pos_id} "
+                            f"broker_status={broker_status}"
+                        )
+                        log.critical("[%s] %s", self.client_id, msg)
+                        result.setdefault("errors", []).append(msg)
+                        continue
+
+                    if _rwr(_can_reopen):
+                        def _revert(pid=pos_id):
+                            with _conn() as c:
+                                c.execute(
+                                    "UPDATE positions SET status='OPEN', "
+                                    "exit_reason=NULL, updated_ts=NOW() "
+                                    "WHERE id=%s AND client_id=%s",
+                                    (pid, self.client_id),
+                                )
+                        _rwr(_revert)
+                        log.warning(
+                            "[%s] RECOVERY: exit was canceled during downtime | "
+                            "pos=%s %s reverted to OPEN — EXIT MUST BE RETRIED",
+                            self.client_id, pos_id, underlying,
+                        )
+                        result["exits_reattached"] += 1
+                    else:
+                        log.warning(
+                            "[%s] RECOVERY: terminal cancel but position has prior "
+                            "partial or is already terminal — not reopening | "
+                            "pos=%s %s",
+                            self.client_id, pos_id, underlying,
+                        )
                 except Exception as e:
                     log.error("[%s] RECOVERY: exit revert failed: %s", self.client_id, e)
                 continue

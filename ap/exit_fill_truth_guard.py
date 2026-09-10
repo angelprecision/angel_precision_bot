@@ -13,6 +13,7 @@ from typing import Any, Iterable
 
 from ap.db import conn, run_with_retry
 from ap.logger import get_logger
+from ap.manual_close_reconciliation import parse_broker_fill_timestamp
 from ap.operator.live_execution_journal import (
     PRICE_SOURCE_PAPER_BROKER,
     PRICE_SOURCE_TRADIER_ENTRY,
@@ -33,6 +34,50 @@ _PARTIAL_RESULT_STATUSES = {
     "PARTIAL_FILL", "PARTIALLY_FILLED", "PARTIAL", "EXIT_PARTIAL_FILL",
 }
 _RECONCILIATION_STALE_ATTEMPT_LEASE = timedelta(minutes=5)
+
+
+def _metadata_dict(raw: Any) -> dict:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _is_external_exit_order(order: dict) -> bool:
+    local_order_id = str(order.get("local_order_id") or "").strip().lower()
+    if local_order_id.startswith("external-exit:"):
+        return True
+    meta = _metadata_dict(order.get("meta"))
+    return str(meta.get("external_broker_order") or "").strip().lower() == "true"
+
+
+def _is_bot_owned_exit_order(order: dict) -> bool:
+    return (
+        str(order.get("kind") or "").strip().upper() == "EXIT"
+        and bool(str(order.get("local_order_id") or "").strip())
+        and not _is_external_exit_order(order)
+    )
+
+
+def _converge_bot_owned_exit_order(order: dict):
+    """Use PR #579's one durable seam for bot-owned EXIT rows."""
+    client_id = str(order.get("client_id") or "").strip()
+    local_order_id = str(order.get("local_order_id") or "").strip()
+    mode = str(order.get("execution_mode") or "").strip().lower()
+    if not client_id or not local_order_id or mode not in {"live", "paper"}:
+        raise ReconciliationIdentityError(
+            "BOT_EXIT_IDENTITY_UNPROVEN"
+        )
+    from ap.position_manager import APPositionManager
+    return APPositionManager(client_id).converge_position_from_durable_exit_order(
+        exit_local_order_id=local_order_id,
+        expected_execution_mode=mode,
+    )
 
 
 class LifecycleProjectionError(ValueError):
@@ -690,7 +735,12 @@ def _run_reconciliation_attempt(
     attempt_count: int,
 ) -> dict:
     client_id = str(order.get("client_id") or "").strip()
-    fill_ts = result.get("filled_ts") or order.get("filled_ts") or datetime.now(timezone.utc)
+    raw_fill_ts = result.get("filled_ts") or order.get("filled_ts")
+    fill_ts = parse_broker_fill_timestamp(raw_fill_ts)
+    if fill_ts is None:
+        raise LifecycleProjectionError(
+            "EXACT_BROKER_FILL_TIMESTAMP_MISSING_OR_INVALID"
+        )
 
     def _tx() -> dict:
         with conn() as c:
@@ -899,11 +949,20 @@ def _reconcile_exit_fill(order: dict, result: dict) -> dict:
 
 
 def reconcile_confirmed_exit_fill(order: dict, result: dict) -> dict:
-    """Reconcile one already broker-confirmed EXIT fill.
-
-    This function has no broker adapter and cannot submit or cancel orders.
-    It delegates to the one canonical EXIT-fill reducer.
-    """
+    """Reconcile one already broker-confirmed EXIT fill without broker mutation."""
+    if _is_bot_owned_exit_order(order):
+        convergence = _converge_bot_owned_exit_order(order)
+        disposition = str(getattr(convergence, "disposition", "") or "")
+        if disposition not in {
+            "APPLIED_PARTIAL",
+            "APPLIED_FULL",
+            "ALREADY_APPLIED",
+        }:
+            raise LifecycleProjectionError(
+                f"BOT_EXIT_CONVERGENCE_HOLD:{disposition}:"
+                f"{getattr(convergence, 'reason', '')}"
+            )
+        return convergence
     return _reconcile_exit_fill(order, result)
 
 
@@ -934,7 +993,7 @@ def retry_exit_fill_reconciliation(*, client_id: str, local_order_id: str) -> di
             meta = {}
     marker = dict(meta.get("exit_fill_reconciliation") or {}) if isinstance(meta, dict) else {}
     status = str(marker.get("status") or "").upper()
-    if status == "RECONCILED":
+    if status == "RECONCILED" and not _is_bot_owned_exit_order(order):
         return {
             "position_id": str(marker.get("position_id") or ""),
             "already_reconciled": True,
@@ -946,6 +1005,21 @@ def retry_exit_fill_reconciliation(*, client_id: str, local_order_id: str) -> di
         "fill_price": order.get("fill_price"),
         "filled_ts": order.get("filled_ts"),
     }
+    if _is_bot_owned_exit_order(order):
+        convergence = _converge_bot_owned_exit_order(order)
+        disposition = str(getattr(convergence, "disposition", "") or "")
+        if disposition not in {
+            "APPLIED_PARTIAL",
+            "APPLIED_FULL",
+            "ALREADY_APPLIED",
+        }:
+            return None
+        return {
+            "position_id": str(getattr(convergence, "position_id", "") or ""),
+            "already_reconciled": disposition == "ALREADY_APPLIED",
+            "convergence_disposition": disposition,
+        }
+
     attempt_count = _claim_reconciliation_retry(order, result)
     if attempt_count is None:
         return None
@@ -1057,10 +1131,23 @@ def install_exit_fill_truth_guard() -> None:
 
     def guarded_sync_exit_price(order: dict, result: dict):
         try:
+            if _is_bot_owned_exit_order(order):
+                # OSM has already run the durable convergence seam before
+                # invoking this compatibility callback.  Keep this callback
+                # dashboard-only so it cannot become a second position/proof
+                # authority or bypass exact timestamp validation.
+                original = getattr(fill_monitor, _ORIGINAL_ATTR, None)
+                if callable(original):
+                    original(order, result)
+                return {
+                    "status": "DURABLE_CONVERGENCE_DELEGATED",
+                    "position_id": str(order.get("position_id") or ""),
+                }
+
             reconciled = _reconcile_exit_fill(order, result)
             projection = reconciled["projection"]
             log.info(
-                "[%s] CANONICAL_EXIT_FILL_RECONCILED position=%s exited=%s remaining=%s "
+                "[%s] CANONICAL_EXTERNAL_EXIT_RECONCILED position=%s exited=%s remaining=%s "
                 "exit_price=%.4f realized_pnl=%.2f proof_rows=%s official_live=%s",
                 order.get("client_id"), reconciled.get("position_id"),
                 projection.exited_qty, projection.remaining_qty,

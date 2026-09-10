@@ -145,6 +145,9 @@ env:
     tests/test_p0_terminal_proof_lock_postgres_concurrency.py
     tests/test_p0_queue_deferral_truth.py
     tests/test_p0_manual_rescue_restart_guard_bypass.py
+    tests/test_p0_exit_filled_position_convergence.py
+    tests/test_p0_pr579_partial_then_cancel_convergence.py
+    tests/test_p0_sept9_qqq_osm_failfirst.py
 
 jobs:
   p0-tests:
@@ -324,3 +327,200 @@ jobs:
         if: always()
         run: |
           echo "P0 merge-ref regression suite complete"
+
+
+
+  p0-rollback-failfirst:
+    # Checks out the verified pre-#579 rollback base and runs an INLINE
+    # fail-first script.  This job must NOT execute any test file introduced
+    # by #579 — those files do not exist on the rollback base.
+    # The inline script proves the production defect: EXIT_FILLED is durable
+    # but the canonical position remains OPEN on the rollback base.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: intelligence_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d intelligence_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: eb1fdefd8fb35effd1752a8a4de50147c06b066b
+
+      - name: Assert rollback base SHA
+        run: |
+          expected="eb1fdefd8fb35effd1752a8a4de50147c06b066b"
+          actual="$(git rev-parse HEAD)"
+          echo "Rollback base: $actual"
+          test "$actual" = "$expected"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install minimal test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas
+
+      - name: Apply migration
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d intelligence_test \
+            -f migrations/20260717_exit_decision_generation_claims.sql || true
+          psql -h localhost -U postgres -d intelligence_test \
+            -f migrations/20260809_exit_decision_generation_requested_qty.sql || true
+
+      - name: Run inline rollback fail-first proof
+        env:
+          PGSSLMODE: "disable"
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
+          INTELLIGENCE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
+        run: |
+          python - << 'PYEOF'
+          import os, sys
+          os.environ["DATABASE_URL"] = os.environ["INTELLIGENCE_POSTGRES_TEST_URL"]
+
+          import psycopg2, psycopg2.extras
+          from datetime import datetime, timezone
+
+          CLIENT_ID       = "jason-rollback-test@example.com"
+          POSITION_UUID   = "70360b2a-9036-4e2d-bb6b-bf8d0065f6ef"
+          REPAIR_EXIT_UUID = "9c430437-2973-4811-8776-1d353b925d9b"
+          BROKER_ORDER_ID = "145130405"
+          OCC_CONTRACT    = "QQQ261121C00510000"
+          ENTRY_TS = datetime(2026, 9, 9, 13, 30, 0, tzinfo=timezone.utc)
+          FILL_TS  = datetime(2026, 9, 9, 15, 42, 18, tzinfo=timezone.utc)
+          FILL_PRICE = 1.17
+          ENTRY_PRICE = 1.48
+
+          conn = psycopg2.connect(os.environ["DATABASE_URL"])
+          conn.autocommit = False
+          cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+          # --- Schema ---
+          cur.execute("""
+          CREATE TEMP TABLE positions (
+            id TEXT PRIMARY KEY, client_id TEXT NOT NULL,
+            execution_mode TEXT, contract TEXT, side TEXT, direction TEXT,
+            status TEXT, qty INTEGER, quantity_remaining INTEGER,
+            avg_fill NUMERIC, entry_price NUMERIC,
+            exit_price NUMERIC, realized_pnl NUMERIC, realized_pnl_pct NUMERIC,
+            entry_ts TIMESTAMPTZ, exit_ts TIMESTAMPTZ,
+            local_order_id TEXT, broker_order_id TEXT,
+            contracts_exited INTEGER, close_source TEXT,
+            close_confidence TEXT, exit_reason TEXT, updated_at TIMESTAMPTZ,
+            exit_in_flight BOOLEAN, pending_exit_qty INTEGER,
+            pending_exit_local_order_id TEXT, pending_exit_broker_order_id TEXT
+          )""")
+          cur.execute("""
+          CREATE TEMP TABLE orders (
+            local_order_id TEXT PRIMARY KEY, position_id TEXT,
+            client_id TEXT NOT NULL, execution_mode TEXT, kind TEXT,
+            status TEXT, contract TEXT, direction TEXT, qty INTEGER,
+            filled_qty INTEGER, fill_price NUMERIC, filled_ts TIMESTAMPTZ,
+            broker_order_id TEXT, meta JSONB, updated_ts TIMESTAMPTZ
+          )""")
+          cur.execute("""
+          CREATE TEMP TABLE proof_trades (
+            id TEXT PRIMARY KEY, client_email TEXT NOT NULL,
+            position_id TEXT, local_order_id TEXT, system_version TEXT,
+            exit_option_price NUMERIC, option_pnl_pct NUMERIC, win BOOLEAN,
+            broker_reconciled BOOLEAN DEFAULT FALSE
+          )""")
+
+          # --- Seed September 9 shape (broker-repair, avg_fill=NULL) ---
+          cur.execute(
+            "INSERT INTO positions (id, client_id, execution_mode, contract, side, direction, status, qty, quantity_remaining, avg_fill, entry_price, entry_ts, local_order_id, updated_at) VALUES (%s,%s,'live',%s,'CALL','CALL','OPEN',1,1,NULL,NULL,%s,'entry-order-qqq',NOW())",
+            (POSITION_UUID, CLIENT_ID, OCC_CONTRACT, ENTRY_TS)
+          )
+          cur.execute(
+            "INSERT INTO orders (local_order_id, position_id, client_id, execution_mode, kind, status, contract, direction, qty, filled_qty, fill_price, filled_ts, broker_order_id, meta, updated_ts) VALUES ('entry-order-qqq',%s,%s,'live','ENTRY','FILLED',%s,'CALL',1,1,%s,%s,'entry-broker-001','{}',NOW())",
+            (POSITION_UUID, CLIENT_ID, OCC_CONTRACT, ENTRY_PRICE, ENTRY_TS)
+          )
+          cur.execute(
+            "INSERT INTO orders (local_order_id, position_id, client_id, execution_mode, kind, status, contract, direction, qty, filled_qty, fill_price, filled_ts, broker_order_id, meta, updated_ts) VALUES (%s,%s,%s,'live','EXIT','EXIT_REQUESTED',%s,'CALL',1,NULL,NULL,NULL,%s,'{}',NOW())",
+            (REPAIR_EXIT_UUID, POSITION_UUID, CLIENT_ID, OCC_CONTRACT, BROKER_ORDER_ID)
+          )
+          conn.commit()
+
+          # --- Verify pre-condition ---
+          cur.execute("SELECT status, quantity_remaining, exit_price FROM positions WHERE id=%s", (POSITION_UUID,))
+          pos_before = dict(cur.fetchone())
+          assert pos_before["status"] == "OPEN", f"Pre-condition failed: {pos_before}"
+          assert pos_before["quantity_remaining"] == 1
+          assert pos_before["exit_price"] is None
+
+          # --- Run OSM transition (production caller path) ---
+          from ap.db import _ConnWrapper
+          import ap.db as db_mod, ap.position_manager as pm_mod, ap.order_state_machine as osm_mod
+          from contextlib import contextmanager
+
+          @contextmanager
+          def _conn():
+            cur2 = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            try:
+              yield _ConnWrapper(conn, cur2)
+              conn.commit()
+            except Exception:
+              conn.rollback()
+              raise
+            finally:
+              cur2.close()
+
+          db_mod.conn  = _conn
+          db_mod.run_with_retry  = lambda fn, **kw: fn()
+          pm_mod.conn  = _conn
+          pm_mod.run_with_retry  = lambda fn, **kw: fn()
+          osm_mod.conn = _conn
+          osm_mod.run_with_retry = lambda fn, **kw: fn()
+
+          from unittest.mock import MagicMock
+          ee = MagicMock(); ee.get_position = MagicMock(return_value=None); ee._positions = {}
+          osm_mod._get_exit_engine_for_client = lambda _: ee
+
+          from ap.order_state_machine import APOrderStateMachine
+          osm = APOrderStateMachine(CLIENT_ID)
+          ok = osm.transition(
+            REPAIR_EXIT_UUID, "EXIT_FILLED",
+            filled_qty=1, fill_price=FILL_PRICE,
+            broker_order_id=BROKER_ORDER_ID, filled_ts=FILL_TS,
+          )
+
+          # --- Fail-first assertion: position must still be OPEN ---
+          cur.execute("SELECT status, quantity_remaining, exit_price FROM positions WHERE id=%s", (POSITION_UUID,))
+          pos_after = dict(cur.fetchone())
+          print(f"Position after OSM transition: {pos_after}")
+
+          if pos_after["status"] == "CLOSED" and pos_after["quantity_remaining"] == 0:
+            print("FAIL-FIRST: Position was unexpectedly CLOSED on rollback base.")
+            print("This means the rollback base already has the fix — check the checkout SHA.")
+            sys.exit(1)
+
+          # On rollback base, position should remain OPEN (the defect we're proving)
+          assert pos_after["status"] == "OPEN", (
+            f"FAIL-FIRST PASSED: Position correctly remains OPEN on rollback base. "
+            f"Got status={pos_after['status']!r} — this is the expected defect behavior."
+            if pos_after["status"] == "OPEN" else
+            f"Unexpected status {pos_after['status']!r} on rollback base."
+          )
+          print(f"PASS: Position remains OPEN on rollback base (defect confirmed). status={pos_after['status']!r}")
+          PYEOF
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "Rollback fail-first complete."
+          echo "Expected: position remains OPEN on pre-#579 base (defect confirmed)."
