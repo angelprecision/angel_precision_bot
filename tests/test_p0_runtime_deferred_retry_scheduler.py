@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
+import time
 import types
 from unittest.mock import MagicMock
 
@@ -213,6 +215,37 @@ def test_runtime_scheduler_survives_one_tick_failure(monkeypatch):
     assert not runner.deferred_recovery_thread.is_alive()
     assert tick.call_count == 2
     assert runner.deferred_recovery_errors == 1
+
+
+def test_runtime_scheduler_serializes_a_slow_tick_without_overlap(monkeypatch):
+    """A slow due-retry scan cannot stack a second scan on the same runner."""
+    runner = _runner()
+    runner.stopped = threading.Event()
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def slow_tick():
+        calls.append("start")
+        started.set()
+        release.wait(timeout=3)
+        calls.append("finish")
+
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", slow_tick)
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "1")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    assert started.wait(timeout=2)
+    time.sleep(0.1)
+    assert calls == ["start"]
+
+    release.set()
+    runner.stopped.set()
+    runner.deferred_recovery_thread.join(timeout=2)
+    assert not runner.deferred_recovery_thread.is_alive()
+    assert calls == ["start", "finish"]
 
 
 @pytest.mark.parametrize(

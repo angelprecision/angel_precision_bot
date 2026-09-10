@@ -81,7 +81,12 @@ class _MockOSM:
             "execution_mode": "paper",
         }
 
-    def update_order_meta(self, local_order_id: str, meta_patch: dict) -> bool:
+    def update_order_meta(
+        self,
+        local_order_id: str,
+        meta_patch: dict,
+        **_expected,
+    ) -> bool:
         self.meta_writes.append((local_order_id, dict(meta_patch)))
         self._ensure(local_order_id)
         self._row_meta[local_order_id].update(meta_patch)
@@ -254,12 +259,12 @@ class TestPreBreachStopActivationPut:
         events: list[str] = []
         osm_write_orig = osm.update_order_meta
 
-        def _tracing_meta_write(oid: str, patch: dict) -> bool:
+        def _tracing_meta_write(oid: str, patch: dict, **expected) -> bool:
             # Only mark ordering on the trigger-timestamp write; later
             # audit writes are noise for this ordering assertion.
             if "trigger_crossed_at" in patch:
                 events.append("meta_write")
-            return osm_write_orig(oid, patch)
+            return osm_write_orig(oid, patch, **expected)
         osm.update_order_meta = _tracing_meta_write  # type: ignore[assignment]
 
         def _on_trigger(ws: WatchedSignal):
@@ -658,7 +663,7 @@ def test_live_timestamp_persistence_retry_requires_durable_write_before_callback
     persist_attempts: list[dict] = []
     fail_persistence = True
 
-    def _meta_write(oid, patch):
+    def _meta_write(oid, patch, **_expected):
         nonlocal fail_persistence
         osm.meta_writes.append((oid, dict(patch)))
         persist_attempts.append(dict(patch))

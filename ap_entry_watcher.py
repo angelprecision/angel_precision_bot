@@ -140,12 +140,44 @@ def _parse_trigger_crossed_at(raw) -> Optional[datetime]:
 
 
 def _coerce_materialization_generation(raw) -> Optional[int]:
-    try:
-        if raw is None or raw == "":
-            return None
-        return int(raw)
-    except (TypeError, ValueError):
+    # Durable materialization generations are PostgreSQL/JSON numeric values.
+    # Do not coerce strings, floats, or booleans into lifecycle authority.
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
         return None
+    return raw
+
+
+def _expected_materialization_generation(signal: dict) -> tuple[bool, int | None]:
+    """Resolve an optional exact generation from the signal and its metadata.
+
+    A normal queue watcher has no generation.  A deferred-materialization
+    watcher carries one in both sources; if either source is present it must
+    be an exact positive integer and both sources must agree.  ``False``
+    distinguishes malformed/contradictory supplied data from an absent
+    generation so the caller can fail closed.
+    """
+    sources = [signal]
+    metadata = signal.get("metadata")
+    if metadata is not None:
+        if not isinstance(metadata, dict):
+            return False, None
+        sources.append(metadata)
+
+    generations = []
+    for source in sources:
+        if "materialization_generation" not in source:
+            continue
+        raw = source.get("materialization_generation")
+        if raw is None:
+            continue
+        generation = _coerce_materialization_generation(raw)
+        if generation is None:
+            return False, None
+        generations.append(generation)
+
+    if len(set(generations)) > 1:
+        return False, None
+    return True, (generations[0] if generations else None)
 
 
 def _build_trigger_crossed_at_provenance(
@@ -160,37 +192,85 @@ def _build_trigger_crossed_at_provenance(
     ordinary queue-created watchers either fabricate a generation or fail
     recovery for a lifecycle that never had one.
     """
-    metadata = signal.get("metadata") or {}
-    if not isinstance(metadata, dict):
-        metadata = {}
-    raw_signal_id = str(
-        signal.get("signal_id") or metadata.get("signal_id") or ""
-    ).strip()
-    canonical_signal_id = str(
-        signal.get("canonical_signal_id")
-        or metadata.get("canonical_signal_id")
-        or ""
-    ).strip()
-    if not canonical_signal_id:
+    def _metadata_dict(raw_metadata):
+        if raw_metadata is None or raw_metadata == {}:
+            return {}
+        return dict(raw_metadata) if isinstance(raw_metadata, dict) else None
+
+    def _values(source, names, *, lower=False):
+        values = []
+        for name in names:
+            raw = source.get(name)
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                continue
+            if not isinstance(raw, str):
+                return None
+            value = raw.strip().lower() if lower else raw.strip()
+            if value:
+                values.append(value)
+        return values
+
+    metadata = _metadata_dict(signal.get("metadata"))
+    if metadata is None:
+        return {
+            "canonical_signal_id": "",
+            "client_id": "",
+            "execution_mode": "",
+            "local_order_id": "",
+        }
+
+    def _resolve(names, *, lower=False):
+        signal_values = _values(signal, names, lower=lower)
+        metadata_values = _values(metadata, names, lower=lower)
+        if signal_values is None or metadata_values is None:
+            return None
+        values = signal_values + metadata_values
+        if len(set(values)) > 1:
+            return None
+        return values[0] if values else ""
+
+    raw_signal_id = _resolve(("signal_id",))
+    canonical_signal_id = _resolve(("canonical_signal_id",))
+    client_id = _resolve(("client_id", "client_email"), lower=True)
+    execution_mode = _resolve(("execution_mode",), lower=True)
+    signal_local_order_id = _resolve(("local_order_id",))
+    supplied_local_order_id = (
+        str(local_order_id).strip() if isinstance(local_order_id, str) else ""
+    )
+    if (
+        signal_local_order_id is None
+        or supplied_local_order_id
+        and signal_local_order_id
+        and supplied_local_order_id != signal_local_order_id
+    ):
+        signal_local_order_id = None
+    elif not signal_local_order_id:
+        signal_local_order_id = supplied_local_order_id
+
+    if None in (
+        raw_signal_id,
+        canonical_signal_id,
+        client_id,
+        execution_mode,
+        signal_local_order_id,
+    ):
+        return {
+            "canonical_signal_id": "",
+            "client_id": "",
+            "execution_mode": "",
+            "local_order_id": "",
+        }
+    if not canonical_signal_id and raw_signal_id:
         # Ordinary queue and deferred-rescue plans do not carry a separate
         # canonical field.  Use the same authority as OSM instead of storing
         # a REEVAL:<uuid>:<suffix> as durable lifecycle evidence.
         canonical_signal_id = build_canonical_signal_id(raw_signal_id)
+
     return {
         "canonical_signal_id": canonical_signal_id,
-        "client_id": str(
-            signal.get("client_id")
-            or signal.get("client_email")
-            or metadata.get("client_id")
-            or metadata.get("client_email")
-            or ""
-        ).strip().lower(),
-        "execution_mode": str(
-            signal.get("execution_mode") or metadata.get("execution_mode") or ""
-        ).strip().lower(),
-        "local_order_id": str(
-            local_order_id or signal.get("local_order_id") or ""
-        ).strip(),
+        "client_id": client_id,
+        "execution_mode": execution_mode,
+        "local_order_id": signal_local_order_id,
     }
 
 
@@ -212,14 +292,14 @@ def _trigger_crossed_at_provenance_matches(
     if (
         not expected["canonical_signal_id"]
         or not expected["client_id"]
-        or not expected["execution_mode"]
+        or expected["execution_mode"] not in {"live", "paper"}
         or not expected["local_order_id"]
     ):
         return False
     if (
         not actual["canonical_signal_id"]
         or not actual["client_id"]
-        or not actual["execution_mode"]
+        or actual["execution_mode"] not in {"live", "paper"}
         or not actual["local_order_id"]
     ):
         return False
@@ -5520,21 +5600,14 @@ class APEntryWatcher:
     ) -> bool:
         """Persist trigger authority before any downstream destructive action.
 
+        Every NEW confirmation uses the same exact-identity, pending-row CAS.
         Direction claims may cancel an opposite pending lifecycle immediately
-        after this write.  Those claims therefore use the optional
-        ``require_pending_row`` fence so the metadata write is conditional on
-        the durable row still being ``PENDING_TRIGGER``.  Ordinary callback
-        persistence keeps the historical two-argument merge semantics.
+        after this write, so they retain the same fence and perform an
+        additional durable reread in the package watcher.  The timestamp and
+        its four-field provenance are supplied in one JSONB patch; a failed or
+        losing CAS writes neither as new evidence.  A callback retry re-CASes
+        the existing evidence before downstream execution.
         """
-        # Ordinary callback retries are idempotent after the first durable
-        # write.  Direction-claim retries must still execute the identity CAS
-        # before another destructive loser-cancellation attempt.
-        if (
-            getattr(watched, "_trigger_authority_persisted", False)
-            and not require_pending_row
-        ):
-            return True
-
         signal = getattr(watched, "signal", {}) or {}
         local_order_id = str(signal.get("local_order_id") or "").strip()
         trigger_crossed_at = getattr(watched, "trigger_crossed_at", None)
@@ -5542,15 +5615,29 @@ class APEntryWatcher:
         if not local_order_id or trigger_crossed_at is None or not callable(update_order_meta):
             return False
 
+        trigger_crossed_dt = _parse_trigger_crossed_at(trigger_crossed_at)
+        provenance = _build_trigger_crossed_at_provenance(signal, local_order_id)
+        if (
+            trigger_crossed_dt is None
+            or not _trigger_crossed_at_provenance_matches(
+                provenance, signal, local_order_id
+            )
+        ):
+            log.critical(
+                "%s | refusing new trigger authority with incomplete or "
+                "contradictory lifecycle identity local_order_id=%s",
+                RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+                local_order_id or "?",
+            )
+            return False
+
+        raw_signal_id = str(signal.get("signal_id") or "").strip()
+        if not raw_signal_id:
+            return False
+
         patch = {
-            "trigger_crossed_at": (
-                trigger_crossed_at.isoformat()
-                if hasattr(trigger_crossed_at, "isoformat")
-                else str(trigger_crossed_at)
-            ),
-            "trigger_crossed_at_provenance": _build_trigger_crossed_at_provenance(
-                signal, local_order_id
-            ),
+            "trigger_crossed_at": trigger_crossed_dt.isoformat(),
+            "trigger_crossed_at_provenance": provenance,
             "trigger_confirmed_at": datetime.now(timezone.utc).isoformat(),
         }
         try:
@@ -5563,19 +5650,62 @@ class APEntryWatcher:
         if first_ask:
             patch["first_breach_ask"] = first_ask
 
+        _expected_mode = str(
+            expected_execution_mode or provenance["execution_mode"] or ""
+        ).strip().lower()
+        if _expected_mode not in {"live", "paper"}:
+            return False
+        _expected_signal_id = str(expected_signal_id or raw_signal_id).strip()
+        if _expected_signal_id != raw_signal_id:
+            return False
+        _generation_ok, _expected_generation = _expected_materialization_generation(
+            signal
+        )
+        if not _generation_ok:
+            log.critical(
+                "%s | refusing trigger authority with malformed or contradictory "
+                "materialization generation local_order_id=%s",
+                RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+                local_order_id or "?",
+            )
+            return False
+        _update_kwargs = {
+            "expected_status": "PENDING_TRIGGER",
+            "expected_execution_mode": _expected_mode,
+            "expected_signal_id": _expected_signal_id,
+            "expected_canonical_signal_id": provenance[
+                "canonical_signal_id"
+            ],
+        }
+        if getattr(watched, "_trigger_authority_persisted", False):
+            # Every callback retry must re-CAS the already persisted authority
+            # before downstream execution.  A changed durable row, broker
+            # evidence, or lost ownership therefore remains fail-closed.
+            patch = {
+                "trigger_crossed_at": patch["trigger_crossed_at"],
+                "trigger_crossed_at_provenance": patch[
+                    "trigger_crossed_at_provenance"
+                ],
+            }
+            _update_kwargs["expected_existing_trigger_authority"] = True
+        else:
+            _update_kwargs["expected_new_trigger_authority"] = True
+        if _expected_generation is not None:
+            _update_kwargs["expected_materialization_generation"] = (
+                _expected_generation
+            )
         try:
-            if require_pending_row:
-                persisted = bool(
-                    update_order_meta(
-                        local_order_id,
-                        patch,
-                        expected_status="PENDING_TRIGGER",
-                        expected_execution_mode=expected_execution_mode,
-                        expected_signal_id=expected_signal_id,
-                    )
+            # ``expected_status``/identity predicates are the durable authority
+            # even for ordinary callback persistence.  ``update_order_meta``
+            # performs one PostgreSQL UPDATE, so a race cannot leave a
+            # timestamp-only confirmation behind.
+            persisted = bool(
+                update_order_meta(
+                    local_order_id,
+                    patch,
+                    **_update_kwargs,
                 )
-            else:
-                persisted = bool(update_order_meta(local_order_id, patch))
+            )
             if not persisted:
                 return False
         except Exception:
@@ -5592,7 +5722,7 @@ class APEntryWatcher:
             "trigger_crossed_at=%s trigger_confirmed_at=%s",
             local_order_id,
             patch["trigger_crossed_at"],
-            patch["trigger_confirmed_at"],
+            patch.get("trigger_confirmed_at", "existing-authority"),
         )
         return True
 
@@ -5735,29 +5865,11 @@ class APEntryWatcher:
                     ).strip()
                     _ts_pre_write_ok = self._persist_trigger_confirmation_authority(w)
                     if not _ts_pre_write_ok:
-                        _is_live_ts = self._is_live_runtime()
-                        if _is_live_ts:
-                            log.critical(
-                                "[%s] WATCHER_TRIGGER_TIMESTAMP_PERSIST_FAILED — "
-                                "LIVE mode, trigger timestamps could not be written "
-                                "to orders.meta before on_trigger; callback is "
-                                "skipped and persistence will be retried. "
-                                "local_order_id=%s",
-                                w.ticker, _ts_pre_local_oid or "?",
-                            )
-                        else:
-                            log.debug(
-                                "[%s] trigger timestamp pre-persist non-critical "
-                                "local_order_id=%s",
-                                w.ticker, _ts_pre_local_oid or "?",
-                            )
-
-                    if (
-                        self._is_live_runtime()
-                        and not _ts_pre_write_ok
-                    ):
-                        # Database truth is unavailable.  Keep the watcher as the
-                        # active owner and never enter selector/broker work.
+                        # Database truth is unavailable or the exact lifecycle
+                        # CAS lost.  Keep the watcher as the active owner and
+                        # never enter selector/materializer/broker work in any
+                        # execution mode; a confirmed trigger without complete
+                        # durable identity is not safe evidence.
                         with self._lock:
                             w.state = WatchState.PENDING
                             w.deferred_retry_not_before = (
@@ -5765,8 +5877,8 @@ class APEntryWatcher:
                             )
                         log.critical(
                             "WATCHER_TRIGGER_PERSISTENCE_RETRY "
-                            "ticker=%s local_order_id=%s kept_in_pending=true",
-                            w.ticker, _ts_pre_local_oid or "?",
+                            "ticker=%s local_order_id=%s mode=%s kept_in_pending=true",
+                            w.ticker, _ts_pre_local_oid or "?", self.mode,
                         )
                         continue
 

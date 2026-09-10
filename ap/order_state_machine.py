@@ -2225,6 +2225,10 @@ class APOrderStateMachine:
         expected_status: str | None = None,
         expected_execution_mode: str | None = None,
         expected_signal_id: str | None = None,
+        expected_canonical_signal_id: str | None = None,
+        expected_new_trigger_authority: bool = False,
+        expected_existing_trigger_authority: bool = False,
+        expected_materialization_generation: int | None = None,
     ) -> bool:
         """Merge *meta_patch* into orders.meta using a safe JSONB || merge.
 
@@ -2238,11 +2242,17 @@ class APOrderStateMachine:
         handled safely without raising.
 
         ``expected_status`` optionally adds a lifecycle CAS predicate.  The
-        optional execution-mode and signal-id predicates are used together by
-        confirmed-direction claims, which must not authorize opposite
-        cancellation if the proven winner identity changes between the read
-        and the metadata write.  Ordinary callers retain the historical
+        optional execution-mode, signal-id, and canonical-signal-id predicates
+        are used together by confirmed-trigger claims, which must not authorize
+        execution if the proven lifecycle identity changes between the read and
+        the metadata write.  Ordinary callers retain the historical
         local-order/client scoped merge semantics.
+
+        ``expected_new_trigger_authority`` reserves a row with no prior
+        trigger evidence.  ``expected_existing_trigger_authority`` is the
+        idempotent retry fence: it requires the exact timestamp and
+        provenance already supplied in *meta_patch*, so a changed or repaired
+        row cannot be reasserted by a direction-claim retry.
 
         Returns True only when Postgres confirms rowcount > 0 (the row exists
         and was updated).  Returns False on not-found, CAS miss, or write error;
@@ -2252,6 +2262,14 @@ class APOrderStateMachine:
         try:
             _patch_json = _json_local.dumps(meta_patch, default=str)
         except Exception:
+            return False
+        if expected_materialization_generation is not None and (
+            isinstance(expected_materialization_generation, bool)
+            or not isinstance(expected_materialization_generation, int)
+            or expected_materialization_generation < 1
+        ):
+            return False
+        if expected_new_trigger_authority and expected_existing_trigger_authority:
             return False
 
         def _fn():
@@ -2272,6 +2290,83 @@ class APOrderStateMachine:
                 if expected_signal_id is not None:
                     _sql += " AND COALESCE(signal_id, '') = %s"
                     _params.append(str(expected_signal_id).strip())
+                if expected_canonical_signal_id is not None:
+                    _sql += (
+                        " AND COALESCE(NULLIF(canonical_signal_id, ''), "
+                        "NULLIF(meta->>'canonical_signal_id', ''), '') = %s"
+                    )
+                    _params.append(str(expected_canonical_signal_id).strip())
+                    # A contradictory top-level/JSONB canonical identity is
+                    # never a valid lifecycle.  Keep the same UPDATE atomic
+                    # and fail closed instead of selecting one source.
+                    _sql += (
+                        " AND (NULLIF(canonical_signal_id, '') IS NULL "
+                        "OR NULLIF(meta->>'canonical_signal_id', '') IS NULL "
+                        "OR NULLIF(canonical_signal_id, '') = "
+                        "NULLIF(meta->>'canonical_signal_id', ''))"
+                    )
+                if expected_new_trigger_authority:
+                    # Never repair or overwrite legacy timestamp-only state
+                    # from the live watcher seam.  Such rows remain for the
+                    # existing recovery identity guard to HOLD.  Broker
+                    # evidence likewise makes this a stale/changed row, not a
+                    # new trigger-confirmation authority.
+                    _sql += (
+                        " AND NOT (COALESCE(meta, '{}'::jsonb) ? "
+                        "'trigger_crossed_at')"
+                        " AND NOT (COALESCE(meta, '{}'::jsonb) ? "
+                        "'trigger_crossed_at_provenance')"
+                        " AND COALESCE(broker_order_id, '') = ''"
+                        " AND submitted_ts IS NULL"
+                        " AND NULLIF(COALESCE(meta->>'submit_intent_at', ''), '') IS NULL"
+                        " AND LOWER(COALESCE(meta->>'broker_ready', 'false')) IN ('false', '')"
+                    )
+                if expected_existing_trigger_authority:
+                    existing_provenance = (
+                        meta_patch.get("trigger_crossed_at_provenance")
+                        if isinstance(meta_patch, dict)
+                        else None
+                    )
+                    existing_crossed_at = (
+                        meta_patch.get("trigger_crossed_at")
+                        if isinstance(meta_patch, dict)
+                        else None
+                    )
+                    if (
+                        not isinstance(existing_provenance, dict)
+                        or not isinstance(existing_crossed_at, str)
+                        or not existing_crossed_at.strip()
+                    ):
+                        return False
+                    try:
+                        existing_provenance_json = _json_local.dumps(
+                            existing_provenance, sort_keys=True
+                        )
+                    except Exception:
+                        return False
+                    _sql += (
+                        " AND (COALESCE(meta, '{}'::jsonb) ? "
+                        "'trigger_crossed_at')"
+                        " AND (COALESCE(meta, '{}'::jsonb) ? "
+                        "'trigger_crossed_at_provenance')"
+                        " AND meta->>'trigger_crossed_at' = %s"
+                        " AND meta->'trigger_crossed_at_provenance' = %s::jsonb"
+                        " AND COALESCE(broker_order_id, '') = ''"
+                        " AND submitted_ts IS NULL"
+                        " AND NULLIF(COALESCE(meta->>'submit_intent_at', ''), '') IS NULL"
+                        " AND LOWER(COALESCE(meta->>'broker_ready', 'false')) IN ('false', '')"
+                    )
+                    _params.extend([
+                        existing_crossed_at.strip(),
+                        existing_provenance_json,
+                    ])
+                if expected_materialization_generation is not None:
+                    _sql += (
+                        " AND jsonb_typeof(COALESCE(meta, '{}'::jsonb)->"
+                        "'materialization_generation') = 'number'"
+                        " AND meta->>'materialization_generation' = %s"
+                    )
+                    _params.append(str(int(expected_materialization_generation)))
                 cur = c.execute(_sql, tuple(_params))
                 # psycopg2: execute() returns the cursor; rowcount is on the cursor.
                 # Never use `or 1` fallback — rowcount=0 means row not found.

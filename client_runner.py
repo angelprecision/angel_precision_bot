@@ -2748,10 +2748,9 @@ class ClientRunner(threading.Thread):
     def _start_deferred_breach_lifecycle_scheduler(self):
         """Start the independent runtime consumer for due deferred retries.
 
-        Startup recovery is deliberately one-shot.  This daemon is the
-        uninterrupted-run consumer for rows that become due later.  Durable
-        CAS in the canonical recovery/execution path remains the authority;
-        this thread is only a timer and caller boundary.
+        Startup and health-loop progress are not liveness prerequisites for a
+        later due retry.  Durable CAS in the canonical recovery/execution path
+        remains the authority; this thread is only a timer and caller boundary.
         """
         if self.stopping.is_set() or self.stopped.is_set() or self.failed.is_set():
             return

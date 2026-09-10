@@ -1,12 +1,18 @@
-# P0 SPEC — Runtime scheduler for due deferred materialization retries
+# P0 SPEC — Runtime retry resilience and confirmed-trigger provenance
 
-**Status:** SPEC ONLY / DRAFT / HARD HOLD / DO NOT MERGE / DO NOT DEPLOY
+**Status:** AMENDED IN PLACE / DRAFT / HARD HOLD / DO NOT MERGE / DO NOT DEPLOY
 
 **Base:** `main@d404df34e00522ba2cce995b6a0129ba39b83944`
 
 ## Why this PR exists
 
-Production on 2026-09-09 proves the deferred-materialization retry system can correctly persist retry authority but still fail to execute that retry when it becomes due during the trading session.
+The original #603 causal hypothesis is disproven and is not the explanation for
+the 2026-09-09 CCEP outcome.  Production logs show the existing ClientRunner
+health-loop recovery was already invoking the canonical deferred-retry recovery
+path repeatedly and was consuming other due work.
+
+The actual CCEP failure was a confirmed-trigger lifecycle with
+`trigger_crossed_at` persisted while `trigger_crossed_at_provenance` was NULL:
 
 Current LIVE Jason evidence from Supabase:
 
@@ -32,7 +38,19 @@ broker_order_id: null
 submitted_ts: null
 ```
 
-The row remained `RETRY_PENDING` after its retry timestamp was due.
+Recovery correctly refused that row with
+`RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN`; the recovery fence must not be
+weakened and the row must not be backfilled from runner, ticker, or environment
+context.
+
+This amendment therefore has two narrowly separated purposes:
+
+1. retain the runtime scheduler as a resilience/failure-isolation improvement
+   whose contract is that deferred retry invocation must not depend on
+   continued health-loop progress; and
+2. close the actual new-confirmation writer gap so `trigger_crossed_at` and its
+   complete lifecycle provenance are written atomically under the same durable
+   CAS authority.
 
 This is not a selector-quality issue and is not permission to weaken spread, OI, volume, delta, DTE, moneyness, score, sizing, capacity, account, or risk gates.
 
@@ -52,27 +70,46 @@ APStartupRecovery._recover_deferred_breach_lifecycles()
 
 Production-shaped replay has already shown that this path can execute successfully on current main when invoked. Therefore this PR must **not** create a second retry executor.
 
-The missing production capability is runtime invocation after startup/morning recovery has already completed.
+The retained runtime seam is a resilience improvement: deferred retry
+invocation must not depend on continued health-loop progress after startup and
+morning recovery have completed. It is not a claim that current main had no
+runtime caller and it is not the CCEP root-cause fix.
 
 ## Root failure class
 
-The canonical executor is wired into startup/morning recovery, but a retry can be created later in the session and become due after those one-shot recovery phases have passed.
-
-Failure sequence:
+The CCEP incident is a confirmed-trigger provenance failure, not proof that the
+runtime scheduler was absent.  The causal sequence is:
 
 ```text
-runner starts
--> startup recovery executes
--> later, watcher confirms breach
--> selector/materialization attempt returns retryable outcome
--> durable RETRY_WAIT / RETRY_PENDING is persisted
--> next_retry_at becomes due
--> no runtime consumer invokes the canonical due-retry executor
--> order monitor may observe/classify the row, but does not own retry execution
--> row remains RETRY_PENDING indefinitely
+watcher confirms breach
+-> trigger_crossed_at is durable without complete provenance
+-> canonical recovery reads the row
+-> RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+-> recovery correctly refuses selector/materializer/broker work
 ```
 
-This PR must solve only the missing runtime scheduling/invocation seam.
+The retained scheduler addresses a separate operational resilience boundary:
+deferred retry invocation must not depend on continued health-loop progress.
+It schedules the existing canonical executor and does not claim that current
+main had no runtime caller or that the scheduler fixes the CCEP incident.
+
+The new-confirmation writer must fail closed on malformed or contradictory
+identity, stale lifecycle/CAS state, and any pre-existing timestamp-only row.
+The timestamp and the four-field provenance must be one JSONB mutation; there
+must be no timestamp-only commit and no separate repair commit.
+
+Failure sequence for the corrected writer:
+
+```text
+watcher confirms breach
+-> exact signal/order identity is validated
+-> one pending-row identity CAS writes timestamp + provenance together
+-> callback may proceed only after the CAS wins
+-> any failure/identity conflict leaves new confirmation evidence unwritten
+```
+
+The scheduler remains a timing/caller seam only.  It must not become a second
+retry executor or order-monitor authority.
 
 ## Binding invariant
 
@@ -162,14 +199,17 @@ Do NOT:
 
 Target the smallest possible production diff.
 
-Preferred production files:
+Production files changed by this amendment:
 
 ```text
 client_runner.py
-ap_recovery.py   # only if a narrow public runtime entry point is required
+ap_entry_watcher.py
+ap/order_state_machine.py
 ```
 
-No other production file should change without fail-first proof that the runtime scheduler cannot be implemented safely inside this boundary.
+The watcher file is the exact confirmed-breach writer; the OSM file supplies
+the same-transaction identity/lifecycle CAS used by that writer.  No recovery,
+selector, broker, monitor, readiness, or risk-policy authority is added.
 
 If any additional production file is changed, the PR description must explain exactly why, with caller-to-side-effect trace.
 
@@ -192,11 +232,16 @@ Requirements:
 
 Prefer a narrow due-retry tick over re-running full startup recovery repeatedly.
 
-## Fail-first production replay
+## Fail-first corrected-writer replay
 
-Before implementing the fix, add a production-shaped test that fails on committed main.
+Before this amendment, the real watcher dispatch path accepted a signal whose
+top-level and metadata identity disagreed, selected one source, and reached the
+callback; it also had no durable predicate preventing a new write from
+repairing timestamp-only legacy state. The amendment test must drive the real
+`WatchedSignal.check()` -> dispatch path and prove the committed-main behavior
+before the correction would have allowed that unsafe write.
 
-Seed the exact current LIVE CCEP shape:
+The exact current LIVE CCEP shape remains the incident control:
 
 ```text
 client_id = jasoncosby1@gmail.com
@@ -218,12 +263,15 @@ submitted_ts = null
 
 The test must prove:
 
-1. runner startup recovery has already completed;
-2. the retry becomes due during runtime without restarting the runner;
-3. committed main leaves the row unchanged because no runtime consumer invokes the canonical executor;
-4. after the implementation, the runtime tick invokes the existing canonical due-retry path;
-5. exactly one selector/materialization attempt occurs;
-6. the row advances to a canonical outcome.
+1. CCEP is refused by the existing identity guard and is not backfilled from
+   runner context;
+2. a NEW confirmed breach writes `trigger_crossed_at` and complete provenance
+   in one OSM JSONB mutation;
+3. malformed/contradictory identity and mutation/CAS failure produce no new
+   timestamp-only evidence and do not reach the callback;
+4. a legacy timestamp-only row remains unchanged;
+5. the separate runtime scheduler still invokes the existing canonical due-
+   retry path after startup without directly calling the executor.
 
 Do not hand-call `resume_deferred_materialization_retry()` in the positive runtime-scheduler test. The test must begin at the actual runtime scheduler/caller added by this PR.
 
@@ -405,7 +453,7 @@ Do not satisfy this PR with source inspection or stitched mocks alone.
 
 Required behavioral layers:
 
-1. real PostgreSQL fail-first runtime scheduler replay;
+1. real PostgreSQL confirmed-writer atomic/CAS gate, including competing workers and rollback-before-commit;
 2. real ClientRunner/runtime-caller boundary;
 3. existing APStartupRecovery due-retry consumer;
 4. existing durable OSM CAS;
@@ -483,7 +531,7 @@ Specifically audit for:
 
 ### #596
 
-Do not merge/rebase old #596 wholesale. It contains a broader historical implementation against an older main. This PR extracts only the still-proven missing production capability: recurring runtime invocation of the already-existing canonical executor.
+Do not merge/rebase old #596 wholesale. It contains a broader historical implementation against an older main. This PR retains only the resilience capability: recurring runtime invocation of the already-existing canonical executor, without claiming it caused or repairs the CCEP provenance incident.
 
 ### #602
 
@@ -499,12 +547,14 @@ Keep their ownership boundaries intact. This PR must not absorb watcher restorat
 
 **HARD HOLD / DO NOT MERGE / DO NOT DEPLOY** until:
 
-1. committed-main fail-first proves the CCEP runtime scheduling gap;
-2. implementation fixes it through the real ClientRunner runtime caller;
-3. exact CCEP LIVE replay passes without runner restart;
-4. LIVE MO and PAPER MMM runtime replays pass;
-5. startup/runtime and watcher/runtime races prove exactly one durable winner;
-6. crash/restart replay proves no duplicate selector/broker side effect;
+1. committed-main fail-first proves the unsafe confirmed-trigger writer shape;
+2. the exact CCEP LIVE row remains correctly held by the existing identity
+   guard, with no runner-context backfill;
+3. the real watcher writer persists new timestamp + provenance atomically;
+4. the runtime scheduler resilience tests and LIVE MO/PAPER MMM/WFC controls
+   pass without a second executor;
+5. writer CAS and scheduler/runtime races prove exactly one durable winner;
+6. crash/transaction tests prove no timestamp-only commit;
 7. exact-head and merge-ref P0 are green;
 8. independent backwards audit finds no silent regression;
 9. user explicitly authorizes merge.
@@ -515,9 +565,11 @@ Green CI alone is not merge permission.
 
 Implement this spec narrowly on the existing branch/PR.
 
-Start with fail-first tests on committed main. Do not edit production code until the fail-first runtime-scheduler replay demonstrates that a due retry created after startup remains stranded.
-
-Then implement the smallest possible runtime scheduling seam, preferably in `ClientRunner`, that periodically invokes the existing canonical deferred due-retry recovery entry point.
+The amendment keeps the smallest possible `ClientRunner` runtime scheduling
+seam, which periodically invokes the existing canonical deferred due-retry
+recovery entry point. It also hardens the exact watcher confirmation writer and
+its OSM identity/CAS boundary after the CCEP audit disproved the original
+causal hypothesis.
 
 Do not add retry business logic to the scheduler. Do not move retry authority into order monitor. Do not redesign materialization. Do not change selector policy. Do not change broker submission behavior.
 
@@ -527,7 +579,8 @@ When complete, report:
 - exact head SHA;
 - exact production files changed;
 - why each production line changed;
-- fail-first evidence on committed main;
+- fail-first evidence for the unsafe writer shape on committed main;
+- exact CCEP LIVE provenance HOLD result;
 - CCEP LIVE runtime replay result;
 - MO LIVE runtime replay result;
 - MMM PAPER runtime replay result;
