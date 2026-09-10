@@ -2890,7 +2890,13 @@ class ClientRunner(threading.Thread):
                             self.deferred_recovery_successful_ticks = getattr(
                                 self, "deferred_recovery_successful_ticks", 0
                             ) + 1
-                            self._clear_deferred_recovery_scheduler_health_reasons()
+                            self._clear_deferred_recovery_scheduler_health_reasons(
+                                recovery_succeeded=(
+                                    isinstance(_outcome, dict)
+                                    and not _outcome.get("errors")
+                                    and not _infrastructure_errors
+                                )
+                            )
                     except Exception as exc:
                         # The tick already has its own boundary.  Keep this outer
                         # guard so a future refactor cannot silently kill liveness.
@@ -2988,8 +2994,17 @@ class ClientRunner(threading.Thread):
                 _reason.upper(),
             )
 
-    def _clear_deferred_recovery_scheduler_health_reasons(self) -> None:
-        """Clear scheduler health telemetry after liveness is proven again."""
+    def _clear_deferred_recovery_scheduler_health_reasons(
+        self,
+        *,
+        recovery_succeeded: bool = False,
+    ) -> None:
+        """Clear scheduler health telemetry after liveness is proven again.
+
+        ``recovery_succeeded`` is deliberately separate from liveness.  The
+        permission health check can prove a live, ready, non-stale thread, but
+        only a clean canonical recovery tick may heal a startup recovery hold.
+        """
         _health_reasons = getattr(
             self, "deferred_recovery_scheduler_health_reasons", None
         )
@@ -3022,6 +3037,8 @@ class ClientRunner(threading.Thread):
             "deferred_recovery_scheduler_recovery_failed",
             "deferred_recovery_scheduler_stale",
         }
+        if recovery_succeeded:
+            _keys.add("startup_deferred_recovery_failed")
         _lock = _health_lock
 
         def _clear() -> bool:

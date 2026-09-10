@@ -279,6 +279,10 @@ def test_runtime_recovery_boundary_exception_is_infrastructure_failure(monkeypat
 def test_row_level_recovery_errors_do_not_mark_scheduler_unhealthy(monkeypatch):
     """An executed pass may report bad rows without losing executor health."""
     runner = _runner()
+    runner.degraded.set()
+    runner.degraded_reasons.add(
+        "startup_deferred_recovery_failed:prior_transient_failure"
+    )
     runner.stopped = _TickThenStopEvent()
     runner.stopping = threading.Event()
     runner.failed = threading.Event()
@@ -302,6 +306,11 @@ def test_row_level_recovery_errors_do_not_mark_scheduler_unhealthy(monkeypatch):
     assert runner.last_deferred_recovery_success_ts > 0
     assert runner.deferred_recovery_scheduler_health_reasons == set()
     assert runner.deferred_recovery_scheduler_healthy.is_set()
+    assert any(
+        runner._reason_key(reason) == "startup_deferred_recovery_failed"
+        for reason in runner.degraded_reasons
+    )
+    assert runner.degraded.is_set()
 
     # The thread has intentionally stopped for the test; model the same live
     # handle during the health check to isolate the failure classification.
@@ -538,6 +547,126 @@ def test_startup_internal_deferred_recovery_failure_holds_entries(monkeypatch):
     runner.last_deferred_recovery_completed_ts = time.time()
     runner.deferred_recovery_heartbeat_max_sec = 60.0
     assert runner._set_entry_permission() is False
+    assert not runner.entries_allowed.is_set()
+
+
+def test_scheduler_infrastructure_failure_does_not_heal_startup_hold(monkeypatch):
+    """A failed first runtime pass leaves the startup degraded reason intact."""
+    runner = _permission_runner()
+    runner.degraded.set()
+    runner.degraded_reasons.add(
+        "startup_deferred_recovery_failed:recovery_due_retry_executor_raised"
+    )
+    runner.stopped = _PulseEvent([False, True])
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    tick = MagicMock(
+        return_value={
+            "deferred_lifecycles_recovered": 0,
+            "errors": ["recovery_due_retry_executor_raised:RuntimeError"],
+            "infrastructure_errors": [
+                "recovery_due_retry_executor_raised:RuntimeError"
+            ],
+        }
+    )
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", tick)
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_READY_TIMEOUT_SEC", "0.1")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    runner.deferred_recovery_thread.join(timeout=2)
+
+    assert tick.call_count == 1
+    assert any(
+        runner._reason_key(reason) == "startup_deferred_recovery_failed"
+        for reason in runner.degraded_reasons
+    )
+    assert "deferred_recovery_scheduler_recovery_failed" in (
+        runner.deferred_recovery_scheduler_health_reasons
+    )
+    assert runner.degraded.is_set()
+    assert not runner.entries_allowed.is_set()
+    assert runner.deferred_recovery_successful_ticks == 0
+
+
+def test_successful_scheduler_tick_heals_startup_hold_and_allows_entries(
+    monkeypatch,
+):
+    """Only a clean canonical tick may heal the startup recovery hold."""
+    runner = _permission_runner()
+    runner.degraded.set()
+    runner.degraded_reasons.add(
+        "startup_deferred_recovery_failed:transient_executor_failure"
+    )
+    runner.stopped = _TickThenStopEvent()
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    tick = MagicMock(
+        return_value={
+            "deferred_lifecycles_recovered": 0,
+            "errors": [],
+            "infrastructure_errors": [],
+        }
+    )
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", tick)
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    runner.deferred_recovery_thread.join(timeout=2)
+
+    assert tick.call_count == 1
+    assert not any(
+        runner._reason_key(reason) == "startup_deferred_recovery_failed"
+        for reason in runner.degraded_reasons
+    )
+    assert not runner.degraded.is_set()
+
+    # The test scheduler has intentionally stopped.  Model a live, ready
+    # handle for the direct permission check after the clean recovery proof.
+    runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.deferred_recovery_scheduler_ready.set()
+    runner.deferred_recovery_started_ts = time.time()
+    runner.last_deferred_recovery_completed_ts = time.time()
+    runner.deferred_recovery_heartbeat_max_sec = 60.0
+    assert runner._set_entry_permission() is True
+    assert runner.entries_allowed.is_set()
+
+
+def test_successful_scheduler_tick_clears_only_startup_recovery_reason(
+    monkeypatch,
+):
+    """Healing scheduler state cannot erase an unrelated degraded reason."""
+    runner = _permission_runner()
+    runner.degraded.set()
+    runner.degraded_reasons.update(
+        {
+            "startup_deferred_recovery_failed:transient_executor_failure",
+            "operator_hold:manual_review",
+        }
+    )
+    runner.stopped = _TickThenStopEvent()
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    tick = MagicMock(
+        return_value={
+            "deferred_lifecycles_recovered": 0,
+            "errors": [],
+            "infrastructure_errors": [],
+        }
+    )
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", tick)
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    runner.deferred_recovery_thread.join(timeout=2)
+
+    assert tick.call_count == 1
+    assert not any(
+        runner._reason_key(reason) == "startup_deferred_recovery_failed"
+        for reason in runner.degraded_reasons
+    )
+    assert "operator_hold:manual_review" in runner.degraded_reasons
+    assert runner.degraded.is_set()
     assert not runner.entries_allowed.is_set()
 
 
