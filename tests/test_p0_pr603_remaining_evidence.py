@@ -897,7 +897,8 @@ def test_postgres_restart_after_selector_claim_has_one_materialization_owner(
         assert len(fresh_watcher._pending) == 1
         assert final_meta["materialization_generation"] == 8
         assert final_meta["retry_attempt"] == 3
-        assert final_meta["materialization_owner"] == f"crash-owner:{local_order_id}"
+        assert final_meta["materialization_owner"] == ""
+        assert final_meta["retry_owner"] == f"crash-owner:{local_order_id}"
         assert not fresh_core.broker.submit_order.called
     finally:
         _drop_schema(url, schema)
