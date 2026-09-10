@@ -1194,3 +1194,130 @@ def test_postgres_restart_during_copyback_keeps_one_owner_without_broker_replay(
         assert not fresh_broker.submit_entry.called
     finally:
         _drop_schema(url, schema)
+
+
+def test_postgres_claim_deferred_materialization_writes_complete_provenance_and_rejects_ambiguous_identity(
+    monkeypatch,
+):
+    """The deferred claim seam cannot create timestamp-only authority."""
+    from ap.order_state_machine import APOrderStateMachine
+
+    url = _postgres_url_or_skip()
+    schema = f"pr603_claim_provenance_{uuid.uuid4().hex}"
+    client_id = "claim-provenance@example.com"
+    mode = "live"
+    local_order_id = f"pr603-claim-{uuid.uuid4().hex}"
+    signal_id = f"sig-claim-{uuid.uuid4().hex}"
+    canonical_signal_id = f"canonical-claim-{uuid.uuid4().hex}"
+    lease_until = (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat()
+    trigger_crossed_at = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+
+    _create_orders_schema(url, schema)
+    scoped = _ScopedPostgres(url, schema)
+    try:
+        _patch_postgres_modules(monkeypatch, scoped)
+        with scoped.conn() as connection:
+            connection.execute(
+                """
+                INSERT INTO orders (
+                    local_order_id, client_id, kind, status, execution_mode,
+                    signal_id, canonical_signal_id, meta
+                ) VALUES (%s,%s,'ENTRY','PENDING_TRIGGER',%s,%s,%s,%s::jsonb)
+                """,
+                (
+                    local_order_id,
+                    client_id,
+                    mode,
+                    signal_id,
+                    canonical_signal_id,
+                    json.dumps({}),
+                ),
+            )
+
+        osm = APOrderStateMachine(client_id)
+        assert osm.claim_deferred_materialization(
+            local_order_id,
+            owner="claim-owner",
+            new_generation=1,
+            lease_until=lease_until,
+            trigger_crossed_at=trigger_crossed_at,
+            trigger_price=100.0,
+            observed_underlying_price=101.0,
+            signal_id=signal_id,
+            execution_mode=mode,
+        )
+
+        row = _read_order(url, schema, local_order_id)
+        meta = dict(row["meta"] or {})
+        assert meta["trigger_crossed_at"] == trigger_crossed_at
+        assert meta["trigger_crossed_at_provenance"] == {
+            "canonical_signal_id": canonical_signal_id,
+            "client_id": client_id,
+            "execution_mode": mode,
+            "local_order_id": local_order_id,
+        }
+
+        missing_id = f"pr603-claim-missing-{uuid.uuid4().hex}"
+        with scoped.conn() as connection:
+            connection.execute(
+                """
+                INSERT INTO orders (
+                    local_order_id, client_id, kind, status, execution_mode,
+                    signal_id, meta
+                ) VALUES (%s,%s,'ENTRY','PENDING_TRIGGER',%s,%s,%s::jsonb)
+                """,
+                (
+                    missing_id,
+                    client_id,
+                    mode,
+                    signal_id,
+                    json.dumps({}),
+                ),
+            )
+        assert not osm.claim_deferred_materialization(
+            missing_id,
+            owner="claim-owner",
+            new_generation=1,
+            lease_until=lease_until,
+            trigger_crossed_at=trigger_crossed_at,
+            trigger_price=100.0,
+            observed_underlying_price=101.0,
+            signal_id=signal_id,
+            execution_mode=mode,
+        )
+        assert (_read_order(url, schema, missing_id)["meta"] or {}) == {}
+
+        contradictory_id = f"pr603-claim-conflict-{uuid.uuid4().hex}"
+        with scoped.conn() as connection:
+            connection.execute(
+                """
+                INSERT INTO orders (
+                    local_order_id, client_id, kind, status, execution_mode,
+                    signal_id, canonical_signal_id, meta
+                ) VALUES (%s,%s,'ENTRY','PENDING_TRIGGER',%s,%s,%s,%s::jsonb)
+                """,
+                (
+                    contradictory_id,
+                    client_id,
+                    mode,
+                    signal_id,
+                    canonical_signal_id,
+                    json.dumps({"canonical_signal_id": "different-canonical"}),
+                ),
+            )
+        assert not osm.claim_deferred_materialization(
+            contradictory_id,
+            owner="claim-owner",
+            new_generation=1,
+            lease_until=lease_until,
+            trigger_crossed_at=trigger_crossed_at,
+            trigger_price=100.0,
+            observed_underlying_price=101.0,
+            signal_id=signal_id,
+            execution_mode=mode,
+        )
+        assert (_read_order(url, schema, contradictory_id)["meta"] or {}) == {
+            "canonical_signal_id": "different-canonical"
+        }
+    finally:
+        _drop_schema(url, schema)
