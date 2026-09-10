@@ -543,7 +543,7 @@ def test_partial_fill_projects_exact_durable_exit_ownership(monkeypatch) -> None
     }
 
 
-def test_partial_fill_with_null_filled_ts_is_reconciled_from_exact_current_local_order(monkeypatch) -> None:
+def test_partial_fill_with_exact_filled_ts_is_reconciled_from_current_local_order(monkeypatch) -> None:
     import ap.exit_fill_truth_guard as guard
 
     position_updates_seen = []
@@ -573,7 +573,7 @@ def test_partial_fill_with_null_filled_ts_is_reconciled_from_exact_current_local
                         "position_id": "position-1",
                         "filled_qty": 2,
                         "fill_price": 1.50,
-                        "filled_ts": None,
+                        "filled_ts": "2026-07-17T16:00:00Z",
                         "status": "EXIT_PARTIAL_FILL",
                     }
                 ])
@@ -635,7 +635,7 @@ def test_partial_fill_with_null_filled_ts_is_reconciled_from_exact_current_local
         qty=4,
         filled_qty=2,
         fill_price=1.50,
-        filled_ts=None,
+        filled_ts="2026-07-17T16:00:00Z",
     )
     result_payload = {
         "status": "EXIT_PARTIAL_FILL",

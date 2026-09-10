@@ -685,6 +685,7 @@ def test_fill_monitor_orcl_replay_adopts_then_uses_canonical_fill_path(
             "exec_quantity": 4,
             "avg_fill_price": 1.25,
             "quantity": 4,
+            "filled_at": "2026-08-08T13:31:00+00:00",
         }
     )
     monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
@@ -739,6 +740,7 @@ def test_fill_monitor_recovery_uses_existing_status_reducer(
             "exec_quantity": raw_qty,
             "avg_fill_price": 1.25,
             "quantity": 4,
+            "filled_at": "2026-08-08T13:31:00+00:00",
         }
     )
     monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
@@ -952,6 +954,7 @@ def test_orcl_replay_uses_real_osm_transition_and_applies_close_once(
             "exec_quantity": 4,
             "avg_fill_price": 1.25,
             "quantity": 4,
+            "filled_at": "2026-08-08T13:31:00+00:00",
         }
     )
     monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
@@ -1017,6 +1020,7 @@ def test_partial_exit_replay_preserves_exact_exit_quantity_and_remaining_positio
             "exec_quantity": 3,
             "avg_fill_price": 1.25,
             "quantity": 3,
+            "filled_at": "2026-08-08T13:31:00+00:00",
         }
     )
     monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
@@ -1355,6 +1359,7 @@ def test_pr566_real_durable_restart_recovery_and_manual_close_ownership(monkeypa
                     "exec_quantity": 4,
                     "avg_fill_price": 1.25,
                     "quantity": 4,
+                    "filled_at": "2026-08-08T13:31:00+00:00",
                 }
 
             def submit_order(self, *args, **kwargs):
@@ -3544,8 +3549,14 @@ def test_f7_recovered_fill_keeps_canonical_exit_filled_reason_code(monkeypatch):
         lambda o, **kw: emitted.append(kw) or True,
     )
     monkeypatch.setattr(
-        fm, "check_order_with_broker",
-        lambda broker, o: {"status": "EXIT_FILLED", "filled_qty": 4, "fill_price": 1.25},
+        fm,
+        "check_order_with_broker",
+        lambda broker, o: {
+            "status": "EXIT_FILLED",
+            "filled_qty": 4,
+            "fill_price": 1.25,
+            "filled_ts": "2026-08-08T13:31:00+00:00",
+        },
     )
     monkeypatch.setattr(fm, "reduce_position_on_fill", MagicMock(), raising=False)
 

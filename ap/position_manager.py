@@ -819,11 +819,17 @@ class APPositionManager:
             )
 
         def _table_columns(c, table_name: str) -> set[str]:
+            # Resolve the relation through the active search_path.  This is
+            # important for legacy deployments and for session-scoped/temp
+            # tables: information_schema can report a different same-named
+            # relation than the one the UPDATE will actually target.
             c.execute(
                 """
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_name=%s
+                SELECT attname AS column_name
+                FROM pg_attribute
+                WHERE attrelid = to_regclass(%s)
+                  AND attnum > 0
+                  AND NOT attisdropped
                 """,
                 (table_name,),
             )
