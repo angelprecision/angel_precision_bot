@@ -1427,6 +1427,10 @@ class APOrderStateMachine:
                     "[%s] opportunity ledger notify failed (non-fatal): %s",
                     self.client_id, _ledger_exc,
                 )
+        # ``_defer_side_effects`` is a transaction-wide contract.  Recovery
+        # currently uses it only for ENTRY cancellation, where the exit hook
+        # is inert, but do not let a future EXIT caller leak non-rollback-safe
+        # position/engine mutations from inside the transaction.
         exit_hook_result = None
         if not _defer_side_effects:
             exit_hook_result = self._handle_exit_engine_hooks(

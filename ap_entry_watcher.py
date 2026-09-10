@@ -4757,27 +4757,11 @@ class APEntryWatcher:
             return _hold(_admission_abort_reason)
 
         # The admission context has committed here.  Only now may the
-        # incumbent's process-local ownership be released.  Ledger
-        # observability is also deliberately deferred until the durable
+        # incumbent's process-local ownership be released.  Both canonical
+        # observability surfaces are deliberately deferred until the durable
         # cancellation transaction has committed, so rollback leaves no
         # opportunity-state side effect behind.
         osm = getattr(self, "order_state_machine", None)
-        notify_ledger = getattr(osm, "_notify_opportunity_ledger", None)
-        if callable(notify_ledger):
-            for ledger_row in _deferred_ledger_rows:
-                try:
-                    notify_ledger(
-                        current=ledger_row["current"],
-                        new_status=ledger_row["new_status"],
-                        last_error=ledger_row["last_error"],
-                    )
-                except Exception as exc:
-                    log.debug(
-                        "[%s] deferred recovery cancellation ledger notify failed: %s",
-                        watched.ticker,
-                        exc,
-                    )
-
         # OSM's transactional cancellation deliberately defers all
         # observability side effects. Replay the canonical transition event
         # only after the admission context has committed; rollback paths return
@@ -4790,6 +4774,22 @@ class APEntryWatcher:
                 except Exception as exc:
                     log.debug(
                         "[%s] deferred recovery transition event failed: %s",
+                        watched.ticker,
+                        exc,
+                    )
+
+        notify_ledger = getattr(osm, "_notify_opportunity_ledger", None)
+        if callable(notify_ledger):
+            for ledger_row in _deferred_ledger_rows:
+                try:
+                    notify_ledger(
+                        current=ledger_row["current"],
+                        new_status=ledger_row["new_status"],
+                        last_error=ledger_row["last_error"],
+                    )
+                except Exception as exc:
+                    log.debug(
+                        "[%s] deferred recovery cancellation ledger notify failed: %s",
                         watched.ticker,
                         exc,
                     )
