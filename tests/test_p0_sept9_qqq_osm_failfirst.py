@@ -272,7 +272,6 @@ def _seed_sept9_shape(
             position_avg_fill,     # entry_price
             ENTRY_TS,
             "entry-order-qqq",     # local_order_id on position row
-            FILL_TS,
         ),
     )
 

@@ -242,59 +242,80 @@ def _create_position_from_entry(order_row: dict, fill_price: float, filled_qty: 
 
 def _close_position_from_exit(order_row: dict, fill_price: float):
     """
-    FIX 2: sets exit_price column and updates client_state.realized_pnl_today
-    atomically — matches fill_monitor behaviour exactly.
-    FIX 6: skips silently if position is already CLOSED (idempotency).
+    PR #579 (Step 8): Route bot-owned EXIT fills through the ONE canonical
+    authority — APPositionManager.converge_position_from_durable_exit_order().
+
+    The legacy direct position UPDATE is removed because it violated the
+    one-canonical-authority requirement: no exact broker fill timestamp, no
+    durable EXIT watermark, no full identity fence.
+
+    External/manual EXIT rows are excluded — they belong to the manual-close
+    authority and must not be re-routed here.
     """
-    client_id   = order_row.get("client_id", "default")
-    position_id = order_row.get("position_id")
+    client_id      = str(order_row.get("client_id") or "").strip()
+    local_order_id = str(order_row.get("local_order_id") or "").strip()
+    execution_mode = str(order_row.get("execution_mode") or "").strip().lower()
 
-    if not position_id:
-        log.error("Exit order has no position_id: %s", order_row.get("local_order_id"))
+    if not local_order_id:
+        log.error(
+            "[%s] _close_position_from_exit: no local_order_id on EXIT order",
+            client_id,
+        )
         return
 
-    with conn() as c:
-        pos = run_with_retry(lambda: c.execute(
-            "SELECT id, client_id, qty, avg_fill, status FROM positions WHERE id=%s AND client_id=%s",
-            (position_id, client_id),
-        ).fetchone())
-
-    if not pos:
-        log.error("Position not found for exit: pos_id=%s client=%s", position_id, client_id)
+    # External/manual EXIT rows belong to the manual-close authority.
+    meta = order_row.get("meta") or {}
+    if isinstance(meta, str):
+        try:
+            import json as _json
+            meta = _json.loads(meta)
+        except Exception:
+            meta = {}
+    if (
+        local_order_id.startswith("external-exit:")
+        or str(meta.get("external_broker_order") or "").lower() == "true"
+    ):
+        log.debug(
+            "[%s] _close_position_from_exit: skipping external/manual EXIT %s",
+            client_id, local_order_id,
+        )
         return
 
-    pos = dict(pos)
-
-    # FIX 6: idempotency — don't close an already-closed position
-    if pos.get("status") == "CLOSED":
-        log.debug("Position %s already CLOSED — skipping reconcile exit", position_id)
+    if execution_mode not in ("live", "paper"):
+        log.error(
+            "[%s] _close_position_from_exit: unresolved execution_mode=%r "
+            "for EXIT %s — HOLD",
+            client_id, execution_mode, local_order_id,
+        )
         return
 
-    entry_price  = float(pos["avg_fill"])
-    qty          = int(pos["qty"])
-    realized_pnl = (float(fill_price) - entry_price) * qty * OPT_MULTIPLIER
-
-    with conn() as c:
-        # FIX 2a: set exit_price alongside the close — fill_monitor also does this
-        run_with_retry(lambda: c.execute(
-            """
-            UPDATE positions
-            SET status='CLOSED', exit_ts=%s, exit_price=%s,
-                exit_reason='EXIT_FILLED', realized_pnl=?
-            WHERE id=%s AND client_id=%s
-            """,
-            (now_utc_iso(), float(fill_price), float(realized_pnl), position_id, client_id),
-        ))
-
-        # FIX 2b: update realized P&L in client_state atomically (same as fill_monitor)
-        run_with_retry(lambda: c.execute(
-            """
-            UPDATE client_state
-            SET realized_pnl_today = COALESCE(realized_pnl_today, 0.0) + %s
-            WHERE client_id = %s
-            """,
-            (float(realized_pnl), client_id),
-        ))
+    try:
+        from ap.position_manager import APPositionManager
+        pm = APPositionManager(client_id)
+        result = pm.converge_position_from_durable_exit_order(
+            exit_local_order_id=local_order_id,
+            expected_execution_mode=execution_mode,
+        )
+        disposition = str(getattr(result, "disposition", "") or "")
+        if disposition in ("APPLIED_FULL", "APPLIED_PARTIAL", "ALREADY_APPLIED"):
+            log.info(
+                "[%s] reconcile _close_position_from_exit converged | "
+                "order=%s disposition=%s",
+                client_id, local_order_id, disposition,
+            )
+        else:
+            log.warning(
+                "[%s] reconcile _close_position_from_exit HOLD | "
+                "order=%s disposition=%s reason=%s",
+                client_id, local_order_id, disposition,
+                getattr(result, "reason", ""),
+            )
+    except Exception as exc:
+        log.error(
+            "[%s] _close_position_from_exit canonical convergence failed "
+            "order=%s: %s",
+            client_id, local_order_id, exc,
+        )
 
 
 # =============================================================================

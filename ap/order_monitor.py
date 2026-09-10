@@ -4201,6 +4201,39 @@ class APOrderMonitor:
                 },
             )
             return
+        # PR #579 (Step 7): order_monitor receives status-only broker data
+        # (no executed quantity, fill price, or timestamp).  For EXIT orders,
+        # a status-only terminal observation must NEVER terminalize the durable
+        # EXIT or reopen/discard partial ownership — those require the exact
+        # fill payload that only fill_monitor and reconciler carry.
+        # Defer EXIT terminal transitions to fill_monitor / reconciler.
+        if kind == "EXIT" and new_status in ("CANCELED", "REJECTED", "EXPIRED"):
+            log.warning(
+                "[%s] EXIT_TERMINAL_STATUS_ONLY_DEFERRED | local=%s contract=%s "
+                "broker_status=%s blocked_transition=%s — status-only observation "
+                "cannot prove executed_qty=0; fill_monitor/reconciler will finalize",
+                self.client_id,
+                local_order_id,
+                contract,
+                s,
+                new_status,
+            )
+            self._emit_order_event(
+                local_order_id=local_order_id,
+                stage="order_monitor",
+                decision="HOLD",
+                reason_code="EXIT_TERMINAL_STATUS_ONLY_DEFERRED",
+                explanation=(
+                    "order_monitor has status-only broker data and cannot safely "
+                    "terminalize an EXIT order without proving executed_qty=0. "
+                    "fill_monitor/reconciler will resolve with full execution payload."
+                ),
+                contract=contract,
+                position_id=(order or {}).get("position_id"),
+                inputs={"broker_status": s, "kind": kind, "deferred_status": new_status},
+            )
+            return
+
         ok = self.osm.transition(local_order_id, new_status, **kwargs)
         if ok:
             log.info(f"[{self.client_id}] Advanced | {contract} | {local_order_id} → {new_status}")

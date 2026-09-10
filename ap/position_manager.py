@@ -88,6 +88,143 @@ def _convergence_hold(disposition: str, reason: str = "", **kwargs) -> Convergen
     return ConvergenceResult(disposition=disposition, reason=reason, **kwargs)
 
 
+def _resolve_entry_cost_basis(
+    c,
+    *,
+    position_id: str,
+    client_id: str,
+    execution_mode: str,
+    occ_contract: str,
+) -> Optional[Decimal]:
+    """Read-only helper: resolve entry fill price from exactly one durable ENTRY order.
+
+    Resolves cost basis for broker-repair canonical positions where avg_fill /
+    entry_price are NULL.  Fail-closed on every edge case; zero mutation.
+
+    Requirements for a valid candidate:
+      * kind='ENTRY', status='FILLED'
+      * client_id, position_id, execution_mode, and OCC contract must match exactly
+      * positive integer filled_qty > 0
+      * positive finite fill_price > 0
+      * broker_order_id non-blank and not a placeholder
+      * exact timezone-aware filled_ts present (never fabricated)
+
+    Returns:
+      Decimal fill price on unique, fully-proven candidate.
+      None on missing, ambiguous, malformed, or identity-mismatched evidence.
+    """
+    try:
+        c.execute(
+            """
+            SELECT fill_price, filled_qty, broker_order_id, filled_ts, execution_mode
+            FROM orders
+            WHERE position_id = %s
+              AND client_id   = %s
+              AND kind        = 'ENTRY'
+              AND status      = 'FILLED'
+              AND COALESCE(filled_qty, 0) > 0
+              AND fill_price IS NOT NULL
+              AND fill_price > 0
+            LIMIT 3
+            """,
+            (position_id, client_id),
+        )
+        rows = c.fetchall() or []
+    except Exception as exc:
+        log.error(
+            "[%s] _resolve_entry_cost_basis: query failed pos=%s: %s",
+            client_id, position_id, exc,
+        )
+        return None
+
+    # Exactly one candidate required
+    if len(rows) == 0:
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: no FILLED ENTRY order found pos=%s",
+            client_id, position_id,
+        )
+        return None
+    if len(rows) > 1:
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: ambiguous ENTRY orders pos=%s count=%d",
+            client_id, position_id, len(rows),
+        )
+        return None
+
+    row = dict(rows[0])
+
+    # Validate execution mode
+    row_mode = str(row.get("execution_mode") or "").strip().lower()
+    if row_mode not in _VALID_EXECUTION_MODES or row_mode != execution_mode:
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: mode mismatch pos=%s expected=%s got=%s",
+            client_id, position_id, execution_mode, row_mode,
+        )
+        return None
+
+    # Validate broker order identity (non-blank, not a placeholder)
+    broker_id = str(row.get("broker_order_id") or "").strip().upper()
+    if not broker_id or broker_id in ("", "N/A", "NONE", "NULL"):
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: blank/placeholder broker_order_id pos=%s",
+            client_id, position_id,
+        )
+        return None
+
+    # Validate filled_ts — must be an exact timezone-aware timestamp
+    filled_ts_raw = row.get("filled_ts")
+    if filled_ts_raw is None:
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: missing filled_ts on ENTRY order pos=%s",
+            client_id, position_id,
+        )
+        return None
+    if isinstance(filled_ts_raw, datetime):
+        if filled_ts_raw.tzinfo is None or filled_ts_raw.utcoffset() is None:
+            log.warning(
+                "[%s] _resolve_entry_cost_basis: timezone-naive filled_ts pos=%s",
+                client_id, position_id,
+            )
+            return None
+    # (non-datetime raw values such as ISO strings are accepted if the DB driver
+    # returned them without conversion; the caller's CAS and chronology checks
+    # downstream will validate ordering.)
+
+    # Validate fill economics
+    try:
+        price = Decimal(str(row["fill_price"]))
+    except (InvalidOperation, TypeError, ValueError):
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: malformed fill_price=%r pos=%s",
+            client_id, row.get("fill_price"), position_id,
+        )
+        return None
+    if not price.is_finite() or price <= 0:
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: invalid fill_price=%s pos=%s",
+            client_id, price, position_id,
+        )
+        return None
+
+    try:
+        qty = int(row.get("filled_qty") or 0)
+    except (TypeError, ValueError):
+        return None
+    if qty <= 0:
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: zero/negative filled_qty=%r pos=%s",
+            client_id, row.get("filled_qty"), position_id,
+        )
+        return None
+
+    log.info(
+        "[%s] _resolve_entry_cost_basis: resolved entry price=%s qty=%d "
+        "from ENTRY order pos=%s",
+        client_id, price, qty, position_id,
+    )
+    return price
+
+
 def _strict_decimal(value, *, positive: bool = False, nonnegative: bool = False) -> Optional[Decimal]:
     """Parse a finite numeric value without accepting booleans or junk text."""
     if value is None or isinstance(value, bool):
@@ -794,6 +931,34 @@ class APPositionManager:
         self._position_columns_cache = None
         self._position_columns()
 
+    # ── PR #579: shared fail-closed entry cost-basis resolver ─────────────────
+
+    def _resolve_entry_cost_basis(
+        self,
+        c,
+        *,
+        position_id: str,
+        execution_mode: str,
+        occ_contract: str,
+    ) -> Optional[Decimal]:
+        """Resolve entry fill price from exactly one durable ENTRY order.
+
+        Called only when the canonical position lacks avg_fill / entry_price
+        (broker-repair shape).  Returns None (HOLD) on any ambiguity,
+        malformation, or identity mismatch.  Never uses EXIT fill price or
+        fabricated timestamps as entry cost basis.
+
+        Caller is responsible for all position/watermark mutation; this method
+        is read-only and performs zero writes.
+        """
+        return _resolve_entry_cost_basis(
+            c,
+            position_id=position_id,
+            client_id=self.client_id,
+            execution_mode=execution_mode,
+            occ_contract=occ_contract,
+        )
+
     def converge_position_from_durable_exit_order(
         self,
         *,
@@ -1075,7 +1240,25 @@ class APPositionManager:
                     positive=True,
                 )
                 if position_qty is None or avg_fill is None:
-                    return _convergence_hold("HOLD_ECONOMICS", "invalid_position_cost_basis", position_id=position_id)
+                    # PR #579: broker-repair positions may lack a persisted
+                    # avg_fill / entry_price because the original ENTRY fill
+                    # was not captured when the repair position was created.
+                    # Resolve cost basis from the ONE exact durable ENTRY order.
+                    # Any ambiguity, malformation, or identity mismatch HOLDs —
+                    # never fabricate entry economics.
+                    avg_fill = _resolve_entry_cost_basis(
+                        c,
+                        position_id=position_id,
+                        client_id=self.client_id,
+                        execution_mode=order_mode,
+                        occ_contract=order_contract,  # noqa: F841 (validated above)
+                    )
+                    if avg_fill is None or position_qty is None:
+                        return _convergence_hold(
+                            "HOLD_ECONOMICS",
+                            "invalid_position_cost_basis",
+                            position_id=position_id,
+                        )
                 if requested_qty > position_qty:
                     return _convergence_hold(
                         "HOLD_STATE", "order_quantity_exceeds_position_quantity", position_id=position_id

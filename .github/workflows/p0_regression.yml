@@ -327,3 +327,69 @@ jobs:
         if: always()
         run: |
           echo "P0 merge-ref regression suite complete"
+
+
+  p0-rollback-failfirst:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: intelligence_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d intelligence_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Rollback base — verified pre-#579 production SHA.
+          # Tests in this job assert OPEN (fail-first) not CLOSED.
+          ref: eb1fdefd8fb35effd1752a8a4de50147c06b066b
+
+      - name: Assert rollback base SHA
+        run: |
+          expected="eb1fdefd8fb35effd1752a8a4de50147c06b066b"
+          actual="$(git rev-parse HEAD)"
+          echo "Rollback base: $actual"
+          test "$actual" = "$expected"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install minimal test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas
+
+      - name: Apply exit decision generation migration
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d intelligence_test \
+            -f migrations/20260717_exit_decision_generation_claims.sql
+          psql -h localhost -U postgres -d intelligence_test \
+            -f migrations/20260809_exit_decision_generation_requested_qty.sql
+
+      - name: Run September 9 fail-first suite (must prove position remains OPEN)
+        env:
+          PGSSLMODE: "disable"
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
+          INTELLIGENCE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
+        run: |
+          python -m pytest \
+            tests/test_p0_sept9_qqq_osm_failfirst.py::TestSept9FailFirst \
+            -v --tb=short --color=yes
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "Rollback fail-first suite complete (must show OPEN on pre-#579 base)"
