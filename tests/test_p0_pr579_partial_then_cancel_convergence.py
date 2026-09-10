@@ -346,21 +346,13 @@ class TestPartialThenCancelPreservesExecutedQuantity:
             f"got transitions={osm.transitions}"
         )
 
-        # ── Order MUST be: fill_update THEN terminal transition ────────
-        # (Applying terminal before fill would zombie the fill.)
-        first_terminal_idx = next(
-            i for i, t in enumerate(osm.transitions) if t["mapped"] == "CANCELED"
-        )
-        # apply_fill_update happens on osm.fill_updates, terminal on transitions.
-        # Both go through the SAME osm object; the fill_update call recorded at
-        # index 0 must have completed before the terminal transition returned.
-        # Concurrency isn't in play here (single-threaded test), so lists
-        # reflect true call order across methods. Assert positional intent:
-        assert osm.fill_updates and osm.transitions, "both must have fired"
-        # apply_fill_update must be the first mutation this branch performs.
-        # (No transitions before the fill_update is placed.)
-        # This is guaranteed as long as we saw exactly one fill_update
-        # and exactly one CANCELED transition, both fired within this call.
+        # The shared trace proves the recovery order: partial lifecycle
+        # transition, canonical convergence, then terminalization.
+        assert trace == [
+            ("transition", "EXIT_PARTIAL_FILL"),
+            ("converge", order["local_order_id"]),
+            ("transition", "CANCELED"),
+        ]
 
         # ── NO broker side-effect surfaces exercised ───────────────────
         assert broker.cancel_order_calls == []
