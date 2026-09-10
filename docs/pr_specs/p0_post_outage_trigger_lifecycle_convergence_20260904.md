@@ -6,7 +6,7 @@
 
 Live PR base: `59eb1882dc84d6bb33475b4bdd0225486a2309fc`
 Latest code/test head before this attestation:
-`007292f3524e971b69093b3049ac913e4996caf7`
+`c852020ff68490261ab6b55bbfed7a6ce47bc033`
 PR state: **Draft / open / MERGE CANDIDATE**. The final branch head including this
 attestation is recorded in the PR body; no merge, deploy, close, or replacement
 PR was performed.
@@ -17,7 +17,7 @@ Prior amended head before live-base rebase: `bb7d2084f014ff216a7915873e34f5bbd92
 Amendment applied: 2026-09-10
 
 Latest code amendment commit (before this documentation attestation):
-`007292f3524e971b69093b3049ac913e4996caf7`. The final branch SHA, including
+`c852020ff68490261ab6b55bbfed7a6ce47bc033`. The final branch SHA, including
 this specification update, is recorded in the PR body after the documentation
 commit.
 
@@ -34,7 +34,7 @@ Dependencies (§STATUS binding order):
 This section supersedes older audit snapshots below. The PR branch is based on
 the live committed GitHub `main` at
 `59eb1882dc84d6bb33475b4bdd0225486a2309fc`. The code/test commit immediately
-before this attestation is `007292f3524e971b69093b3049ac913e4996caf7`; the
+before this attestation is `c852020ff68490261ab6b55bbfed7a6ce47bc033`; the
 final documentation commit SHA is recorded in the PR body. The PR remains
 Draft/open and must not be merged, deployed, or closed during this audit.
 
@@ -138,12 +138,12 @@ Focused local evidence for this amendment:
   GitHub PostgreSQL jobs are the authoritative CI rerun.
 
 The exact-head/merge-ref P0 workflow for code/test head
-`007292f3524e971b69093b3049ac913e4996caf7` is run `34538566287`:
+`c852020ff68490261ab6b55bbfed7a6ce47bc033` is run `34543937426`:
 
-- exact-head `p0-tests`, job `103075727793`: **PASS**;
-- pull-request merge-ref `p0-merge-ref-tests`, job `103075727630`: **PASS**;
+- exact-head `p0-tests`, job `103092381233`: **PASS**;
+- pull-request merge-ref `p0-merge-ref-tests`, job `103092381062`: **PASS**;
 - both jobs collected `5298` tests and completed `5298 passed`;
-- the separate `p0-rollback-failfirst` guard, job `103075727748`, also passed,
+- the separate `p0-rollback-failfirst` guard, job `103092380931`, also passed,
   but its pre-#579 historical base is not used as #580 clearance evidence.
 
 The historical implementation/gate notes below are retained for audit
