@@ -2894,10 +2894,14 @@ class ClientRunner(threading.Thread):
                             self.deferred_recovery_successful_ticks = getattr(
                                 self, "deferred_recovery_successful_ticks", 0
                             ) + 1
+                            # A completed canonical pass proves the executor
+                            # is available when it reports no infrastructure
+                            # errors. Row-level errors remain visible and
+                            # fail-closed for their rows, but must not preserve
+                            # a global startup hold after the executor heals.
                             self._clear_deferred_recovery_scheduler_health_reasons(
                                 recovery_succeeded=(
                                     isinstance(_outcome, dict)
-                                    and not _outcome.get("errors")
                                     and not _infrastructure_errors
                                 )
                             )
@@ -3042,7 +3046,9 @@ class ClientRunner(threading.Thread):
 
         ``recovery_succeeded`` is deliberately separate from liveness.  The
         permission health check can prove a live, ready, non-stale thread, but
-        only a clean canonical recovery tick may heal a startup recovery hold.
+        only a canonical recovery tick with no infrastructure errors may heal
+        a startup recovery hold. Row-level errors remain visible and scoped to
+        their rows.
         """
         _health_reasons = getattr(
             self, "deferred_recovery_scheduler_health_reasons", None
@@ -4646,11 +4652,15 @@ class ClientRunner(threading.Thread):
                     _completion_logged = True
                 except _cf.TimeoutError:
                     logger.warning(
-                        "[%s] Startup recovery timed out after %.0fs — continuing without full recovery. "
-                        "Open positions may not be reseeded until next restart.",
+                        "[%s] Startup recovery timed out after %.0fs — "
+                        "entries remain blocked until a clean deferred recovery tick.",
                         self.email, _RECOVERY_TIMEOUT,
                     )
                     _fut.cancel()
+                    self._enter_degraded_mode(
+                        "startup_deferred_recovery_failed:timeout",
+                        stop_runner=False,
+                    )
                     self._log_startup_recovery_complete(
                         status="timeout",
                         started_at=_recovery_started_at,

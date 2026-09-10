@@ -306,17 +306,108 @@ def test_row_level_recovery_errors_do_not_mark_scheduler_unhealthy(monkeypatch):
     assert runner.last_deferred_recovery_success_ts > 0
     assert runner.deferred_recovery_scheduler_health_reasons == set()
     assert runner.deferred_recovery_scheduler_healthy.is_set()
-    assert any(
+    assert not any(
         runner._reason_key(reason) == "startup_deferred_recovery_failed"
         for reason in runner.degraded_reasons
     )
-    assert runner.degraded.is_set()
+    assert not runner.degraded.is_set()
 
     # The thread has intentionally stopped for the test; model the same live
     # handle during the health check to isolate the failure classification.
     runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
     runner.deferred_recovery_scheduler_ready.set()
     assert runner._check_deferred_recovery_scheduler_health(now=time.time()) is True
+
+
+def test_startup_recovery_timeout_holds_entries_until_clean_scheduler_tick(
+    monkeypatch,
+):
+    """A timeout cannot be healed by readiness; the next infra-clean tick can."""
+    runner = _permission_runner()
+    runner._log_startup_recovery_complete = MagicMock()
+    active_calls = 0
+    max_active_calls = 0
+    call_order: list[str] = []
+    active_lock = threading.Lock()
+
+    def _record_call(kind: str):
+        nonlocal active_calls, max_active_calls
+        with active_lock:
+            active_calls += 1
+            max_active_calls = max(max_active_calls, active_calls)
+            call_order.append(kind)
+
+        def _release():
+            nonlocal active_calls
+            with active_lock:
+                active_calls -= 1
+
+        return _release
+
+    class _Recovery:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, include_watcher_reseed=False):
+            release = _record_call("startup")
+            try:
+                time.sleep(0.02)
+                return {}
+            finally:
+                release()
+
+        def recover_deferred_lifecycles(self):
+            release = _record_call("runtime")
+            try:
+                return {
+                    "deferred_lifecycles_recovered": 0,
+                    "errors": ["recovery_malformed_counter"],
+                    "infrastructure_errors": [],
+                }
+            finally:
+                release()
+
+    monkeypatch.setattr(cr, "APStartupRecovery", _Recovery)
+    monkeypatch.setenv("STARTUP_RECOVERY_TIMEOUT_SEC", "0.001")
+    runner._run_startup_recovery(MagicMock(), object())
+
+    assert not runner.entries_allowed.is_set()
+    assert "startup_deferred_recovery_failed:timeout" in runner.degraded_reasons
+
+    # A live, ready scheduler handle without a completed recovery tick cannot
+    # bypass the startup hold created by the timeout.
+    runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.deferred_recovery_scheduler_ready.set()
+    runner.deferred_recovery_started_ts = time.time()
+    runner.deferred_recovery_heartbeat_max_sec = 60.0
+    assert runner._set_entry_permission() is False
+    assert not runner.entries_allowed.is_set()
+    runner.deferred_recovery_thread = None
+    runner.deferred_recovery_scheduler_ready.clear()
+
+    runner.stopped = _TickThenStopEvent()
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+    runner._start_deferred_breach_lifecycle_scheduler()
+    runner.deferred_recovery_thread.join(timeout=2)
+
+    assert call_order == ["startup", "runtime"]
+    assert max_active_calls == 1
+    assert runner.deferred_recovery_errors == 1
+    assert runner.deferred_recovery_successful_ticks == 1
+    assert "startup_deferred_recovery_failed:timeout" not in runner.degraded_reasons
+    assert not runner.degraded.is_set()
+
+    # Model the still-live, ready scheduler after the test thread's deliberate
+    # shutdown; readiness alone was not sufficient before the clean tick.
+    runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.deferred_recovery_scheduler_ready.set()
+    runner.deferred_recovery_started_ts = time.time()
+    runner.last_deferred_recovery_completed_ts = time.time()
+    runner.deferred_recovery_heartbeat_max_sec = 60.0
+    assert runner._set_entry_permission() is True
+    assert runner.entries_allowed.is_set()
 
 
 def test_recovery_infrastructure_failure_stays_unhealthy_despite_fresh_liveness(
