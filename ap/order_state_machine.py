@@ -1372,6 +1372,52 @@ class APOrderStateMachine:
                 "[%s] opportunity ledger notify failed (non-fatal): %s",
                 self.client_id, _ledger_exc,
             )
+        # PR #604: project exact terminal ENTRY truth into the linked
+        # trade_queue row.  This is bookkeeping only; the reconciler never
+        # talks to the broker and never owns watcher, retry, position, or proof
+        # lifecycle.  A queue projection failure must not undo a durable order
+        # transition, so it is deliberately diagnostic/non-blocking here.
+        if kind.upper() == "ENTRY" and new_status in OrderStatus.TERMINAL:
+            try:
+                from ap.trade_queue_lifecycle_reconciler import (
+                    reconcile_entry_order_transition,
+                )
+
+                queue_order = dict(current)
+                queue_order["status"] = new_status
+                if broker_order_id is not None:
+                    queue_order["broker_order_id"] = broker_order_id
+                if filled_qty is not None:
+                    queue_order["filled_qty"] = filled_qty
+                if fill_price is not None:
+                    queue_order["fill_price"] = fill_price
+                if filled_ts is not None:
+                    queue_order["filled_ts"] = filled_ts
+                if position_id is not None:
+                    queue_order["position_id"] = position_id
+                if last_error is not None:
+                    queue_order["last_error"] = last_error
+                queue_decision = reconcile_entry_order_transition(
+                    order=queue_order,
+                    expected_client_id=self.client_id,
+                )
+                if not queue_decision.mutated and queue_decision.outcome not in {
+                    "ALREADY_TERMINAL", "CLASSIFIED",
+                }:
+                    log.warning(
+                        "[%s] queue lifecycle projection held | local_order_id=%s "
+                        "reason=%s outcome=%s",
+                        self.client_id,
+                        local_order_id,
+                        queue_decision.reason_code,
+                        queue_decision.outcome,
+                    )
+            except Exception as _queue_lifecycle_exc:
+                log.error(
+                    "[%s] queue lifecycle projection failed (non-blocking) | "
+                    "local_order_id=%s error=%s",
+                    self.client_id, local_order_id, _queue_lifecycle_exc,
+                )
         exit_hook_result = self._handle_exit_engine_hooks(
             current=current, new_status=new_status, position_id=position_id,
             filled_qty=filled_qty, fill_price=fill_price,

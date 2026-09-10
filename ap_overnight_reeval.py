@@ -3180,6 +3180,16 @@ def run_overnight_reeval(
                 # auto-fields like score, tier, signal_id, etc.
                 from ap.authorization import execution_mode_for_broker
                 _plan_meta = getattr(decision.plan, "metadata", None) or {}
+                _plan_meta = dict(_plan_meta)
+                # PR #604: preserve the exact source queue owner on
+                # overnight materialization too; do not fall back to
+                # ticker/signal-only matching during terminal projection.
+                if isinstance(job_id, int) and not isinstance(job_id, bool) and job_id > 0:
+                    _plan_meta["queue_id"] = job_id
+                    _plan_meta["trade_queue_id"] = job_id
+                elif isinstance(job_id, str) and job_id.strip().isdigit() and int(job_id.strip()) > 0:
+                    _plan_meta["queue_id"] = int(job_id.strip())
+                    _plan_meta["trade_queue_id"] = int(job_id.strip())
                 local_order_id = order_state_machine.create_entry_order(
                     decision.plan,
                     initial_status="PENDING_TRIGGER",

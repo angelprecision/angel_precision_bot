@@ -3392,7 +3392,12 @@ def _dispatch(
         from ap.authorization import execution_mode_for_broker
         _entry_exec_mode = execution_mode_for_broker(broker)
         local_order_id = order_state_machine.create_entry_order(
-            plan, execution_mode=_entry_exec_mode,
+            plan,
+            execution_mode=_entry_exec_mode,
+            # PR #604: persist the exact queue owner on the ENTRY row so a
+            # later terminal order transition can project back without
+            # matching by ticker or guessing across signal lifecycles.
+            meta={"queue_id": job_id, "trade_queue_id": job_id},
         )
         # PR E / FIX-1 (BUG-MC-1): stash local_order_id on plan.metadata
         # so any LATER revalidate_exposure (called from execution-core at
@@ -3693,6 +3698,8 @@ def _dispatch(
             _mark_job(job_id, "WATCHING",
                       result={"plan_id": plan.plan_id,
                               "local_order_id": local_order_id,
+                              "canonical_signal_id": _canonical_signal_id,
+                              "execution_mode": str(_entry_exec_mode or "").strip().lower(),
                               "contract": getattr(plan, "contract_symbol", ""),
                               "real_cost": plan.max_position_usd,
                               "trigger_type": "breach",
