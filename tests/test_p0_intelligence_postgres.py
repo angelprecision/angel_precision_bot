@@ -151,3 +151,56 @@ def test_real_postgres_breach_phase_uses_existing_identity_and_claim_fence():
     assert len(claimed["jobs"]) == 1
     assert claimed["jobs"][0]["phase"] == "BREACH"
     assert claimed["jobs"][0]["local_order_id"] == "order-1"
+
+
+def test_real_postgres_breach_duplicate_enqueue_is_idempotent():
+    first = _enqueue("breach-dup-hash", phase="BREACH", local_order_id="order-dup")
+    second = _enqueue("breach-dup-hash", phase="BREACH", local_order_id="order-dup")
+    assert first["ok"] and first.get("inserted")
+    assert second["ok"] and (second.get("duplicate") or not second.get("inserted"))
+    with _conn() as c:
+        c.execute(
+            "SELECT COUNT(*)::int AS count FROM ap_intelligence_jobs "
+            "WHERE phase='BREACH' AND local_order_id=%s AND input_hash=%s",
+            ("order-dup", "breach-dup-hash"),
+        )
+        assert c.fetchone()["count"] == 1
+
+
+def test_real_postgres_breach_identity_keys_do_not_cross_clients_or_modes():
+    a = _enqueue("breach-a", phase="BREACH", local_order_id="loid-a")
+    assert a["ok"] and a["inserted"]
+    from ap.intelligence_snapshot_store import enqueue_intelligence_job
+    other_client = enqueue_intelligence_job(
+        client_id="other@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-1", signal_id="signal-1", phase="BREACH",
+        local_order_id="loid-a", profile_version="profile-1", input_hash="breach-a",
+        payload={"signal": {"ticker": "SPY"}},
+    )
+    other_mode = enqueue_intelligence_job(
+        client_id="client@example.com", execution_mode="LIVE",
+        canonical_signal_id="canon-1", signal_id="signal-1", phase="BREACH",
+        local_order_id="loid-a", profile_version="profile-1", input_hash="breach-a",
+        payload={"signal": {"ticker": "SPY"}},
+    )
+    assert other_client["ok"] and other_client.get("inserted")
+    assert other_mode["ok"] and other_mode.get("inserted")
+    with _conn() as c:
+        c.execute("SELECT COUNT(*)::int AS count FROM ap_intelligence_jobs WHERE phase='BREACH'")
+        assert c.fetchone()["count"] == 3
+
+
+def test_real_postgres_breach_claim_is_scoped_and_single_owner():
+    _enqueue("breach-claim", phase="BREACH", local_order_id="order-claim")
+    from ap.intelligence_snapshot_store import claim_due_intelligence_jobs
+    first = claim_due_intelligence_jobs(
+        claim_owner="owner-a", client_id="client@example.com",
+        execution_mode="PAPER", limit=10,
+    )
+    second = claim_due_intelligence_jobs(
+        claim_owner="owner-b", client_id="client@example.com",
+        execution_mode="PAPER", limit=10,
+    )
+    assert first["ok"] and len(first["jobs"]) == 1
+    assert second["ok"] and second["jobs"] == []
+    assert first["jobs"][0]["phase"] == "BREACH"

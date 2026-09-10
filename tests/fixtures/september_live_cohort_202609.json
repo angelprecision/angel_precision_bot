@@ -1,0 +1,155 @@
+{
+  "schema_version": "september_live_cohort.v1",
+  "notes": "Durable signal/order IDs for QQQ/HOOD/LULU/NKE were not present in PR #435 docs/comments at amendment time; fields marked UNKNOWN must be filled from production DB before claiming full cohort proof. Do not fabricate option BID/ASK or outcomes into BREACH scoring.",
+  "cases": [
+    {
+      "case_id": "QQQ_PUT_2026-09-09",
+      "ticker": "QQQ",
+      "side": "PUT",
+      "session_date": "2026-09-09",
+      "expected_family": "B",
+      "narrative": "immediate entry became materially red before later recovery/continuation",
+      "durable": {
+        "client_id": "UNKNOWN",
+        "signal_id": "UNKNOWN",
+        "canonical_signal_id": "UNKNOWN",
+        "local_order_id": "UNKNOWN",
+        "execution_mode": "LIVE",
+        "trigger_crossed_at": "UNKNOWN",
+        "actual_entry_timestamp": "UNKNOWN",
+        "option_bid_ask_at_breach": "UNKNOWN",
+        "first_reclaim_timestamp": "UNKNOWN"
+      },
+      "breach_shape": {
+        "pattern": "UNKNOWN",
+        "timeframe": "UNKNOWN",
+        "breach_count": 1,
+        "fifteen_follow_through": false,
+        "five_status": "MISSING",
+        "percent_move_consumed": 0.15,
+        "remaining_r": 1.2,
+        "opposing_4h_in_path": false
+      }
+    },
+    {
+      "case_id": "HOOD_PUT_2026-09-09",
+      "ticker": "HOOD",
+      "side": "PUT",
+      "session_date": "2026-09-09",
+      "expected_family": "B",
+      "narrative": "pullback before later recovery/continuation",
+      "durable": {
+        "client_id": "UNKNOWN",
+        "signal_id": "UNKNOWN",
+        "canonical_signal_id": "UNKNOWN",
+        "local_order_id": "UNKNOWN",
+        "execution_mode": "LIVE",
+        "trigger_crossed_at": "UNKNOWN",
+        "actual_entry_timestamp": "UNKNOWN",
+        "option_bid_ask_at_breach": "UNKNOWN",
+        "first_reclaim_timestamp": "UNKNOWN"
+      },
+      "breach_shape": {
+        "pattern": "UNKNOWN",
+        "timeframe": "UNKNOWN",
+        "breach_count": 1,
+        "fifteen_follow_through": false,
+        "five_status": "MISSING",
+        "percent_move_consumed": 0.35,
+        "remaining_r": 0.9,
+        "opposing_4h_in_path": false
+      }
+    },
+    {
+      "case_id": "LULU_CALL_2026-09-08",
+      "ticker": "LULU",
+      "side": "CALL",
+      "session_date": "2026-09-08",
+      "expected_family": "B",
+      "narrative": "pullback before later recovery/continuation",
+      "durable": {
+        "client_id": "UNKNOWN",
+        "signal_id": "UNKNOWN",
+        "canonical_signal_id": "UNKNOWN",
+        "local_order_id": "UNKNOWN",
+        "execution_mode": "LIVE",
+        "trigger_crossed_at": "UNKNOWN",
+        "actual_entry_timestamp": "UNKNOWN",
+        "option_bid_ask_at_breach": "UNKNOWN",
+        "first_reclaim_timestamp": "UNKNOWN"
+      },
+      "breach_shape": {
+        "pattern": "UNKNOWN",
+        "timeframe": "UNKNOWN",
+        "breach_count": 1,
+        "fifteen_follow_through": false,
+        "five_status": "MISSING",
+        "percent_move_consumed": 0.4,
+        "remaining_r": 0.8,
+        "opposing_4h_in_path": false
+      }
+    },
+    {
+      "case_id": "NKE_CALL_2026-09-08",
+      "ticker": "NKE",
+      "side": "CALL",
+      "session_date": "2026-09-08",
+      "expected_family": "UNKNOWN",
+      "narrative": "required by later amendment text; durable production identity not yet located in PR docs",
+      "durable": {
+        "client_id": "UNKNOWN",
+        "signal_id": "UNKNOWN",
+        "canonical_signal_id": "UNKNOWN",
+        "local_order_id": "UNKNOWN",
+        "execution_mode": "LIVE",
+        "trigger_crossed_at": "UNKNOWN",
+        "actual_entry_timestamp": "UNKNOWN",
+        "option_bid_ask_at_breach": "UNKNOWN",
+        "first_reclaim_timestamp": "UNKNOWN"
+      },
+      "breach_shape": {
+        "pattern": "UNKNOWN",
+        "timeframe": "UNKNOWN",
+        "breach_count": 1,
+        "fifteen_follow_through": false,
+        "five_status": "MISSING",
+        "percent_move_consumed": null,
+        "remaining_r": null,
+        "opposing_4h_in_path": null
+      }
+    },
+    {
+      "case_id": "AAPL_PUT_2026-08-12_OPENING",
+      "ticker": "AAPL",
+      "side": "PUT",
+      "session_date": "2026-08-12",
+      "expected_family": "B",
+      "narrative": "Jason LIVE opening-window first breach; documented on PR #435",
+      "durable": {
+        "client_id": "jasoncosby1@gmail.com",
+        "signal_id": "83503891-b746-4c79-a39c-19e8cd8d4cd8",
+        "canonical_signal_id": "83503891-b746-4c79-a39c-19e8cd8d4cd8",
+        "local_order_id": "UNKNOWN",
+        "execution_mode": "LIVE",
+        "trigger_crossed_at": "2026-08-12T13:51:50Z",
+        "actual_entry_timestamp": "2026-08-12T13:51:51Z",
+        "option_bid_ask_at_breach": "UNKNOWN",
+        "first_reclaim_timestamp": "UNKNOWN"
+      },
+      "breach_shape": {
+        "pattern": "2-3",
+        "timeframe": "1d",
+        "breach_count": 1,
+        "fifteen_follow_through": false,
+        "five_status": "MISSING",
+        "percent_move_consumed": 0.2,
+        "remaining_r": 1.5,
+        "opposing_4h_in_path": true,
+        "trigger_price": 302.8,
+        "stop_price": 303.96,
+        "target_price": 300.0,
+        "underlying_price": 302.79
+      }
+    }
+  ]
+}
