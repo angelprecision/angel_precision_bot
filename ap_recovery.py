@@ -1381,10 +1381,21 @@ class APStartupRecovery:
                         return remaining >= qty
 
                 try:
-                    self.osm.transition(
-                        local_id, BROKER_TO_OSM.get(broker_status, "CANCELED"),
-                        last_error=f"recovery: broker_status={broker_status}",
+                    terminalized = bool(
+                        self.osm.transition(
+                            local_id, BROKER_TO_OSM.get(broker_status, "CANCELED"),
+                            last_error=f"recovery: broker_status={broker_status}",
+                        )
                     )
+                    if not terminalized:
+                        msg = (
+                            f"RECOVERY_TERMINAL_OSM_TRANSITION_HOLD "
+                            f"local={local_id} pos={pos_id} "
+                            f"broker_status={broker_status}"
+                        )
+                        log.critical("[%s] %s", self.client_id, msg)
+                        result.setdefault("errors", []).append(msg)
+                        continue
 
                     if _rwr(_can_reopen):
                         def _revert(pid=pos_id):
