@@ -92,6 +92,40 @@ class _AuditWatcher(APEntryWatcher):
         return None
 
 
+class _ReadbackOSM(_DispatchOSM):
+    def update_order_meta(self, local_order_id, patch, **kwargs):
+        self.calls.append((local_order_id, dict(patch), dict(kwargs)))
+        if kwargs.get("expected_new_trigger_authority"):
+            return False
+        if kwargs.get("expected_existing_trigger_authority"):
+            return (
+                patch.get("trigger_crossed_at") == self.row["meta"].get("trigger_crossed_at")
+                and patch.get("trigger_crossed_at_provenance")
+                == self.row["meta"].get("trigger_crossed_at_provenance")
+            )
+        return False
+
+    def read_trigger_confirmation_authority(
+        self,
+        local_order_id,
+        *,
+        client_id,
+        execution_mode,
+        signal_id,
+        canonical_signal_id,
+        expected_materialization_generation=None,
+    ):
+        if local_order_id != self.row["local_order_id"]:
+            return None
+        return {
+            "proven": True,
+            "trigger_crossed_at": self.row["meta"].get("trigger_crossed_at"),
+            "trigger_crossed_at_provenance": dict(
+                self.row["meta"].get("trigger_crossed_at_provenance") or {}
+            ),
+        }
+
+
 def _confirmed_dispatch(osm, signal, *, mode="PAPER"):
     watcher = _AuditWatcher(MagicMock(), order_state_machine=osm, mode=mode)
     watched = WatchedSignal(signal, overnight=False)
@@ -233,6 +267,39 @@ def test_legacy_timestamp_only_row_is_not_repaired_by_new_confirmation_writer():
 
     callback.assert_not_called()
     assert set(osm.row["meta"]) == {"trigger_crossed_at"}
+
+
+def test_response_loss_readback_normalizes_z_and_preserves_durable_spelling():
+    signal = _signal(local_order_id="local-confirm-603-z")
+    durable_timestamp = "2026-09-09T20:00:00Z"
+    signal["trigger_crossed_at"] = "2026-09-09T22:00:00+02:00"
+    durable_provenance = {
+        "canonical_signal_id": signal["canonical_signal_id"],
+        "client_id": signal["client_id"],
+        "execution_mode": "paper",
+        "local_order_id": signal["local_order_id"],
+    }
+    osm = _ReadbackOSM(
+        _row(
+            signal,
+            meta={
+                "trigger_crossed_at": durable_timestamp,
+                "trigger_crossed_at_provenance": durable_provenance,
+            },
+        )
+    )
+    watcher = _AuditWatcher(MagicMock(), order_state_machine=osm, mode="PAPER")
+    watched = WatchedSignal(signal, overnight=False)
+    watched._watcher_ref = watcher
+
+    assert watcher._persist_trigger_confirmation_authority(watched) is True
+    assert [call[2].get("expected_new_trigger_authority") for call in osm.calls] == [
+        True,
+        None,
+    ]
+    assert osm.calls[1][2]["expected_existing_trigger_authority"] is True
+    assert osm.calls[1][1]["trigger_crossed_at"] == durable_timestamp
+    assert osm.calls[1][1]["trigger_crossed_at_provenance"] == durable_provenance
 
 
 def test_ccep_shaped_live_timestamp_only_row_is_held_without_runner_backfill():

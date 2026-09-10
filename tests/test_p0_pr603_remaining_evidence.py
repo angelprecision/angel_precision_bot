@@ -102,6 +102,7 @@ def _create_orders_schema(url, schema):
                     qty INTEGER,
                     limit_price NUMERIC,
                     reserved_cost NUMERIC,
+                    contract_selection_status TEXT,
                     score NUMERIC,
                     tier TEXT,
                     trigger_price NUMERIC,
@@ -115,6 +116,9 @@ def _create_orders_schema(url, schema):
                 )
                 """
             )
+            cursor.execute(f'CREATE TABLE "{schema}".positions (id BIGSERIAL PRIMARY KEY)')
+            cursor.execute(f'CREATE TABLE "{schema}".proof_trades (id BIGSERIAL PRIMARY KEY)')
+            cursor.execute(f'CREATE TABLE "{schema}".trade_queue (id BIGSERIAL PRIMARY KEY)')
         admin.commit()
     finally:
         admin.close()
@@ -147,6 +151,66 @@ def _read_order(url, schema, local_order_id):
             return dict(row) if row else None
     finally:
         connection.close()
+
+
+def _read_side_effect_counts(url, schema):
+    import psycopg2
+
+    connection = psycopg2.connect(url)
+    try:
+        with connection.cursor() as cursor:
+            return {
+                table: cursor.execute(
+                    f'SELECT COUNT(*) FROM "{schema}".{table}'
+                ) or cursor.fetchone()[0]
+                for table in ("orders", "positions", "proof_trades", "trade_queue")
+            }
+    finally:
+        connection.close()
+
+
+class _CommitThenResponseLossPostgres(_ScopedPostgres):
+    """Commit the first UPDATE, then lose the response before rowcount."""
+
+    def __init__(self, url, schema, *, failure_pattern="trigger_crossed_at"):
+        super().__init__(url, schema)
+        self.failure_pattern = failure_pattern
+        self.response_loss_count = 0
+        self.authority_update_count = 0
+
+    @contextmanager
+    def conn(self):
+        import psycopg2
+        import psycopg2.extras
+
+        connection = psycopg2.connect(self.url)
+        cursor = connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        response_loss_for_this_connection = False
+        try:
+            cursor.execute(f'SET search_path TO "{self.schema}"')
+
+            class _Cursor(_RealDictCursor):
+                def execute(inner_self, sql, params=()):
+                    nonlocal response_loss_for_this_connection
+                    if (
+                        sql.lstrip().upper().startswith("UPDATE ORDERS")
+                        and self.failure_pattern in sql
+                    ):
+                        response_loss_for_this_connection = True
+                        self.authority_update_count += 1
+                    return super(_Cursor, inner_self).execute(sql, params)
+
+            yield _Cursor(cursor)
+            connection.commit()
+            if response_loss_for_this_connection and self.response_loss_count == 0:
+                self.response_loss_count += 1
+                raise ConnectionError("committed response lost before rowcount")
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            cursor.close()
+            connection.close()
 
 
 def _patch_postgres_modules(monkeypatch, scoped):
@@ -604,5 +668,335 @@ def test_postgres_confirmation_restart_reconstructs_authority_without_duplicate_
         assert reread["status"] == "PENDING_TRIGGER"
         assert reread["broker_order_id"] is None
         assert reread["submitted_ts"] is None
+
+        # The first poll in the fresh process is intentionally on the trigger
+        # side, but the durable retry schedule is still future-due.  Recovery
+        # owns the watcher without replaying callback/materialization work.
+        fresh_watcher._fetch_quotes = lambda _tickers: {
+            "AAPL": {"bid": 99.2, "ask": 100.6}
+        }
+        fresh_watcher._poll_active_signals(open_protect_active=False)
+        assert fresh_callback.call_count == 0
+        assert _read_order(url, schema, local_order_id)["meta"] == reread_meta
+    finally:
+        _drop_schema(url, schema)
+
+
+def test_postgres_post_commit_trigger_authority_response_loss_is_adopted_without_duplicates(
+    monkeypatch,
+):
+    """A committed UPDATE with a lost response is adopted exactly once."""
+    from ap_entry_watcher import APEntryWatcher, WatchedSignal
+    from ap.order_state_machine import APOrderStateMachine
+
+    url = _postgres_url_or_skip()
+    schema = f"pr603_response_loss_{uuid.uuid4().hex}"
+    client_id = "response-loss@example.com"
+    mode = "paper"
+    local_order_id = f"pr603-loss-{uuid.uuid4().hex}"
+    signal_id = f"signal-loss-{uuid.uuid4().hex}"
+    canonical_signal_id = f"canonical-loss-{uuid.uuid4().hex}"
+    _create_orders_schema(url, schema)
+    scoped = _CommitThenResponseLossPostgres(url, schema)
+
+    class _NoAuditWatcher(APEntryWatcher):
+        def _persist_watcher_audit(self, *args, **kwargs):
+            return None
+
+    try:
+        _patch_postgres_modules(monkeypatch, scoped)
+        meta = {
+            "signal_id": signal_id,
+            "canonical_signal_id": canonical_signal_id,
+            "client_id": client_id,
+            "execution_mode": mode,
+            "local_order_id": local_order_id,
+        }
+        _insert_order(
+            scoped,
+            local_order_id=local_order_id,
+            client_id=client_id,
+            mode=mode,
+            signal_id=signal_id,
+            meta=meta,
+            contract="AAPL240101C00100000",
+        )
+        before = _read_side_effect_counts(url, schema)
+
+        signal = {
+            "signal_id": signal_id,
+            "canonical_signal_id": canonical_signal_id,
+            "local_order_id": local_order_id,
+            "client_id": client_id,
+            "execution_mode": mode,
+            "ticker": "AAPL",
+            "side": "CALL",
+            "entry_price": 100.0,
+            "stop_price": 95.0,
+            "target_price": 105.0,
+            "score": 85.0,
+            "grade": "A",
+            "contract_symbol": "AAPL240101C00100000",
+            "metadata": dict(meta),
+        }
+        osm = APOrderStateMachine(client_id)
+        broker = MagicMock()
+        watcher = _NoAuditWatcher(broker, order_state_machine=osm, mode="PAPER")
+        watched = WatchedSignal(signal, overnight=False)
+        watched._watcher_ref = watcher
+        watcher._pending.append(watched)
+        watcher._dedup_set.add(signal_id)
+        callback_calls = []
+        selector = MagicMock()
+
+        def _callback(_watched):
+            callback_calls.append(local_order_id)
+            return None
+
+        watcher.on_trigger = _callback
+        quotes = iter(
+            (
+                {"AAPL": {"bid": 99.0, "ask": 100.5}},
+                {"AAPL": {"bid": 99.2, "ask": 100.6}},
+                {"AAPL": {"bid": 99.2, "ask": 100.6}},
+            )
+        )
+        watcher._fetch_quotes = lambda _tickers: next(quotes)
+
+        watcher._poll_active_signals(open_protect_active=False)
+        watcher._poll_active_signals(open_protect_active=False)
+        watcher._poll_active_signals(open_protect_active=False)
+
+        row = _read_order(url, schema, local_order_id)
+        durable_meta = dict(row["meta"] or {})
+        assert scoped.response_loss_count == 1
+        assert scoped.authority_update_count == 2, (
+            "the second UPDATE must be the fenced expected-existing CAS, "
+            "not a third new-authority attempt"
+        )
+        assert isinstance(durable_meta.get("trigger_crossed_at"), str)
+        assert datetime.fromisoformat(
+            durable_meta["trigger_crossed_at"].replace("Z", "+00:00")
+        ).tzinfo is not None
+        assert durable_meta["trigger_crossed_at_provenance"] == {
+            "canonical_signal_id": canonical_signal_id,
+            "client_id": client_id,
+            "execution_mode": mode,
+            "local_order_id": local_order_id,
+        }
+        assert callback_calls == [local_order_id]
+        assert selector.call_count == 0
+        assert not broker.submit_order.called
+        assert not broker.submit_entry.called
+        assert _read_side_effect_counts(url, schema) == before
+        assert watcher._pending == []
+        assert watched._trigger_authority_persisted is True
+    finally:
+        _drop_schema(url, schema)
+
+
+def test_postgres_restart_after_selector_claim_has_one_materialization_owner(
+    monkeypatch,
+):
+    """A crash after the fenced selector claim cannot create a second owner."""
+    from ap.order_state_machine import APOrderStateMachine
+    from ap_recovery import APStartupRecovery
+
+    url = _postgres_url_or_skip()
+    schema = f"pr603_claim_restart_{uuid.uuid4().hex}"
+    client_id = "claim-restart@example.com"
+    mode = "paper"
+    local_order_id = f"pr603-claim-{uuid.uuid4().hex}"
+    signal_id = f"signal-claim-{uuid.uuid4().hex}"
+    canonical_signal_id = f"canonical-claim-{uuid.uuid4().hex}"
+    _create_orders_schema(url, schema)
+    scoped = _ScopedPostgres(url, schema)
+    try:
+        _patch_postgres_modules(monkeypatch, scoped)
+        monkeypatch.setenv("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", "5")
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "60")
+        meta = _retry_meta(
+            local_order_id=local_order_id,
+            client_id=client_id,
+            mode=mode,
+            signal_id=signal_id,
+            canonical_signal_id=canonical_signal_id,
+            due_at=(datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat(),
+            trigger_crossed_at=(datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat(),
+        )
+        _insert_order(
+            scoped,
+            local_order_id=local_order_id,
+            client_id=client_id,
+            mode=mode,
+            signal_id=signal_id,
+            meta=meta,
+        )
+        osm = APOrderStateMachine(client_id)
+        crashed_core = _build_recovery_core(
+            osm,
+            client_id=client_id,
+            mode=mode,
+            callback_calls=[],
+            callback_lock=threading.Lock(),
+        )
+
+        def _crash_after_claim(_watched):
+            raise RuntimeError("simulated process death after selector claim")
+
+        crashed_core._on_entry_trigger = _crash_after_claim
+        result = crashed_core.resume_deferred_materialization_retry(
+            local_order_id=local_order_id,
+            expected_generation=7,
+            expected_retry_attempt=3,
+            owner=f"crash-owner:{local_order_id}",
+        )
+        assert result["disposition"] == "RETRY_WAIT"
+
+        claimed = _read_order(url, schema, local_order_id)
+        claimed_meta = dict(claimed["meta"] or {})
+        assert claimed_meta["materialization_generation"] == 8
+        assert claimed_meta["retry_attempt"] == 3
+        assert claimed_meta["materialization_owner"] == f"crash-owner:{local_order_id}"
+        assert claimed_meta["lifecycle_state"] == "RETRY_WAIT"
+        assert claimed_meta["materialization_status"] == "RETRY_PENDING"
+
+        # A fresh recovery object sees the retained future-due retry and
+        # reconstitutes exactly one watcher, without claiming generation 9.
+        fresh_osm = APOrderStateMachine(client_id)
+        from ap_entry_watcher import APEntryWatcher
+
+        fresh_watcher = APEntryWatcher(
+            MagicMock(), order_state_machine=fresh_osm, mode=mode.upper()
+        )
+        fresh_watcher._persist_watcher_audit = lambda *args, **kwargs: None
+        fresh_watcher._get_quote = lambda _ticker: {"bid": 99.0, "ask": 99.5}
+        fresh_core = _build_recovery_core(
+            fresh_osm,
+            client_id=client_id,
+            mode=mode,
+            callback_calls=[],
+            callback_lock=threading.Lock(),
+        )
+        recovery = APStartupRecovery(
+            client_id=client_id,
+            broker=fresh_core.broker,
+            osm=fresh_osm,
+            pm=None,
+            master_control=SimpleNamespace(mode=mode.upper()),
+            entry_watcher=fresh_watcher,
+            execution_core=fresh_core,
+        )
+        recovered = recovery.recover_deferred_lifecycles()
+        final = _read_order(url, schema, local_order_id)
+        final_meta = dict(final["meta"] or {})
+        assert recovered["errors"] == []
+        assert len(fresh_watcher._pending) == 1
+        assert final_meta["materialization_generation"] == 8
+        assert final_meta["retry_attempt"] == 3
+        assert final_meta["materialization_owner"] == f"crash-owner:{local_order_id}"
+        assert not fresh_core.broker.submit_order.called
+    finally:
+        _drop_schema(url, schema)
+
+
+def test_postgres_restart_during_copyback_keeps_one_owner_without_broker_replay(
+    monkeypatch,
+):
+    """A committed copyback with a lost response remains broker-free on restart."""
+    from ap.order_state_machine import APOrderStateMachine
+    from ap_recovery import APStartupRecovery
+
+    url = _postgres_url_or_skip()
+    schema = f"pr603_copyback_restart_{uuid.uuid4().hex}"
+    client_id = "copyback-restart@example.com"
+    mode = "paper"
+    local_order_id = f"pr603-copyback-{uuid.uuid4().hex}"
+    signal_id = f"signal-copyback-{uuid.uuid4().hex}"
+    canonical_signal_id = f"canonical-copyback-{uuid.uuid4().hex}"
+    _create_orders_schema(url, schema)
+    setup = _ScopedPostgres(url, schema)
+    try:
+        _patch_postgres_modules(monkeypatch, setup)
+        meta = _retry_meta(
+            local_order_id=local_order_id,
+            client_id=client_id,
+            mode=mode,
+            signal_id=signal_id,
+            canonical_signal_id=canonical_signal_id,
+            due_at=(datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat(),
+            trigger_crossed_at=(datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat(),
+        )
+        _insert_order(
+            setup,
+            local_order_id=local_order_id,
+            client_id=client_id,
+            mode=mode,
+            signal_id=signal_id,
+            meta=meta,
+        )
+        owner = f"copyback-owner:{local_order_id}"
+        osm = APOrderStateMachine(client_id)
+        assert osm.claim_deferred_materialization(
+            local_order_id,
+            owner=owner,
+            new_generation=8,
+            lease_until=(datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+            trigger_crossed_at=meta["trigger_crossed_at"],
+            trigger_price=100.0,
+            observed_underlying_price=101.0,
+            signal_id=signal_id,
+            execution_mode=mode,
+            retry_attempt=3,
+        )
+
+        # The copyback UPDATE commits, then its response is lost.  The OSM
+        # returns False, but fresh durable state must be BROKER_READY and owned.
+        copyback = _CommitThenResponseLossPostgres(
+            url, schema, failure_pattern="contract_selection_status"
+        )
+        _patch_postgres_modules(monkeypatch, copyback)
+        copyback_osm = APOrderStateMachine(client_id)
+        assert not copyback_osm.persist_deferred_broker_ready(
+            local_order_id,
+            owner=owner,
+            generation=8,
+            signal_id=signal_id,
+            execution_mode=mode,
+            contract="AAPL240101C00100000",
+            limit_price=1.25,
+            qty=1,
+            reserved_cost=125.0,
+            selector_meta={"selector": "real-postgres-test"},
+        )
+        durable = _read_order(url, schema, local_order_id)
+        durable_meta = dict(durable["meta"] or {})
+        assert copyback.response_loss_count == 1
+        assert durable_meta["broker_ready"] is True
+        assert durable_meta["lifecycle_state"] == "BROKER_READY"
+        assert durable_meta["materialization_generation"] == 8
+        assert durable_meta["materialization_owner"] == owner
+        assert durable["contract"] == "AAPL240101C00100000"
+
+        # Fresh recovery has no broker-submit executor for this BROKER_READY
+        # proof. It must retain the durable owner and perform zero broker work.
+        fresh_broker = MagicMock()
+        recovery = APStartupRecovery(
+            client_id=client_id,
+            broker=fresh_broker,
+            osm=APOrderStateMachine(client_id),
+            pm=None,
+            master_control=SimpleNamespace(mode=mode.upper()),
+            entry_watcher=None,
+            execution_core=None,
+        )
+        recovery_result = recovery.recover_deferred_lifecycles()
+        after = _read_order(url, schema, local_order_id)
+        after_meta = dict(after["meta"] or {})
+        assert recovery_result["errors"] == []
+        assert after_meta["materialization_generation"] == 8
+        assert after_meta["materialization_owner"] == owner
+        assert not fresh_broker.submit_order.called
+        assert not fresh_broker.submit_entry.called
     finally:
         _drop_schema(url, schema)

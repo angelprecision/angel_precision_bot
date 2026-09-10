@@ -2382,6 +2382,200 @@ class APOrderStateMachine:
             )
             return False
 
+    def read_trigger_confirmation_authority(
+        self,
+        local_order_id: str,
+        *,
+        client_id: str,
+        execution_mode: str,
+        signal_id: str,
+        canonical_signal_id: str,
+        expected_materialization_generation: int | None = None,
+    ) -> dict | None:
+        """Read one exact, broker-free durable trigger authority.
+
+        This is deliberately a read-only proof boundary.  It is used after a
+        CAS reports ``False`` because the connection may have failed after
+        PostgreSQL committed the UPDATE but before the caller observed its
+        rowcount.  Every identity and lifecycle predicate is applied in SQL;
+        the JSONB payload is then validated again without coercion so legacy,
+        contradictory, or broker-bearing rows cannot be adopted as authority.
+        The raw timestamp and provenance are returned unchanged for a later
+        expected-existing CAS.
+        """
+        _local = str(local_order_id or "").strip()
+        _client = str(client_id or "").strip().lower()
+        _mode = str(execution_mode or "").strip().lower()
+        _signal = str(signal_id or "").strip()
+        _canonical = str(canonical_signal_id or "").strip()
+        if (
+            not _local
+            or not _client
+            or _client != str(self.client_id or "").strip().lower()
+            or _mode not in {"live", "paper"}
+            or not _signal
+            or not _canonical
+        ):
+            return None
+        if expected_materialization_generation is not None and (
+            isinstance(expected_materialization_generation, bool)
+            or not isinstance(expected_materialization_generation, int)
+            or expected_materialization_generation < 1
+        ):
+            return None
+
+        def _parse_exact_timestamp(raw):
+            if not isinstance(raw, str) or not raw.strip():
+                return None
+            try:
+                _value = datetime.fromisoformat(
+                    raw.strip()[:-1] + "+00:00"
+                    if raw.strip().endswith("Z")
+                    else raw.strip()
+                )
+                if _value.tzinfo is None or _value.utcoffset() is None:
+                    return None
+                return _value
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        def _read():
+            with conn() as c:
+                _sql = """
+                    SELECT local_order_id, client_id, signal_id,
+                           canonical_signal_id, execution_mode, status,
+                           broker_order_id, submitted_ts, meta
+                      FROM orders
+                     WHERE local_order_id = %s
+                       AND LOWER(TRIM(COALESCE(client_id, ''))) = %s
+                       AND kind = 'ENTRY'
+                       AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                       AND COALESCE(signal_id, '') = %s
+                       AND COALESCE(NULLIF(canonical_signal_id, ''),
+                                    NULLIF(meta->>'canonical_signal_id', ''), '') = %s
+                       AND (NULLIF(canonical_signal_id, '') IS NULL
+                            OR NULLIF(meta->>'canonical_signal_id', '') IS NULL
+                            OR NULLIF(canonical_signal_id, '') =
+                               NULLIF(meta->>'canonical_signal_id', ''))
+                       AND UPPER(COALESCE(status, '')) = 'PENDING_TRIGGER'
+                       AND COALESCE(broker_order_id, '') = ''
+                       AND submitted_ts IS NULL
+                       AND NULLIF(COALESCE(meta->>'submit_intent_at', ''), '') IS NULL
+                       AND LOWER(COALESCE(meta->>'broker_ready', 'false')) IN ('false', '')
+                """
+                _params = [_local, _client, _mode, _signal, _canonical]
+                if expected_materialization_generation is not None:
+                    _sql += """
+                       AND jsonb_typeof(COALESCE(meta, '{}'::jsonb)->
+                                        'materialization_generation') = 'number'
+                       AND meta->>'materialization_generation' = %s
+                    """
+                    _params.append(str(expected_materialization_generation))
+                _sql += " LIMIT 2"
+                c.execute(_sql, tuple(_params))
+                return c.fetchall()
+
+        try:
+            _rows = run_with_retry(_read)
+        except Exception as exc:
+            log.warning(
+                "[%s] trigger authority readback failed for local_order_id=%s: %s",
+                self.client_id, _local, exc,
+            )
+            return None
+        if not _rows or len(_rows) != 1:
+            return None
+        _row = dict(_rows[0])
+        _meta = _row.get("meta") or {}
+        if isinstance(_meta, str):
+            try:
+                _meta = json.loads(_meta)
+            except Exception:
+                return None
+        if not isinstance(_meta, dict):
+            return None
+
+        # Recheck all exact identity fields after the SQL scope.  A row with
+        # contradictory duplicated identity is not an authority even if one
+        # of its copies happened to satisfy the selector predicate.
+        if (
+            str(_row.get("local_order_id") or "").strip() != _local
+            or str(_row.get("client_id") or "").strip().lower() != _client
+            or str(_row.get("signal_id") or "").strip() != _signal
+            or str(_row.get("execution_mode") or "").strip().lower() != _mode
+            or str(_row.get("canonical_signal_id") or "").strip() != _canonical
+        ):
+            return None
+        for _key, _expected in (
+            ("local_order_id", _local),
+            ("client_id", _client),
+            ("execution_mode", _mode),
+            ("signal_id", _signal),
+            ("canonical_signal_id", _canonical),
+        ):
+            if _key not in _meta:
+                continue
+            _actual = _meta.get(_key)
+            if not isinstance(_actual, str):
+                return None
+            _actual = _actual.strip().lower() if _key in {"client_id", "execution_mode"} else _actual.strip()
+            if _actual != _expected:
+                return None
+
+        _crossed_raw = _meta.get("trigger_crossed_at")
+        _crossed_dt = _parse_exact_timestamp(_crossed_raw)
+        _provenance = _meta.get("trigger_crossed_at_provenance")
+        if _crossed_dt is None or not isinstance(_provenance, dict):
+            return None
+        _expected_provenance = {
+            "canonical_signal_id": _canonical,
+            "client_id": _client,
+            "execution_mode": _mode,
+            "local_order_id": _local,
+        }
+        for _key, _expected in _expected_provenance.items():
+            _actual = _provenance.get(_key)
+            if not isinstance(_actual, str) or not _actual.strip():
+                return None
+            _actual = _actual.strip().lower() if _key in {"client_id", "execution_mode"} else _actual.strip()
+            if _actual != _expected:
+                return None
+
+        # False is a valid explicit non-ready marker; any other value is not
+        # absence of broker authority and must not be adopted.
+        if "broker_ready" in _meta and _meta.get("broker_ready") not in (None, False, ""):
+            return None
+        if "submit_intent_at" in _meta and _meta.get("submit_intent_at") not in (None, ""):
+            return None
+        if _row.get("broker_order_id") not in (None, "") or _row.get("submitted_ts") is not None:
+            return None
+
+        _generation = None
+        if "materialization_generation" in _meta and _meta.get("materialization_generation") is not None:
+            _generation = _meta.get("materialization_generation")
+            if (
+                isinstance(_generation, bool)
+                or not isinstance(_generation, int)
+                or _generation < 1
+                or expected_materialization_generation != _generation
+            ):
+                return None
+        elif expected_materialization_generation is not None:
+            return None
+
+        return {
+            "proven": True,
+            "local_order_id": _local,
+            "client_id": _client,
+            "execution_mode": _mode,
+            "signal_id": _signal,
+            "canonical_signal_id": _canonical,
+            "trigger_crossed_at": _crossed_raw,
+            "trigger_crossed_at_utc": _crossed_dt.astimezone(timezone.utc).isoformat(),
+            "trigger_crossed_at_provenance": dict(_provenance),
+            "materialization_generation": _generation,
+        }
+
     def retire_unsubmitted_exit_intent(self, local_order_id: str, *, last_error: str) -> bool:
         """Atomically retire one EXIT_REQUESTED row only if no submit evidence exists."""
         error_text = str(last_error or "NO_POST_ATTEMPTED")

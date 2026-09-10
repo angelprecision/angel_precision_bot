@@ -215,6 +215,48 @@ def test_runtime_scheduler_survives_one_tick_failure(monkeypatch):
     assert not runner.deferred_recovery_thread.is_alive()
     assert tick.call_count == 2
     assert runner.deferred_recovery_errors == 1
+    assert runner.deferred_recovery_completed_ticks == 2
+    assert runner.last_deferred_recovery_completed_ts > 0
+
+
+def test_runtime_scheduler_handle_is_never_replaced_after_exit(monkeypatch):
+    """A dead scheduler is a health fault, never a reason to overlap one."""
+    runner = _runner()
+    runner.stopped = _PulseEvent([True])
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    first = runner.deferred_recovery_thread
+    first.join(timeout=2)
+    assert not first.is_alive()
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    assert runner.deferred_recovery_thread is first
+
+
+def test_scheduler_health_dead_or_stale_fails_closed_without_restart():
+    runner = _runner()
+    runner.entries_allowed = threading.Event()
+    runner.entries_allowed.set()
+    runner.degraded = threading.Event()
+    runner.degraded_reasons = set()
+    runner._degraded_lock = threading.Lock()
+
+    dead = types.SimpleNamespace(is_alive=lambda: False)
+    runner.deferred_recovery_thread = dead
+    assert runner._check_deferred_recovery_scheduler_health(now=100.0) is False
+    assert not runner.entries_allowed.is_set()
+    assert "deferred_recovery_scheduler_dead" in runner.degraded_reasons
+
+    runner.degraded_reasons.clear()
+    runner.entries_allowed.set()
+    runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.deferred_recovery_started_ts = 10.0
+    runner.last_deferred_recovery_completed_ts = 20.0
+    runner.deferred_recovery_heartbeat_max_sec = 5.0
+    assert runner._check_deferred_recovery_scheduler_health(now=100.0) is False
+    assert not runner.entries_allowed.is_set()
+    assert "deferred_recovery_scheduler_stale" in runner.degraded_reasons
 
 
 def test_runtime_scheduler_serializes_a_slow_tick_without_overlap(monkeypatch):

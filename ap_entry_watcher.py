@@ -121,7 +121,10 @@ def _parse_trigger_crossed_at(raw) -> Optional[datetime]:
         return None
     # datetime instances: accept iff tz-aware.
     if isinstance(raw, datetime):
-        return raw if raw.tzinfo is not None else None
+        try:
+            return raw if raw.tzinfo is not None and raw.utcoffset() is not None else None
+        except (TypeError, ValueError, OverflowError):
+            return None
     # Anything else must be a non-empty ISO-8601 string with tz info.
     if not isinstance(raw, str):
         return None
@@ -134,7 +137,11 @@ def _parse_trigger_crossed_at(raw) -> Optional[datetime]:
         value = datetime.fromisoformat(text)
     except (TypeError, ValueError):
         return None
-    if value.tzinfo is None:
+    try:
+        _offset = value.utcoffset()
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if value.tzinfo is None or _offset is None:
         return None
     return value
 
@@ -762,6 +769,26 @@ class WatchedSignal:
         # fresh canonical breach is observed.
         self.trigger_crossed_at: Optional[datetime] = _parse_trigger_crossed_at(
             _trigger_crossed_raw
+        )
+        # Set immediately before this process enters on_trigger().  A failed
+        # durable write may be adopted only while callback work has not begun;
+        # once callback execution starts, response-loss recovery must remain
+        # fail-closed rather than trying to infer ownership retroactively.
+        self._trigger_callback_started: bool = False
+        self._trigger_authority_persisted: bool = bool(
+            signal.pop("__durable_trigger_authority_proven", False)
+        )
+        self._durable_trigger_crossed_at_raw = (
+            _trigger_crossed_raw if isinstance(_trigger_crossed_raw, str) else None
+        )
+        _durable_provenance = signal.get("metadata", {}).get(
+            "trigger_crossed_at_provenance"
+        ) if isinstance(signal.get("metadata"), dict) else None
+        self._durable_trigger_crossed_at_provenance = (
+            dict(_durable_provenance)
+            if self._trigger_authority_persisted
+            and isinstance(_durable_provenance, dict)
+            else None
         )
         # PR #407: pending (unconfirmed) first-breach timestamp. Populated on
         # the first breach poll of a streak, promoted into trigger_crossed_at
@@ -3808,6 +3835,90 @@ class APEntryWatcher:
         }
 
         if _recovery_rearm or _materialization_resume:
+            # A timestamp in a reconstructed plan is not authority by itself.
+            # Re-read the exact broker-free durable row before hydrating the
+            # watcher, preserving the existing classifier below for rows with
+            # no proven materialization owner.
+            _raw_recovery_crossed_at = signal_dict.get("trigger_crossed_at")
+            if _raw_recovery_crossed_at is None:
+                _signal_meta = signal_dict.get("metadata") or {}
+                if isinstance(_signal_meta, dict):
+                    _raw_recovery_crossed_at = _signal_meta.get("trigger_crossed_at")
+            if _raw_recovery_crossed_at is not None:
+                _reader = getattr(
+                    getattr(self, "order_state_machine", None),
+                    "read_trigger_confirmation_authority",
+                    None,
+                )
+                _readback_ok = False
+                if callable(_reader):
+                    _provenance_for_read = _build_trigger_crossed_at_provenance(
+                        signal_dict, local_order_id
+                    )
+                    _generation_ok, _generation_for_read = (
+                        _expected_materialization_generation(signal_dict)
+                    )
+                    if _generation_ok:
+                        try:
+                            _readback = _reader(
+                                local_order_id,
+                                client_id=_provenance_for_read["client_id"],
+                                execution_mode=_provenance_for_read["execution_mode"],
+                                signal_id=str(signal_dict.get("signal_id") or "").strip(),
+                                canonical_signal_id=_provenance_for_read[
+                                    "canonical_signal_id"
+                                ],
+                                expected_materialization_generation=(
+                                    _generation_for_read
+                                    if _materialization_resume
+                                    else None
+                                ),
+                            )
+                        except Exception:
+                            _readback = None
+                        _source_dt = _parse_trigger_crossed_at(_raw_recovery_crossed_at)
+                        _durable_raw = (
+                            _readback.get("trigger_crossed_at")
+                            if isinstance(_readback, dict)
+                            else None
+                        )
+                        _durable_dt = _parse_trigger_crossed_at(_durable_raw)
+                        _readback_ok = bool(
+                            isinstance(_readback, dict)
+                            and _readback.get("proven") is True
+                            and _source_dt is not None
+                            and _durable_dt is not None
+                            and _source_dt.astimezone(timezone.utc)
+                            == _durable_dt.astimezone(timezone.utc)
+                            and _trigger_crossed_at_provenance_matches(
+                                _readback.get("trigger_crossed_at_provenance"),
+                                signal_dict,
+                                local_order_id,
+                            )
+                        )
+                        if _readback_ok:
+                            # Preserve the exact durable spelling (including Z
+                            # versus +00:00) and provenance for the next CAS.
+                            signal_dict["trigger_crossed_at"] = _durable_raw
+                            _metadata = signal_dict.setdefault("metadata", {})
+                            if isinstance(_metadata, dict):
+                                _metadata["trigger_crossed_at"] = _durable_raw
+                                _metadata["trigger_crossed_at_provenance"] = dict(
+                                    _readback["trigger_crossed_at_provenance"]
+                                )
+                            signal_dict["__durable_trigger_authority_proven"] = True
+                if not _readback_ok:
+                    self._last_reject_reason = (
+                        RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+                    )
+                    log.critical(
+                        "[%s] %s local_order_id=%s — exact durable trigger "
+                        "authority readback failed; refusing recovery rearm",
+                        signal_dict.get("ticker") or "?",
+                        RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+                        local_order_id or "?",
+                    )
+                    return False
             if not recovery_trigger_evidence_identity_is_proven(
                 signal_dict, local_order_id
             ):
@@ -5682,10 +5793,20 @@ class APEntryWatcher:
             # before downstream execution.  A changed durable row, broker
             # evidence, or lost ownership therefore remains fail-closed.
             patch = {
-                "trigger_crossed_at": patch["trigger_crossed_at"],
-                "trigger_crossed_at_provenance": patch[
-                    "trigger_crossed_at_provenance"
-                ],
+                "trigger_crossed_at": (
+                    getattr(watched, "_durable_trigger_crossed_at_raw", None)
+                    or patch["trigger_crossed_at"]
+                ),
+                "trigger_crossed_at_provenance": (
+                    dict(
+                        getattr(
+                            watched,
+                            "_durable_trigger_crossed_at_provenance",
+                            None,
+                        )
+                        or patch["trigger_crossed_at_provenance"]
+                    )
+                ),
             }
             _update_kwargs["expected_existing_trigger_authority"] = True
         else:
@@ -5707,7 +5828,87 @@ class APEntryWatcher:
                 )
             )
             if not persisted:
-                return False
+                # PostgreSQL may have committed the new authority while the
+                # connection failed before rowcount reached this process.
+                # Adopt only an exact, broker-free durable proof, and only
+                # before this process has entered callback work.  The second
+                # write remains the existing-authority CAS; this is never a
+                # downgrade to an unconditional existing-row update.
+                if (
+                    not getattr(watched, "_trigger_authority_persisted", False)
+                    and not getattr(watched, "_trigger_callback_started", False)
+                ):
+                    _reader = getattr(
+                        self.order_state_machine,
+                        "read_trigger_confirmation_authority",
+                        None,
+                    )
+                    _readback = None
+                    if callable(_reader):
+                        try:
+                            _readback = _reader(
+                                local_order_id,
+                                client_id=provenance["client_id"],
+                                execution_mode=_expected_mode,
+                                signal_id=_expected_signal_id,
+                                canonical_signal_id=provenance[
+                                    "canonical_signal_id"
+                                ],
+                                expected_materialization_generation=(
+                                    _expected_generation
+                                ),
+                            )
+                        except Exception:
+                            _readback = None
+                    _durable_raw = (
+                        _readback.get("trigger_crossed_at")
+                        if isinstance(_readback, dict)
+                        else None
+                    )
+                    _durable_dt = _parse_trigger_crossed_at(_durable_raw)
+                    _same_timestamp = bool(
+                        _durable_dt is not None
+                        and _durable_dt.astimezone(timezone.utc)
+                        == trigger_crossed_dt.astimezone(timezone.utc)
+                    )
+                    _same_provenance = bool(
+                        isinstance(_readback, dict)
+                        and _trigger_crossed_at_provenance_matches(
+                            _readback.get("trigger_crossed_at_provenance"),
+                            signal,
+                            local_order_id,
+                        )
+                    )
+                    if (
+                        isinstance(_readback, dict)
+                        and _readback.get("proven") is True
+                        and _same_timestamp
+                        and _same_provenance
+                    ):
+                        watched._trigger_authority_persisted = True
+                        watched._durable_trigger_crossed_at_raw = _durable_raw
+                        watched._durable_trigger_crossed_at_provenance = dict(
+                            _readback["trigger_crossed_at_provenance"]
+                        )
+                        patch = {
+                            "trigger_crossed_at": _durable_raw,
+                            "trigger_crossed_at_provenance": dict(
+                                _readback["trigger_crossed_at_provenance"]
+                            ),
+                        }
+                        _update_kwargs.pop("expected_new_trigger_authority", None)
+                        _update_kwargs["expected_existing_trigger_authority"] = True
+                        persisted = bool(
+                            update_order_meta(
+                                local_order_id,
+                                patch,
+                                **_update_kwargs,
+                            )
+                        )
+                    if not persisted:
+                        return False
+                else:
+                    return False
         except Exception:
             log.exception(
                 "WATCHER_TRIGGER_AUTHORITY_PERSIST_FAILED local_order_id=%s",
@@ -5716,6 +5917,10 @@ class APEntryWatcher:
             return False
 
         watched._trigger_authority_persisted = True
+        watched._durable_trigger_crossed_at_raw = patch.get("trigger_crossed_at")
+        watched._durable_trigger_crossed_at_provenance = dict(
+            patch.get("trigger_crossed_at_provenance") or {}
+        )
         log.info(
             "WATCHER_TRIGGER_TIMESTAMPS_PERSISTED "
             "WATCHER_TRIGGER_AUTHORITY_PERSISTED local_order_id=%s "
@@ -5884,6 +6089,7 @@ class APEntryWatcher:
 
                     # ── Call the trigger callback — timestamps are now durable ──
                     try:
+                        w._trigger_callback_started = True
                         _callback_result = self.on_trigger(w)
                         _callback_disposition, _callback_next_retry = (
                             self._resolve_trigger_callback_disposition(w, _callback_result)

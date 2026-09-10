@@ -691,7 +691,10 @@ class ClientRunner(threading.Thread):
         self.last_worker_heartbeat_ts = 0.0
         self.last_equity_heartbeat_ts = 0.0
         self.last_deferred_recovery_ts = 0.0
+        self.deferred_recovery_started_ts = 0.0
+        self.last_deferred_recovery_completed_ts = 0.0
         self.deferred_recovery_ticks = 0
+        self.deferred_recovery_completed_ticks = 0
         self.deferred_recovery_errors = 0
 
         self.core = None
@@ -713,6 +716,7 @@ class ClientRunner(threading.Thread):
         self.equity_thread = None
         self.health_thread = None
         self.deferred_recovery_thread = None
+        self._deferred_recovery_scheduler_start_lock = threading.Lock()
         self.failure_reason: str = ""
         self._overnight_reeval_attempt_lock = threading.Lock()
         self._overnight_reeval_state_date = None
@@ -2755,15 +2759,39 @@ class ClientRunner(threading.Thread):
         if self.stopping.is_set() or self.stopped.is_set() or self.failed.is_set():
             return
 
-        current = getattr(self, "deferred_recovery_thread", None)
-        if current is not None and current.is_alive():
-            return
+        _start_lock = getattr(self, "_deferred_recovery_scheduler_start_lock", None)
+        if _start_lock is None:
+            # object.__new__ fixtures do not run __init__; serialize the one
+            # time compatibility initialization under the registry lock so
+            # two callers cannot create overlapping scheduler threads.
+            with _registry_lock:
+                _start_lock = getattr(
+                    self, "_deferred_recovery_scheduler_start_lock", None
+                )
+                if _start_lock is None:
+                    _start_lock = threading.Lock()
+                    self._deferred_recovery_scheduler_start_lock = _start_lock
+
+        with _start_lock:
+            # A non-None handle is permanent for this runner lifetime.  A dead
+            # child is a health fault, not permission to launch a second
+            # executor against the same durable recovery boundary.
+            current = getattr(self, "deferred_recovery_thread", None)
+            if current is not None:
+                return
 
         try:
             interval = float(os.getenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "20"))
         except (TypeError, ValueError):
             interval = 20.0
         interval = max(1.0, interval)
+        self.deferred_recovery_interval_sec = interval
+        self.deferred_recovery_heartbeat_max_sec = max(
+            60.0,
+            interval * 3.0,
+        )
+        self.deferred_recovery_started_ts = time.time()
+        self.last_deferred_recovery_completed_ts = 0.0
 
         def _scheduler_loop():
             logger.info(
@@ -2788,14 +2816,63 @@ class ClientRunner(threading.Thread):
                         _autonomy_log_context(self.mode).get("commit_sha"),
                         exc_info=True,
                     )
+                finally:
+                    # Liveness is based on completed work.  A tick that is
+                    # stuck inside recovery must age out and fail closed.
+                    self.last_deferred_recovery_completed_ts = time.time()
+                    self.deferred_recovery_completed_ticks = getattr(
+                        self, "deferred_recovery_completed_ticks", 0
+                    ) + 1
             logger.info("[%s] Deferred retry scheduler stopped", self.email)
 
-        self.deferred_recovery_thread = threading.Thread(
-            target=_scheduler_loop,
-            daemon=True,
-            name=f"runner-deferred-retry-{self.email}",
+        with _start_lock:
+            # Recheck under the lock in case another caller won the race
+            # while this thread was resolving interval configuration.
+            if getattr(self, "deferred_recovery_thread", None) is not None:
+                return
+            self.deferred_recovery_thread = threading.Thread(
+                target=_scheduler_loop,
+                daemon=True,
+                name=f"runner-deferred-retry-{self.email}",
+            )
+            self.deferred_recovery_thread.start()
+
+    def _check_deferred_recovery_scheduler_health(self, now: float | None = None) -> bool:
+        """Hold new entries when the one-and-only scheduler is dead or stale."""
+        _thread = getattr(self, "deferred_recovery_thread", None)
+        if _thread is None or not _thread.is_alive():
+            logger.critical(
+                "[%s] DEFERRED_RECOVERY_SCHEDULER_DEAD — blocking new entries; "
+                "no overlapping scheduler will be started",
+                self.email,
+            )
+            self._enter_degraded_mode(
+                "deferred_recovery_scheduler_dead", stop_runner=False
+            )
+            return False
+
+        _now = time.time() if now is None else float(now)
+        _started = float(getattr(self, "deferred_recovery_started_ts", 0.0) or 0.0)
+        _completed = float(
+            getattr(self, "last_deferred_recovery_completed_ts", 0.0) or 0.0
         )
-        self.deferred_recovery_thread.start()
+        _heartbeat_max = float(
+            getattr(self, "deferred_recovery_heartbeat_max_sec", 60.0) or 60.0
+        )
+        _reference = _completed or _started
+        if not _reference or (_now - _reference) > _heartbeat_max:
+            logger.critical(
+                "[%s] DEFERRED_RECOVERY_SCHEDULER_STALE — blocking new entries; "
+                "last_completed_ts=%s heartbeat_max_sec=%.1f",
+                self.email,
+                _completed or None,
+                _heartbeat_max,
+            )
+            self._enter_degraded_mode(
+                "deferred_recovery_scheduler_stale", stop_runner=False
+            )
+            return False
+        return True
 
     def _detect_manual_closes(self):
         """Delegate to ap.manual_close_reconciliation.
@@ -2875,6 +2952,7 @@ class ClientRunner(threading.Thread):
                 self._run_overnight_reeval_if_due()  # Arm WATCHING signals at 9:00-9:45 AM ET
                 self._run_exit_autonomous_recovery() # Resolve CLOSING-forever positions every 60s
                 self._detect_manual_closes()         # Detect broker-closed positions not in DB
+                self._check_deferred_recovery_scheduler_health()
                 self._set_entry_permission()
 
                 try:
@@ -3536,8 +3614,8 @@ class ClientRunner(threading.Thread):
         self.initialized.set()
         self._set_entry_permission()
         self._run_startup_morning_handoff()
-        self._start_runtime_health_loop()
         self._start_deferred_breach_lifecycle_scheduler()
+        self._start_runtime_health_loop()
 
         logger.info(
             "[%s] Control stack initialized | mode=%s max_pos=%s max_trades=%s daily_loss=$%.0f entries_allowed=%s",
