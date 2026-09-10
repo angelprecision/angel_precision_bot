@@ -185,6 +185,7 @@ def postgres_harness(monkeypatch):
                     filled_ts TIMESTAMPTZ,
                     broker_order_id TEXT,
                     meta JSONB,
+                    last_error TEXT,
                     updated_ts TIMESTAMPTZ
                 )
             """)
