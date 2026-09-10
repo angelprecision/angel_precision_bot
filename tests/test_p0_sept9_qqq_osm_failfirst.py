@@ -208,6 +208,20 @@ def postgres_harness(monkeypatch):
         monkeypatch.setattr(pm_mod,  "run_with_retry", lambda fn, **kw: fn())
         monkeypatch.setattr(osm_mod, "conn",           harness.conn)
         monkeypatch.setattr(osm_mod, "run_with_retry", lambda fn, **kw: fn())
+
+        # Earlier P0 tests reload/patch ap.order_state_machine.  The class
+        # collected by this module can therefore retain a different globals
+        # dictionary from the module currently present in sys.modules.  Bind
+        # the exact method globals used by this real OSM call path.
+        osm_method_globals = APOrderStateMachine._get_order.__globals__
+        monkeypatch.setitem(osm_method_globals, "conn", harness.conn)
+        monkeypatch.setitem(osm_method_globals, "run_with_retry", lambda fn, **kw: fn())
+
+        pm_method_globals = (
+            APPositionManager.converge_position_from_durable_exit_order.__globals__
+        )
+        monkeypatch.setitem(pm_method_globals, "conn", harness.conn)
+        monkeypatch.setitem(pm_method_globals, "run_with_retry", lambda fn, **kw: fn())
         yield harness
     finally:
         connection.rollback()
