@@ -28,10 +28,15 @@ os.environ["INTELLIGENCE_CONTEXT_STORE_BACKEND"] = "memory"
 
 from ap.intelligence_context_materializer import (  # noqa: E402
     build_intelligence_context_payload,
+    build_snapshot_kwargs,
     enqueue_breach_context,
     recover_missing_intelligence_jobs,
     resolve_breach_lineage,
     resolve_public_breach_lifecycle,
+    _stable_hash,
+)
+from ap.intelligence_context_handoff import (  # noqa: E402
+    enqueue_breach_context_best_effort,
 )
 from ap.intelligence_snapshot_store import (  # noqa: E402
     _MEMORY_JOBS,
@@ -624,3 +629,402 @@ def test_restart_db_unavailable_shape_is_diagnostic(monkeypatch):
         "error": "pg_down",
     }
     assert _MEMORY_JOBS == {}
+
+
+# ---------------------------------------------------------------------------
+# Three-path frozen-envelope parity (ONE envelope → runtime / restart / materializer)
+# ---------------------------------------------------------------------------
+#
+# Feeds a single frozen BREACH envelope through:
+#   1) runtime enqueue_breach_context (and sync best-effort handoff)
+#   2) recover_missing_intelligence_jobs rebuild from durable order meta
+#   3) build_snapshot_kwargs materializer path
+# and asserts byte-identical / deep-equal critical fields across all three.
+
+
+def _candle(ts: str, o: float, h: float, l: float, c: float) -> dict[str, Any]:
+    return {"time": ts, "open": o, "high": h, "low": l, "close": c, "volume": 1000}
+
+
+# Deterministic 4h/1h geometry (same series used by market_structure freeze P0).
+_FROZEN_4H_1H = [
+    _candle("2026-09-04T09:30:00-04:00", 94.0, 95.0, 93.0, 94.5),
+    _candle("2026-09-04T13:30:00-04:00", 95.0, 96.5, 94.8, 96.0),
+    _candle("2026-09-05T09:30:00-04:00", 97.0, 98.0, 97.0, 97.5),
+    _candle("2026-09-05T13:30:00-04:00", 105.5, 107.0, 105.0, 105.2),
+    _candle("2026-09-08T09:30:00-04:00", 105.0, 105.5, 103.5, 104.0),
+    _candle("2026-09-08T13:30:00-04:00", 103.8, 104.2, 102.5, 103.0),
+    _candle("2026-09-09T09:30:00-04:00", 100.0, 101.0, 99.5, 100.5),
+]
+
+_FROZEN_AS_OF = "2026-09-09T14:05:00+00:00"
+_FROZEN_CONFIRMED = "2026-09-09T14:05:02+00:00"
+
+
+def _order_meta_for_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Durable order.meta subset that recovery merges into the rebuild signal."""
+    keys = (
+        "trigger_crossed_at",
+        "trigger_confirmed_at",
+        "breach_count",
+        "breach_reset",
+        "first_breach_bid",
+        "first_breach_ask",
+        "breach_price",
+        "underlying_price",
+        "materialization_generation",
+        "recovery_submit_generation",
+        "retry_attempt",
+        "recovery_submit_fenced",
+        "ownership_token",
+    )
+    return {k: envelope[k] for k in keys if k in envelope and envelope[k] is not None}
+
+
+def _frozen_breach_envelope(*, mode: str = "PAPER", rebreach: bool = False) -> dict[str, Any]:
+    """ONE frozen BREACH envelope shared by all three paths.
+
+    Metadata mirrors the durable order-meta keys so recovery merge does not
+    invent extra keys that would diverge input_hash from the runtime freeze.
+    """
+    meta = {
+        "trigger_crossed_at": _FROZEN_AS_OF,
+        "trigger_confirmed_at": _FROZEN_CONFIRMED,
+        "breach_count": 2 if rebreach else 1,
+        "first_breach_bid": 100.4,
+        "first_breach_ask": 100.6,
+        "breach_price": 100.5,
+        "underlying_price": 100.5,
+        "materialization_generation": 3,
+        "recovery_submit_generation": 3,
+        "retry_attempt": 1,
+        "ownership_token": "tok-3path",
+    }
+    if rebreach:
+        meta["breach_reset"] = True
+    sig = {
+        "signal_id": "sig-3path-1",
+        "canonical_signal_id": "canon-3path-1",
+        "client_id": "client@example.com",
+        "execution_mode": mode,
+        "local_order_id": "loid-3path-1",
+        "ticker": "SPY",
+        "side": "CALL",
+        "timeframe": "1d",
+        "pattern": "2-3",
+        "trigger_price": 100.0,
+        "stop_price": 98.0,
+        "target_price": 106.0,
+        "underlying_price": 100.5,
+        "breach_price": 100.5,
+        "current_price": 100.5,
+        "trigger_crossed_at": _FROZEN_AS_OF,
+        "trigger_confirmed_at": _FROZEN_CONFIRMED,
+        "first_breach_bid": 100.4,
+        "first_breach_ask": 100.6,
+        "breach_count": meta["breach_count"],
+        "materialization_generation": 3,
+        "recovery_submit_generation": 3,
+        "retry_attempt": 1,
+        "ownership_token": "tok-3path",
+        "metadata": dict(meta),
+        "candles": {
+            "4h": list(_FROZEN_4H_1H),
+            "1h": list(_FROZEN_4H_1H),
+            "15m": [
+                _candle("2026-09-09T09:30:00-04:00", 99.0, 100.0, 98.5, 99.5),
+                _candle("2026-09-09T09:45:00-04:00", 99.5, 101.0, 99.4, 100.5),
+            ],
+            "5m": [
+                _candle("2026-09-09T09:55:00-04:00", 100.0, 100.8, 99.9, 100.4),
+                _candle("2026-09-09T10:00:00-04:00", 100.4, 101.0, 100.3, 100.5),
+            ],
+        },
+    }
+    if rebreach:
+        sig["breach_reset"] = True
+    return sig
+
+
+def _critical_from_job(job: dict[str, Any]) -> dict[str, Any]:
+    """Critical fields available on the enqueued BREACH job (runtime/restart)."""
+    frozen = (job.get("payload") or {}).get("signal") or {}
+    lifecycle = frozen.get("breach_lifecycle") if isinstance(frozen.get("breach_lifecycle"), dict) else {}
+    # Public lifecycle subset — exclude volatile/process-local if any appear later.
+    public_lifecycle = {
+        "generation": lifecycle.get("generation"),
+        "attempt": lifecycle.get("attempt"),
+        "recovered": lifecycle.get("recovered"),
+        "preclaimed": lifecycle.get("preclaimed"),
+        "execution_mode": lifecycle.get("execution_mode"),
+        "client_id": lifecycle.get("client_id"),
+        "owner": lifecycle.get("owner"),
+        "source": lifecycle.get("source"),
+    }
+    return {
+        "input_hash": job.get("input_hash"),
+        "breach_lineage": frozen.get("breach_lineage"),
+        "canonical_strategy_pattern": frozen.get("canonical_strategy_pattern"),
+        "breach_lifecycle": public_lifecycle,
+        "phase": job.get("phase"),
+        "client_id": job.get("client_id"),
+        "execution_mode": job.get("execution_mode"),
+        "canonical_signal_id": job.get("canonical_signal_id"),
+        "local_order_id": job.get("local_order_id"),
+        "signal_id": job.get("signal_id"),
+        "observe_only": (job.get("payload") or {}).get("observe_only"),
+        "affected_eligibility": (job.get("payload") or {}).get("affected_eligibility"),
+        # Materializer-only fields are absent on the job — leave as None sentinel.
+        "entry_readiness_classification": None,
+        "entry_timing_candidate": None,
+        "market_structure_zone_ids": None,
+        "market_structure_hash": None,
+        "market_structure_relationship": None,
+    }
+
+
+def _critical_from_materializer(snap: dict[str, Any]) -> dict[str, Any]:
+    """Critical fields after build_snapshot_kwargs (includes readiness + structure)."""
+    payload = snap.get("payload") or {}
+    evidence = payload.get("breach_evidence") if isinstance(payload.get("breach_evidence"), dict) else {}
+    readiness = evidence.get("entry_readiness_observe_only")
+    if not isinstance(readiness, dict):
+        readiness = payload.get("entry_timing_candidate_observe_only") or {}
+    ms = evidence.get("market_structure") if isinstance(evidence.get("market_structure"), dict) else {}
+    if not ms and isinstance(payload.get("market_structure"), dict):
+        ms = payload["market_structure"]
+    zone_ids = [z.get("zone_id") for z in (ms.get("zones") or []) if isinstance(z, dict)]
+    relationship = ms.get("relationship") if isinstance(ms.get("relationship"), dict) else {}
+    structure_fingerprint = {
+        "zone_ids": zone_ids,
+        "relationship_zone_id": relationship.get("relationship_zone_id"),
+        "relationship_class": relationship.get("classification") or relationship.get("class"),
+        "schema_version": ms.get("schema_version"),
+        "data_as_of": ms.get("data_as_of"),
+    }
+    frozen_from_evidence = {
+        "breach_lineage": evidence.get("breach_lineage"),
+        "canonical_strategy_pattern": evidence.get("canonical_strategy_pattern"),
+        "breach_lifecycle": evidence.get("breach_lifecycle"),
+    }
+    lifecycle = frozen_from_evidence["breach_lifecycle"]
+    if not isinstance(lifecycle, dict):
+        lifecycle = {}
+    public_lifecycle = {
+        "generation": lifecycle.get("generation"),
+        "attempt": lifecycle.get("attempt"),
+        "recovered": lifecycle.get("recovered"),
+        "preclaimed": lifecycle.get("preclaimed"),
+        "execution_mode": lifecycle.get("execution_mode"),
+        "client_id": lifecycle.get("client_id"),
+        "owner": lifecycle.get("owner"),
+        "source": lifecycle.get("source"),
+    }
+    return {
+        "input_hash": snap.get("input_hash") or payload.get("input_hash"),
+        "breach_lineage": frozen_from_evidence["breach_lineage"],
+        "canonical_strategy_pattern": frozen_from_evidence["canonical_strategy_pattern"],
+        "breach_lifecycle": public_lifecycle,
+        "phase": snap.get("phase") or payload.get("phase"),
+        "client_id": snap.get("client_id"),
+        "execution_mode": snap.get("execution_mode"),
+        "canonical_signal_id": snap.get("canonical_signal_id"),
+        "local_order_id": snap.get("local_order_id"),
+        "signal_id": snap.get("signal_id"),
+        "observe_only": payload.get("observe_only"),
+        "affected_eligibility": payload.get("affected_eligibility"),
+        "entry_readiness_classification": readiness.get("classification"),
+        "entry_timing_candidate": readiness.get("entry_timing_candidate"),
+        "market_structure_zone_ids": zone_ids,
+        "market_structure_hash": _stable_hash(structure_fingerprint),
+        "market_structure_relationship": structure_fingerprint.get("relationship_zone_id"),
+    }
+
+
+def _run_runtime_path(envelope: dict[str, Any], *, mode: str) -> dict[str, Any]:
+    result = enqueue_breach_context(
+        deepcopy(envelope),
+        client_id="client@example.com",
+        execution_mode=mode,
+        canonical_signal_id="canon-3path-1",
+        local_order_id="loid-3path-1",
+        signal_id="sig-3path-1",
+    )
+    assert result.get("ok") is True and result.get("inserted") is True
+    job = next(iter(_MEMORY_JOBS.values()))
+    return job
+
+
+def _run_best_effort_runtime_path(envelope: dict[str, Any], *, mode: str, monkeypatch) -> dict[str, Any]:
+    """Best-effort handoff with synchronous submit so freeze lands in memory store."""
+    monkeypatch.setenv("INTELLIGENCE_CONTEXT_WORKER_ENABLED", "1")
+
+    def _sync_submit(enqueue, *args, phase, signal_id, **kwargs):
+        del phase, signal_id
+        return enqueue(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "ap.intelligence_context_handoff.submit_intelligence_enqueue",
+        _sync_submit,
+    )
+    handoff = enqueue_breach_context_best_effort(
+        deepcopy(envelope),
+        client_id="client@example.com",
+        execution_mode=mode,
+        canonical_signal_id="canon-3path-1",
+        local_order_id="loid-3path-1",
+        signal_id="sig-3path-1",
+    )
+    # Sync monkeypatch returns enqueue result directly.
+    assert handoff.get("ok") is True
+    assert handoff.get("inserted") is True or handoff.get("accepted") is True or _MEMORY_JOBS
+    assert _MEMORY_JOBS, "best-effort sync path must persist a BREACH job"
+    return next(iter(_MEMORY_JOBS.values()))
+
+
+def _run_restart_path(envelope: dict[str, Any], *, mode: str, monkeypatch) -> dict[str, Any]:
+    meta = _order_meta_for_envelope(envelope)
+    _install_recovery_cursor(
+        monkeypatch,
+        [{
+            "signal_id": envelope["signal_id"],
+            "local_order_id": envelope["local_order_id"],
+            "client_id": "client@example.com",
+            "execution_mode": mode,
+            "meta": meta,
+            "payload": deepcopy(envelope),
+        }],
+    )
+    result = recover_missing_intelligence_jobs(
+        client_id="client@example.com", execution_mode=mode
+    )
+    assert result["ok"] is True
+    assert result["breach"] == 1
+    assert result["breach_errors"] == 0
+    return next(iter(_MEMORY_JOBS.values()))
+
+
+def _job_critical_equal(a: dict[str, Any], b: dict[str, Any]) -> None:
+    """Assert job-level critical fields (available on enqueue) are identical."""
+    for key in (
+        "input_hash",
+        "breach_lineage",
+        "canonical_strategy_pattern",
+        "breach_lifecycle",
+        "phase",
+        "client_id",
+        "execution_mode",
+        "canonical_signal_id",
+        "local_order_id",
+        "signal_id",
+        "observe_only",
+        "affected_eligibility",
+    ):
+        assert a[key] == b[key], f"mismatch on {key}: {a[key]!r} != {b[key]!r}"
+
+
+THREE_PATH_ROWS = [
+    pytest.param("PAPER", False, "INITIAL_BREACH", "2-3-2", id="paper-first-breach"),
+    pytest.param("LIVE", False, "INITIAL_BREACH", "2-3-2", id="live-first-breach"),
+    pytest.param("PAPER", True, "REBREACH_AFTER_RESET", "2-3-2", id="paper-rebreach"),
+]
+
+
+@pytest.mark.parametrize("mode,rebreach,expected_lineage,expected_pattern", THREE_PATH_ROWS)
+def test_three_path_frozen_envelope_parity(mode, rebreach, expected_lineage, expected_pattern, monkeypatch):
+    """ONE frozen envelope → runtime / restart / materializer: critical fields identical."""
+    envelope = _frozen_breach_envelope(mode=mode, rebreach=rebreach)
+
+    # --- Path 1: runtime enqueue ---
+    _reset_memory_store_for_tests()
+    runtime_job = _run_runtime_path(envelope, mode=mode)
+    runtime_job_crit = _critical_from_job(runtime_job)
+    runtime_snap = build_snapshot_kwargs(deepcopy(runtime_job), broker=None)
+    runtime_mat_crit = _critical_from_materializer(runtime_snap)
+
+    # --- Path 2: restart recovery rebuild ---
+    _reset_memory_store_for_tests()
+    restart_job = _run_restart_path(envelope, mode=mode, monkeypatch=monkeypatch)
+    restart_job_crit = _critical_from_job(restart_job)
+    restart_snap = build_snapshot_kwargs(deepcopy(restart_job), broker=None)
+    restart_mat_crit = _critical_from_materializer(restart_snap)
+
+    # --- Path 3: materializer on a fresh runtime job (same envelope) ---
+    _reset_memory_store_for_tests()
+    materializer_job = _run_runtime_path(envelope, mode=mode)
+    materializer_snap = build_snapshot_kwargs(deepcopy(materializer_job), broker=None)
+    materializer_crit = _critical_from_materializer(materializer_snap)
+
+    # Job-level criticals: runtime == restart (byte-identical input_hash + lineage + …)
+    _job_critical_equal(runtime_job_crit, restart_job_crit)
+    assert runtime_job_crit["input_hash"]
+    assert runtime_job_crit["breach_lineage"] == expected_lineage
+    assert runtime_job_crit["canonical_strategy_pattern"] == expected_pattern
+    assert runtime_job_crit["observe_only"] is True
+    assert runtime_job_crit["affected_eligibility"] is False
+    assert runtime_job_crit["breach_lifecycle"]["generation"] == 3
+    assert runtime_job_crit["breach_lifecycle"]["attempt"] == 1
+    assert runtime_job_crit["breach_lifecycle"]["execution_mode"] == mode
+
+    # Materializer preserves job input_hash and re-derives lineage/pattern/lifecycle
+    assert runtime_mat_crit["input_hash"] == runtime_job_crit["input_hash"]
+    assert restart_mat_crit["input_hash"] == restart_job_crit["input_hash"]
+    assert materializer_crit["input_hash"] == runtime_job_crit["input_hash"]
+
+    for key in ("breach_lineage", "canonical_strategy_pattern", "breach_lifecycle"):
+        assert runtime_mat_crit[key] == runtime_job_crit[key]
+        assert restart_mat_crit[key] == restart_job_crit[key]
+        assert materializer_crit[key] == runtime_job_crit[key]
+
+    # Materializer-only: readiness + market_structure identical across paths
+    assert runtime_mat_crit["entry_readiness_classification"] is not None
+    assert runtime_mat_crit["market_structure_zone_ids"]
+    assert runtime_mat_crit["market_structure_hash"]
+    for key in (
+        "entry_readiness_classification",
+        "entry_timing_candidate",
+        "market_structure_zone_ids",
+        "market_structure_hash",
+        "market_structure_relationship",
+    ):
+        assert runtime_mat_crit[key] == restart_mat_crit[key] == materializer_crit[key], (
+            f"materializer field {key} diverged across three paths"
+        )
+
+    # Observe-only fence on materializer output
+    assert materializer_crit["observe_only"] is True
+    assert materializer_crit["affected_eligibility"] is False
+
+
+@pytest.mark.parametrize("mode,rebreach,expected_lineage,expected_pattern", THREE_PATH_ROWS)
+def test_three_path_best_effort_handoff_matches_direct_enqueue(
+    mode, rebreach, expected_lineage, expected_pattern, monkeypatch
+):
+    """Best-effort handoff (sync) freezes the same critical job fields as direct enqueue."""
+    envelope = _frozen_breach_envelope(mode=mode, rebreach=rebreach)
+
+    _reset_memory_store_for_tests()
+    direct_job = _run_runtime_path(envelope, mode=mode)
+    direct_crit = _critical_from_job(direct_job)
+
+    _reset_memory_store_for_tests()
+    handoff_job = _run_best_effort_runtime_path(envelope, mode=mode, monkeypatch=monkeypatch)
+    handoff_crit = _critical_from_job(handoff_job)
+
+    _job_critical_equal(direct_crit, handoff_crit)
+    assert handoff_crit["breach_lineage"] == expected_lineage
+    assert handoff_crit["canonical_strategy_pattern"] == expected_pattern
+
+    # Materializer on handoff job matches materializer on direct job
+    direct_mat = _critical_from_materializer(build_snapshot_kwargs(deepcopy(direct_job), broker=None))
+    handoff_mat = _critical_from_materializer(build_snapshot_kwargs(deepcopy(handoff_job), broker=None))
+    for key in (
+        "input_hash",
+        "breach_lineage",
+        "canonical_strategy_pattern",
+        "breach_lifecycle",
+        "entry_readiness_classification",
+        "market_structure_zone_ids",
+        "market_structure_hash",
+    ):
+        assert direct_mat[key] == handoff_mat[key]
