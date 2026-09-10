@@ -288,3 +288,120 @@ def test_runtime_scheduler_preserves_client_and_mode_isolation(
     assert len(recovery_calls) == 1
     assert recovery_calls[0]["client_id"] == email
     assert recovery_calls[0]["master_control"].mode == mode
+
+
+def _health_loop_runner() -> object:
+    runner = _runner()
+    runner.stopped = threading.Event()
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    runner.core = types.SimpleNamespace(exit_eng=object(), entry_watcher=None)
+    runner.worker_thread = None
+    runner.fill_monitor_thread = None
+    runner.equity_thread = None
+    runner.last_worker_heartbeat_ts = 0.0
+    runner.last_fill_monitor_heartbeat_ts = 0.0
+    runner.last_equity_heartbeat_ts = 0.0
+    runner.entries_allowed = threading.Event()
+    runner.degraded = threading.Event()
+    return runner
+
+
+def _disable_health_side_effects(monkeypatch, runner):
+    """Keep the health-loop proof focused on thread liveness, not subsystems."""
+    for name in (
+        "_enter_degraded_mode",
+        "_clear_degraded_reason_key",
+        "_try_recover_degraded_mode",
+        "_check_split_brain_recovery",
+        "_run_overnight_reeval_if_due",
+        "_run_exit_autonomous_recovery",
+        "_detect_manual_closes",
+        "_set_entry_permission",
+    ):
+        monkeypatch.setattr(runner, name, MagicMock())
+
+
+def _stop_runner_threads(runner):
+    runner.stopping.set()
+    runner.stopped.set()
+    for name in ("health_thread", "deferred_recovery_thread"):
+        thread = getattr(runner, name, None)
+        if thread is not None:
+            thread.join(timeout=3)
+            assert not thread.is_alive()
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_scheduler_survives_independent_health_loop_failure(monkeypatch):
+    """A stopped/raised health loop cannot take deferred recovery with it."""
+    runner = _health_loop_runner()
+    _disable_health_side_effects(monkeypatch, runner)
+    health_failed = threading.Event()
+    scheduler_tick = threading.Event()
+    tick_calls = []
+
+    def health_failure():
+        health_failed.set()
+        # SystemExit terminates only this thread and avoids converting the
+        # intentional isolation proof into a pytest thread-warning failure.
+        raise SystemExit("simulated health-loop failure")
+
+    def deferred_tick():
+        tick_calls.append("tick")
+        scheduler_tick.set()
+
+    monkeypatch.setattr(runner, "_check_split_brain_recovery", health_failure)
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", deferred_tick)
+    monkeypatch.setenv("RUNNER_HEALTH_CHECK_SEC", "0.01")
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "1")
+
+    runner._start_runtime_health_loop()
+    runner._start_deferred_breach_lifecycle_scheduler()
+
+    assert health_failed.wait(timeout=2)
+    runner.health_thread.join(timeout=2)
+    assert not runner.health_thread.is_alive()
+    assert scheduler_tick.wait(timeout=2)
+    assert tick_calls == ["tick"]
+
+    _stop_runner_threads(runner)
+    calls_after_stop = list(tick_calls)
+    time.sleep(1.1)
+    assert tick_calls == calls_after_stop == ["tick"]
+
+
+def test_health_loop_survives_independent_scheduler_tick_failure(monkeypatch):
+    """A deferred tick exception is contained while the health loop stays live."""
+    runner = _health_loop_runner()
+    _disable_health_side_effects(monkeypatch, runner)
+    health_tick = threading.Event()
+    scheduler_tick = threading.Event()
+    tick_calls = []
+
+    def health_observer():
+        health_tick.set()
+
+    def deferred_failure():
+        tick_calls.append("tick")
+        scheduler_tick.set()
+        raise RuntimeError("simulated deferred-recovery failure")
+
+    monkeypatch.setattr(runner, "_set_entry_permission", health_observer)
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", deferred_failure)
+    monkeypatch.setenv("RUNNER_HEALTH_CHECK_SEC", "0.01")
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "1")
+
+    runner._start_runtime_health_loop()
+    runner._start_deferred_breach_lifecycle_scheduler()
+
+    assert health_tick.wait(timeout=2)
+    assert scheduler_tick.wait(timeout=2)
+    assert runner.health_thread.is_alive()
+    assert runner.deferred_recovery_thread.is_alive()
+    assert runner.deferred_recovery_errors == 1
+
+    _stop_runner_threads(runner)
+    calls_after_stop = list(tick_calls)
+    time.sleep(1.1)
+    assert tick_calls == calls_after_stop == ["tick"]
