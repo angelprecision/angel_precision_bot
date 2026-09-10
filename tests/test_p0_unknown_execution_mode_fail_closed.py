@@ -317,6 +317,21 @@ def test_recovery_unknown_mode_skips_order_mutation():
     assert "recovery_unknown_execution_mode" in result["errors"]
 
 
+def test_deferred_recovery_unknown_mode_classifies_boundary_failure():
+    rec = ap_recovery.APStartupRecovery(
+        client_id="client@example.com",
+        broker=MagicMock(),
+        osm=MagicMock(),
+        pm=MagicMock(),
+        master_control=SimpleNamespace(mode="staging"),
+    )
+
+    result = rec.recover_deferred_lifecycles()
+
+    assert result["errors"] == ["recovery_unknown_execution_mode"]
+    assert result["infrastructure_errors"] == ["recovery_unknown_execution_mode"]
+
+
 def test_reconciler_unknown_mode_skips_terminal_correction(monkeypatch):
     broker = MagicMock()
     def _boom(*args, **kwargs):

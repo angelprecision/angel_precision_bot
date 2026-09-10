@@ -125,6 +125,26 @@ class _PulseEvent:
         return False
 
 
+class _TickThenStopEvent:
+    """Allow one scheduler tick and report shutdown on the next wait."""
+
+    def __init__(self) -> None:
+        self.wait_calls: list[float] = []
+        self._wait_count = 0
+        self._stopped = False
+
+    def wait(self, timeout: float) -> bool:
+        self.wait_calls.append(timeout)
+        self._wait_count += 1
+        if self._wait_count == 1:
+            return False
+        self._stopped = True
+        return True
+
+    def is_set(self) -> bool:
+        return self._stopped
+
+
 def _runner() -> object:
     runner = object.__new__(cr.ClientRunner)
     runner.email = "jasoncosby1@gmail.com"
@@ -236,6 +256,101 @@ def test_runtime_scheduler_survives_one_tick_failure(monkeypatch):
     assert runner.deferred_recovery_last_error_ts > 0
     assert runner.deferred_recovery_successful_ticks == 1
     assert runner.last_deferred_recovery_success_ts > 0
+
+
+def test_runtime_recovery_boundary_exception_is_infrastructure_failure(monkeypatch):
+    runner = _runner()
+
+    class _BrokenRecovery:
+        def __init__(self, **kwargs):
+            pass
+
+        def recover_deferred_lifecycles(self):
+            raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(cr, "APStartupRecovery", _BrokenRecovery)
+
+    result = runner._run_deferred_breach_lifecycle_recovery()
+
+    assert result["errors"] == ["runtime_tick:RuntimeError"]
+    assert result["infrastructure_errors"] == ["runtime_tick:RuntimeError"]
+
+
+def test_row_level_recovery_errors_do_not_mark_scheduler_unhealthy(monkeypatch):
+    """An executed pass may report bad rows without losing executor health."""
+    runner = _runner()
+    runner.stopped = _TickThenStopEvent()
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    tick = MagicMock(
+        return_value={
+            "deferred_lifecycles_recovered": 0,
+            "errors": ["recovery_malformed_counter"],
+            "infrastructure_errors": [],
+        }
+    )
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", tick)
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    runner.deferred_recovery_thread.join(timeout=2)
+
+    assert tick.call_count == 1
+    assert runner.deferred_recovery_completed_ticks == 1
+    assert runner.deferred_recovery_successful_ticks == 1
+    assert runner.last_deferred_recovery_completed_ts > 0
+    assert runner.last_deferred_recovery_success_ts > 0
+    assert runner.deferred_recovery_scheduler_health_reasons == set()
+    assert runner.deferred_recovery_scheduler_healthy.is_set()
+
+    # The thread has intentionally stopped for the test; model the same live
+    # handle during the health check to isolate the failure classification.
+    runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.deferred_recovery_scheduler_ready.set()
+    assert runner._check_deferred_recovery_scheduler_health(now=time.time()) is True
+
+
+def test_recovery_infrastructure_failure_stays_unhealthy_despite_fresh_liveness(
+    monkeypatch,
+):
+    """A failed recovery boundary cannot be made healthy by ``finally``."""
+    runner = _runner()
+    runner._deferred_recovery_scheduler_startup_gate_open = True
+    runner.entries_allowed.set()
+    runner.stopped = _TickThenStopEvent()
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    tick = MagicMock(
+        return_value={
+            "deferred_lifecycles_recovered": 0,
+            "errors": ["runtime_stack_unavailable"],
+            "infrastructure_errors": ["runtime_stack_unavailable"],
+        }
+    )
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", tick)
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    runner.deferred_recovery_thread.join(timeout=2)
+
+    assert tick.call_count == 1
+    assert runner.deferred_recovery_completed_ticks == 1
+    assert runner.deferred_recovery_successful_ticks == 0
+    assert runner.last_deferred_recovery_completed_ts > 0
+    assert runner.last_deferred_recovery_success_ts == 0.0
+    assert "deferred_recovery_scheduler_recovery_failed" in (
+        runner.deferred_recovery_scheduler_health_reasons
+    )
+    assert not runner.deferred_recovery_scheduler_healthy.is_set()
+
+    # The handle is live and the completed heartbeat is fresh, but the
+    # explicit infrastructure-failure reason still fails the deferred seam
+    # closed without clearing unrelated post-startup entry permission.
+    runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.deferred_recovery_scheduler_ready.set()
+    assert runner._check_deferred_recovery_scheduler_health(now=time.time()) is False
+    assert runner.entries_allowed.is_set()
+    assert not runner.degraded.is_set()
 
 
 def test_runtime_scheduler_handle_is_never_replaced_after_exit(monkeypatch):

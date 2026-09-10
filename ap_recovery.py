@@ -640,14 +640,23 @@ class APStartupRecovery:
             "deferred_lifecycles_found": 0,
             "deferred_lifecycles_due": 0,
             "errors": [],
+            # ``errors`` includes row-level recovery outcomes.  This separate
+            # channel is reserved for failures at the recovery boundary itself
+            # so the runtime scheduler can distinguish an executable pass that
+            # found a bad row from an executor that could not run.
+            "infrastructure_errors": [],
         }
         if self._execution_mode() is None:
-            result["errors"].append("recovery_unknown_execution_mode")
+            _error = "recovery_unknown_execution_mode"
+            result["errors"].append(_error)
+            result["infrastructure_errors"].append(_error)
             return result
         try:
             self._recover_deferred_breach_lifecycles(result)
         except Exception as exc:
-            result["errors"].append(f"deferred_lifecycle:{exc}")
+            _error = f"deferred_lifecycle:{exc}"
+            result["errors"].append(_error)
+            result["infrastructure_errors"].append(_error)
         return result
 
     def _execution_mode(self) -> str | None:
@@ -1952,6 +1961,9 @@ class APStartupRecovery:
                 self.client_id,
             )
             result.setdefault("errors", []).append("recovery_unknown_execution_mode")
+            result.setdefault("infrastructure_errors", []).append(
+                "recovery_unknown_execution_mode"
+            )
             return
         recovery_mode_sql = recovery_mode.lower()  # SQL predicate is case-insensitive lower
 
@@ -1964,6 +1976,9 @@ class APStartupRecovery:
                 self.client_id, osm_client_id, self.client_id,
             )
             result.setdefault("errors", []).append("recovery_osm_client_id_mismatch")
+            result.setdefault("infrastructure_errors", []).append(
+                "recovery_osm_client_id_mismatch"
+            )
             return
 
         def _load():

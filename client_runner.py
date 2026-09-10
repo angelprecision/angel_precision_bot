@@ -2733,7 +2733,12 @@ class ClientRunner(threading.Thread):
         core = getattr(self, "core", None)
         watcher = getattr(core, "entry_watcher", None) if core is not None else None
         if broker is None or core is None or self.order_state_machine is None:
-            return {"deferred_lifecycles_recovered": 0, "errors": ["runtime_stack_unavailable"]}
+            _error = "runtime_stack_unavailable"
+            return {
+                "deferred_lifecycles_recovered": 0,
+                "errors": [_error],
+                "infrastructure_errors": [_error],
+            }
         try:
             recovery = APStartupRecovery(
                 client_id=self.email,
@@ -2786,6 +2791,7 @@ class ClientRunner(threading.Thread):
             return {
                 "deferred_lifecycles_recovered": 0,
                 "errors": [f"runtime_tick:{type(exc).__name__}"],
+                "infrastructure_errors": [f"runtime_tick:{type(exc).__name__}"],
             }
 
     def _start_deferred_breach_lifecycle_scheduler(self):
@@ -2864,18 +2870,35 @@ class ClientRunner(threading.Thread):
                         break
                     try:
                         _outcome = self._run_deferred_breach_lifecycle_recovery()
-                        if isinstance(_outcome, dict) and _outcome.get("errors"):
+                        _infrastructure_errors = (
+                            _outcome.get("infrastructure_errors")
+                            if isinstance(_outcome, dict)
+                            else None
+                        )
+                        if _infrastructure_errors:
                             self.deferred_recovery_last_error_ts = time.time()
+                            self._mark_deferred_recovery_scheduler_unhealthy(
+                                "deferred_recovery_scheduler_recovery_failed"
+                            )
                         else:
+                            if isinstance(_outcome, dict) and _outcome.get("errors"):
+                                # Row-level recovery outcomes remain visible in
+                                # telemetry, but the canonical recovery boundary
+                                # did execute and is therefore scheduler-healthy.
+                                self.deferred_recovery_last_error_ts = time.time()
                             self.last_deferred_recovery_success_ts = time.time()
                             self.deferred_recovery_successful_ticks = getattr(
                                 self, "deferred_recovery_successful_ticks", 0
                             ) + 1
+                            self._clear_deferred_recovery_scheduler_health_reasons()
                     except Exception as exc:
                         # The tick already has its own boundary.  Keep this outer
                         # guard so a future refactor cannot silently kill liveness.
                         self.deferred_recovery_errors = getattr(self, "deferred_recovery_errors", 0) + 1
                         self.deferred_recovery_last_error_ts = time.time()
+                        self._mark_deferred_recovery_scheduler_unhealthy(
+                            "deferred_recovery_scheduler_recovery_failed"
+                        )
                         logger.error(
                             "[%s] deferred retry scheduler unhandled tick failure: %s commit=%s",
                             self.email,
@@ -2996,6 +3019,7 @@ class ClientRunner(threading.Thread):
         _keys = {
             "deferred_recovery_scheduler_dead",
             "deferred_recovery_scheduler_not_ready",
+            "deferred_recovery_scheduler_recovery_failed",
             "deferred_recovery_scheduler_stale",
         }
         _lock = _health_lock
@@ -3050,6 +3074,16 @@ class ClientRunner(threading.Thread):
                 "deferred_recovery_scheduler_not_ready",
                 "[%s] DEFERRED_RECOVERY_SCHEDULER_NOT_READY — scheduler thread "
                 "has not completed its startup handshake",
+                self.email,
+            )
+
+        if "deferred_recovery_scheduler_recovery_failed" in getattr(
+            self, "deferred_recovery_scheduler_health_reasons", set()
+        ):
+            return _fault(
+                "deferred_recovery_scheduler_recovery_failed",
+                "[%s] DEFERRED_RECOVERY_SCHEDULER_RECOVERY_FAILED — canonical "
+                "deferred recovery did not execute successfully",
                 self.email,
             )
 
