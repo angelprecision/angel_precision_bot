@@ -692,10 +692,17 @@ class ClientRunner(threading.Thread):
         self.last_equity_heartbeat_ts = 0.0
         self.last_deferred_recovery_ts = 0.0
         self.deferred_recovery_started_ts = 0.0
+        # ``completed`` is a liveness heartbeat: the scheduler returned from
+        # a tick, even when recovery reported an error.  Success has its own
+        # timestamp/counter so health telemetry cannot mistake a live thread
+        # for a successful recovery executor.
         self.last_deferred_recovery_completed_ts = 0.0
+        self.last_deferred_recovery_success_ts = 0.0
         self.deferred_recovery_ticks = 0
         self.deferred_recovery_completed_ticks = 0
+        self.deferred_recovery_successful_ticks = 0
         self.deferred_recovery_errors = 0
+        self.deferred_recovery_last_error_ts = 0.0
 
         self.core = None
         self.master_control = None
@@ -722,6 +729,13 @@ class ClientRunner(threading.Thread):
         # actually running, without adding a second recovery executor or
         # forcing a duplicate recovery pass after startup recovery.
         self.deferred_recovery_scheduler_ready = threading.Event()
+        # Startup readiness is a one-way gate for the first permission unlock.
+        # Once the normal money path has opened, later scheduler health faults
+        # belong to the deferred-recovery subsystem and must not become a
+        # global unrelated-entry halt.
+        self._deferred_recovery_scheduler_startup_gate_open = False
+        self.deferred_recovery_scheduler_healthy = threading.Event()
+        self.deferred_recovery_scheduler_health_reasons: set[str] = set()
         self.failure_reason: str = ""
         self._overnight_reeval_attempt_lock = threading.Lock()
         self._overnight_reeval_state_date = None
@@ -1675,11 +1689,18 @@ class ClientRunner(threading.Thread):
             logger.warning("[%s] ExitReliabilityMonitor failed to start (non-fatal): %s", self.email, _erm_err)
 
     def _set_entry_permission(self):
-        # Entry permission is the canonical money-path gate.  Do not rely on
-        # the health loop having remembered to check scheduler health first:
-        # every caller must prove the independent deferred-recovery consumer
-        # is live, ready, and within its heartbeat budget.
-        _deferred_scheduler_ok = self._check_deferred_recovery_scheduler_health()
+        # Entry permission is the canonical money-path gate.  Before the
+        # first unlock, every caller must prove the independent deferred-
+        # recovery consumer is live, ready, and within its heartbeat budget.
+        # After startup has opened the gate, scheduler health remains a
+        # separate deferred-recovery diagnostic and does not halt unrelated
+        # fresh entries globally.
+        _startup_gate_open = bool(
+            getattr(self, "_deferred_recovery_scheduler_startup_gate_open", False)
+        )
+        _deferred_scheduler_ok = self._check_deferred_recovery_scheduler_health(
+            startup_required=not _startup_gate_open
+        )
         _worker_ok = self.worker_thread is not None and self.worker_thread.is_alive()
         _fill_ok   = self.fill_monitor_thread is not None and self.fill_monitor_thread.is_alive()
         _core_ok   = self.core is not None and getattr(self.core, "exit_eng", None) is not None
@@ -1736,10 +1757,12 @@ class ClientRunner(threading.Thread):
             and _worker_ok
             and _fill_ok_for_entries
             and _quote_ok
-            and _deferred_scheduler_ok
+            and (_deferred_scheduler_ok if not _startup_gate_open else True)
         )
         if ready:
             self.entries_allowed.set()
+            if not _startup_gate_open:
+                self._deferred_recovery_scheduler_startup_gate_open = True
         else:
             if not self.is_alive():
                 logger.warning("[%s] entries_allowed BLOCKED: runner thread not alive", self.email)
@@ -1758,7 +1781,7 @@ class ClientRunner(threading.Thread):
                 )
             if _require_qpm and not _quote_ok:
                 logger.warning("[%s] entries_allowed BLOCKED: quote_monitor unhealthy/missing", self.email)
-            if not _deferred_scheduler_ok:
+            if not _startup_gate_open and not _deferred_scheduler_ok:
                 logger.warning(
                     "[%s] entries_allowed BLOCKED: deferred recovery scheduler unhealthy",
                     self.email,
@@ -2769,9 +2792,11 @@ class ClientRunner(threading.Thread):
         """Start the independent runtime consumer for due deferred retries.
 
         Startup recovery runs before this thread is started.  The thread-entry
-        readiness handshake is therefore the minimum prerequisite for enabling
-        entries; no initial recovery tick is added here, which avoids replaying
-        the same broad recovery boundary immediately after startup recovery.
+        readiness handshake is therefore the minimum prerequisite for the
+        first entry unlock; no initial recovery tick is added here, which
+        avoids replaying the same broad recovery boundary immediately after
+        startup recovery.  After that unlock, scheduler health is scoped to
+        deferred lifecycles and is not a global fresh-entry permission gate.
         Durable CAS in the canonical recovery/execution path remains the
         authority; this thread is only a timer and caller boundary.
         """
@@ -2838,11 +2863,19 @@ class ClientRunner(threading.Thread):
                     if self.stopping.is_set() or self.stopped.is_set() or self.failed.is_set():
                         break
                     try:
-                        self._run_deferred_breach_lifecycle_recovery()
+                        _outcome = self._run_deferred_breach_lifecycle_recovery()
+                        if isinstance(_outcome, dict) and _outcome.get("errors"):
+                            self.deferred_recovery_last_error_ts = time.time()
+                        else:
+                            self.last_deferred_recovery_success_ts = time.time()
+                            self.deferred_recovery_successful_ticks = getattr(
+                                self, "deferred_recovery_successful_ticks", 0
+                            ) + 1
                     except Exception as exc:
                         # The tick already has its own boundary.  Keep this outer
                         # guard so a future refactor cannot silently kill liveness.
                         self.deferred_recovery_errors = getattr(self, "deferred_recovery_errors", 0) + 1
+                        self.deferred_recovery_last_error_ts = time.time()
                         logger.error(
                             "[%s] deferred retry scheduler unhandled tick failure: %s commit=%s",
                             self.email,
@@ -2859,13 +2892,15 @@ class ClientRunner(threading.Thread):
                         ) + 1
             finally:
                 # A scheduler that exits for any reason other than an explicit
-                # runner shutdown must close the money path immediately.  The
-                # health loop and direct permission callers also re-check this
-                # state, but they are not the first line of defense.
+                # runner shutdown must publish a critical deferred-recovery
+                # health fault.  Before the first entry unlock the direct
+                # permission gate turns that fault into a startup hold; after
+                # startup it remains scoped to deferred lifecycles and does
+                # not clear unrelated fresh-entry permission.
                 _ready_event.clear()
                 if not self.stopping.is_set() and not self.stopped.is_set() and not self.failed.is_set():
-                    self._enter_degraded_mode(
-                        "deferred_recovery_scheduler_dead", stop_runner=False
+                    self._mark_deferred_recovery_scheduler_unhealthy(
+                        "deferred_recovery_scheduler_dead"
                     )
                 logger.info("[%s] Deferred retry scheduler stopped", self.email)
 
@@ -2893,14 +2928,77 @@ class ClientRunner(threading.Thread):
             _ready_timeout = 5.0
         _ready_event.wait(_ready_timeout)
 
+    def _mark_deferred_recovery_scheduler_unhealthy(self, reason: str) -> None:
+        """Publish scheduler health without changing post-startup entry authority."""
+        _reason = str(reason)
+        _lock = getattr(self, "_degraded_lock", None)
+
+        def _record() -> bool:
+            _reasons = getattr(
+                self, "deferred_recovery_scheduler_health_reasons", set()
+            )
+            if not isinstance(_reasons, set):
+                _reasons = set(_reasons)
+            _first = _reason not in _reasons
+            _reasons.add(_reason)
+            self.deferred_recovery_scheduler_health_reasons = _reasons
+            return _first
+
+        if _lock is None:
+            _first = _record()
+        else:
+            with _lock:
+                _first = _record()
+
+        _healthy = getattr(self, "deferred_recovery_scheduler_healthy", None)
+        if _healthy is None:
+            _healthy = threading.Event()
+            self.deferred_recovery_scheduler_healthy = _healthy
+        _healthy.clear()
+
+        if _first:
+            logger.critical(
+                "[%s] %s — deferred recovery scheduler unhealthy; "
+                "deferred lifecycles remain held and unrelated entry permission "
+                "is unchanged after startup; no overlapping scheduler will be started",
+                self.email,
+                _reason.upper(),
+            )
+
     def _clear_deferred_recovery_scheduler_health_reasons(self) -> None:
-        """Clear only scheduler-owned degraded reasons after health recovers."""
+        """Clear scheduler health telemetry after liveness is proven again."""
+        _health_reasons = getattr(
+            self, "deferred_recovery_scheduler_health_reasons", None
+        )
+        _health_lock = getattr(self, "_degraded_lock", None)
+
+        def _clear_health_reasons() -> None:
+            if _health_reasons is None:
+                self.deferred_recovery_scheduler_health_reasons = set()
+            else:
+                _health_reasons.clear()
+
+        if _health_lock is None:
+            _clear_health_reasons()
+        else:
+            with _health_lock:
+                _clear_health_reasons()
+
+        _healthy = getattr(self, "deferred_recovery_scheduler_healthy", None)
+        if _healthy is None:
+            _healthy = threading.Event()
+            self.deferred_recovery_scheduler_healthy = _healthy
+        _healthy.set()
+
+        # A startup fault may already have entered generic degraded mode before
+        # the first permission unlock.  Remove only that scheduler-specific
+        # residue; runtime scheduler health never adds generic degraded state.
         _keys = {
             "deferred_recovery_scheduler_dead",
             "deferred_recovery_scheduler_not_ready",
             "deferred_recovery_scheduler_stale",
         }
-        _lock = getattr(self, "_degraded_lock", None)
+        _lock = _health_lock
 
         def _clear() -> bool:
             _reasons = getattr(self, "degraded_reasons", set())
@@ -2918,31 +3016,42 @@ class ClientRunner(threading.Thread):
         if _empty and not self.failed.is_set() and not self.stopping.is_set():
             self.degraded.clear()
 
-    def _check_deferred_recovery_scheduler_health(self, now: float | None = None) -> bool:
-        """Hold new entries when the one-and-only scheduler is dead or stale."""
+    def _check_deferred_recovery_scheduler_health(
+        self,
+        now: float | None = None,
+        *,
+        startup_required: bool = False,
+    ) -> bool:
+        """Check the one scheduler, gating only the first entry unlock."""
+        _scope = (
+            "blocking the initial entry unlock"
+            if startup_required
+            else "holding deferred lifecycles while leaving unrelated entry permission unchanged"
+        )
+
+        def _fault(reason: str, message: str, *args) -> bool:
+            logger.critical(f"{message} — {_scope}", *args)
+            self._mark_deferred_recovery_scheduler_unhealthy(reason)
+            if startup_required:
+                self._enter_degraded_mode(reason, stop_runner=False)
+            return False
+
         _thread = getattr(self, "deferred_recovery_thread", None)
         if _thread is None or not _thread.is_alive():
-            logger.critical(
-                "[%s] DEFERRED_RECOVERY_SCHEDULER_DEAD — blocking new entries; "
-                "no overlapping scheduler will be started",
+            return _fault(
+                "deferred_recovery_scheduler_dead",
+                "[%s] DEFERRED_RECOVERY_SCHEDULER_DEAD — no overlapping scheduler will be started",
                 self.email,
             )
-            self._enter_degraded_mode(
-                "deferred_recovery_scheduler_dead", stop_runner=False
-            )
-            return False
 
         _ready_event = getattr(self, "deferred_recovery_scheduler_ready", None)
         if _ready_event is None or not _ready_event.is_set():
-            logger.critical(
-                "[%s] DEFERRED_RECOVERY_SCHEDULER_NOT_READY — blocking new entries; "
-                "scheduler thread has not completed its startup handshake",
+            return _fault(
+                "deferred_recovery_scheduler_not_ready",
+                "[%s] DEFERRED_RECOVERY_SCHEDULER_NOT_READY — scheduler thread "
+                "has not completed its startup handshake",
                 self.email,
             )
-            self._enter_degraded_mode(
-                "deferred_recovery_scheduler_not_ready", stop_runner=False
-            )
-            return False
 
         _now = time.time() if now is None else float(now)
         _started = float(getattr(self, "deferred_recovery_started_ts", 0.0) or 0.0)
@@ -2954,17 +3063,14 @@ class ClientRunner(threading.Thread):
         )
         _reference = _completed or _started
         if not _reference or (_now - _reference) > _heartbeat_max:
-            logger.critical(
-                "[%s] DEFERRED_RECOVERY_SCHEDULER_STALE — blocking new entries; "
-                "last_completed_ts=%s heartbeat_max_sec=%.1f",
+            return _fault(
+                "deferred_recovery_scheduler_stale",
+                "[%s] DEFERRED_RECOVERY_SCHEDULER_STALE — last_completed_ts=%s "
+                "heartbeat_max_sec=%.1f",
                 self.email,
                 _completed or None,
                 _heartbeat_max,
             )
-            self._enter_degraded_mode(
-                "deferred_recovery_scheduler_stale", stop_runner=False
-            )
-            return False
         self._clear_deferred_recovery_scheduler_health_reasons()
         return True
 
@@ -3046,7 +3152,13 @@ class ClientRunner(threading.Thread):
                 self._run_overnight_reeval_if_due()  # Arm WATCHING signals at 9:00-9:45 AM ET
                 self._run_exit_autonomous_recovery() # Resolve CLOSING-forever positions every 60s
                 self._detect_manual_closes()         # Detect broker-closed positions not in DB
-                self._check_deferred_recovery_scheduler_health()
+                self._check_deferred_recovery_scheduler_health(
+                    startup_required=not getattr(
+                        self,
+                        "_deferred_recovery_scheduler_startup_gate_open",
+                        False,
+                    )
+                )
                 self._set_entry_permission()
 
                 try:

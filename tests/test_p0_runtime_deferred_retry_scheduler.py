@@ -138,6 +138,15 @@ def _runner() -> object:
     runner.degraded_reasons = set()
     runner._degraded_lock = threading.Lock()
     runner.deferred_recovery_scheduler_ready = threading.Event()
+    runner.deferred_recovery_scheduler_healthy = threading.Event()
+    runner.deferred_recovery_scheduler_health_reasons = set()
+    runner._deferred_recovery_scheduler_startup_gate_open = False
+    runner.deferred_recovery_started_ts = 0.0
+    runner.last_deferred_recovery_completed_ts = 0.0
+    runner.last_deferred_recovery_success_ts = 0.0
+    runner.deferred_recovery_completed_ticks = 0
+    runner.deferred_recovery_successful_ticks = 0
+    runner.deferred_recovery_last_error_ts = 0.0
     runner.is_alive = lambda: True
     runner.broker = object()
     runner.position_manager = object()
@@ -224,6 +233,9 @@ def test_runtime_scheduler_survives_one_tick_failure(monkeypatch):
     assert runner.deferred_recovery_errors == 1
     assert runner.deferred_recovery_completed_ticks == 2
     assert runner.last_deferred_recovery_completed_ts > 0
+    assert runner.deferred_recovery_last_error_ts > 0
+    assert runner.deferred_recovery_successful_ticks == 1
+    assert runner.last_deferred_recovery_success_ts > 0
 
 
 def test_runtime_scheduler_handle_is_never_replaced_after_exit(monkeypatch):
@@ -241,30 +253,72 @@ def test_runtime_scheduler_handle_is_never_replaced_after_exit(monkeypatch):
     assert runner.deferred_recovery_thread is first
 
 
-def test_scheduler_health_dead_or_stale_fails_closed_without_restart():
+def test_runtime_scheduler_health_is_scoped_without_clearing_entry_permission():
+    """Post-startup faults hold deferred work, not unrelated fresh entries."""
     runner = _runner()
     runner.entries_allowed = threading.Event()
     runner.entries_allowed.set()
-    runner.degraded = threading.Event()
-    runner.degraded_reasons = set()
-    runner._degraded_lock = threading.Lock()
+    runner._deferred_recovery_scheduler_startup_gate_open = True
 
     dead = types.SimpleNamespace(is_alive=lambda: False)
     runner.deferred_recovery_thread = dead
     assert runner._check_deferred_recovery_scheduler_health(now=100.0) is False
-    assert not runner.entries_allowed.is_set()
-    assert "deferred_recovery_scheduler_dead" in runner.degraded_reasons
+    assert runner.entries_allowed.is_set()
+    assert not runner.degraded.is_set()
+    assert runner.degraded_reasons == set()
+    assert runner.deferred_recovery_scheduler_health_reasons == {
+        "deferred_recovery_scheduler_dead"
+    }
+    assert not runner.deferred_recovery_scheduler_healthy.is_set()
 
-    runner.degraded_reasons.clear()
-    runner.entries_allowed.set()
     runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
     runner.deferred_recovery_scheduler_ready.set()
     runner.deferred_recovery_started_ts = 10.0
     runner.last_deferred_recovery_completed_ts = 20.0
     runner.deferred_recovery_heartbeat_max_sec = 5.0
     assert runner._check_deferred_recovery_scheduler_health(now=100.0) is False
-    assert not runner.entries_allowed.is_set()
-    assert "deferred_recovery_scheduler_stale" in runner.degraded_reasons
+    assert runner.entries_allowed.is_set()
+    assert runner.degraded_reasons == set()
+    assert runner.deferred_recovery_scheduler_health_reasons == {
+        "deferred_recovery_scheduler_dead",
+        "deferred_recovery_scheduler_stale",
+    }
+
+
+def test_runtime_set_entry_permission_keeps_unrelated_entries_after_scheduler_fault():
+    """The canonical permission caller cannot turn a runtime fault global."""
+    runner = _permission_runner()
+    runner._deferred_recovery_scheduler_startup_gate_open = True
+    runner.entries_allowed.set()
+    runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: False)
+
+    assert runner._set_entry_permission() is True
+    assert runner.entries_allowed.is_set()
+    assert not runner.degraded.is_set()
+    assert "deferred_recovery_scheduler_dead" in (
+        runner.deferred_recovery_scheduler_health_reasons
+    )
+
+
+def test_runtime_scheduler_fault_holds_deferred_work_without_replacement_or_broker_side_effects():
+    """A dead scheduler does not run a deferred row or create a replacement."""
+    runner = _runner()
+    runner._deferred_recovery_scheduler_startup_gate_open = True
+    runner.entries_allowed.set()
+    runner.broker = MagicMock()
+    recovery = MagicMock()
+    runner._run_deferred_breach_lifecycle_recovery = recovery
+    dead = types.SimpleNamespace(is_alive=lambda: False)
+    runner.deferred_recovery_thread = dead
+
+    assert runner._check_deferred_recovery_scheduler_health(now=100.0) is False
+    runner._start_deferred_breach_lifecycle_scheduler()
+
+    assert runner.deferred_recovery_thread is dead
+    recovery.assert_not_called()
+    assert runner.entries_allowed.is_set()
+    assert not runner.broker.submit_order.called
+    assert not runner.broker.submit_entry.called
 
 
 def _permission_runner() -> object:
