@@ -34,6 +34,16 @@ payload `entry_timing_candidate_observe_only`.
 `runway_to_opposing_wall`, `vwap_status` / `volume_status` (**MISSING honesty**),
 `first_vs_rebreach`, `htf_freshness` summary. No outcome / MFE / PnL fields.
 
+## FVG touch lineage audit (this turn)
+
+Searched tip modules + harness for durable `touch_count` / `first_touch_ts` /
+`last_touch_ts` / `penetration_pct` / `reclaim_state` / `touch_kind` authority.
+
+**Result: BLOCKED** — authority absent. Did not invent production history.
+
+- Note: `FVG_TOUCH_LINEAGE_BLOCKED.md`
+- Honesty gate: `tests/test_p0_435_fvg_touch_lineage.py`
+
 ## Still deferred (not in this pack)
 
 | # | Gap | Why still deferred |
