@@ -601,6 +601,7 @@ def test_postgres_broker_ready_submit_claim_consumes_exact_trigger_authority(
             "materialization_status": "SELECTED",
             "materialization_generation": 3,
             "broker_ready": True,
+            "canonical_signal_id": canonical_signal_id,
             "trigger_crossed_at": trigger_crossed_at,
             "selected_contract": "AAPL260117C00100000",
             "selected_limit": 1.25,
@@ -978,12 +979,8 @@ def test_postgres_confirmation_restart_reconstructs_authority_without_duplicate_
 
         reread = _read_order(url, schema, local_order_id)
         reread_meta = dict(reread["meta"] or {})
-        assert recovery_result["errors"] == [
-            "recovery_broker_ready_executor_unavailable"
-        ]
-        assert recovery_result["infrastructure_errors"] == [
-            "recovery_broker_ready_executor_unavailable"
-        ]
+        assert recovery_result["errors"] == []
+        assert recovery_result["infrastructure_errors"] == []
         assert recovery_result["deferred_lifecycles_recovered"] == 1
         assert reread_meta["trigger_crossed_at"] == committed_timestamp
         assert reread_meta["trigger_crossed_at_provenance"] == committed_provenance
@@ -1322,7 +1319,12 @@ def test_postgres_restart_during_copyback_keeps_one_owner_without_broker_replay(
         recovery_result = recovery.recover_deferred_lifecycles()
         after = _read_order(url, schema, local_order_id)
         after_meta = dict(after["meta"] or {})
-        assert recovery_result["errors"] == []
+        assert recovery_result["errors"] == [
+            "recovery_broker_ready_executor_unavailable"
+        ]
+        assert recovery_result["infrastructure_errors"] == [
+            "recovery_broker_ready_executor_unavailable"
+        ]
         assert after_meta["materialization_generation"] == 8
         assert after_meta["materialization_owner"] == owner
         assert not fresh_broker.submit_order.called
