@@ -1125,14 +1125,31 @@ class APPositionManager:
                 pending_exit_broker_id = _field_text(
                     position, "pending_exit_broker_order_id"
                 )
-                if (
-                    (pending_exit_local_id or pending_exit_broker_id)
-                    and pending_exit_local_id != local_order_id
-                    and pending_exit_broker_id != broker_order_id
-                ):
+                # PR #579 amendment (2026-09-06): pending-exit identity
+                # is a position-mutation authority fence and requires
+                # INDEPENDENT agreement on BOTH sides. The prior AND-
+                # combined form let split-identity conflicts through
+                # whenever ONE of the two identifiers matched — that is,
+                #
+                #   local matches, broker conflicts  → PASSED
+                #   broker matches, local conflicts  → PASSED
+                #
+                # Either shape is enough to route a durable exit onto
+                # the wrong position. A non-blank durable identity that
+                # disagrees on EITHER side is now an authoritative HOLD.
+                # Blank durable identity (no prior owner recorded) still
+                # allows convergence — the first exit against a
+                # position has no owner to conflict with.
+                if pending_exit_local_id and pending_exit_local_id != local_order_id:
                     return _convergence_hold(
                         "HOLD_IDENTITY",
-                        "pending_exit_owner_mismatch",
+                        "pending_exit_local_owner_mismatch",
+                        position_id=position_id,
+                    )
+                if pending_exit_broker_id and pending_exit_broker_id != broker_order_id:
+                    return _convergence_hold(
+                        "HOLD_IDENTITY",
+                        "pending_exit_broker_owner_mismatch",
                         position_id=position_id,
                     )
 

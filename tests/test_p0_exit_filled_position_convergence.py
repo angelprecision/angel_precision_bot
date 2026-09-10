@@ -110,7 +110,16 @@ def postgres_harness(monkeypatch):
                     close_source TEXT,
                     close_confidence TEXT,
                     exit_reason TEXT,
-                    updated_at TIMESTAMPTZ
+                    updated_at TIMESTAMPTZ,
+                    -- PR #579 amendment: pending-exit ownership columns.
+                    -- Missing here previously, which meant _field_text()
+                    -- returned "" and the identity fence in
+                    -- converge_position_from_durable_exit_order was
+                    -- effectively bypassed by the whole test suite.
+                    exit_in_flight BOOLEAN,
+                    pending_exit_qty INTEGER,
+                    pending_exit_local_order_id TEXT,
+                    pending_exit_broker_order_id TEXT
                 )
                 """
             )
@@ -775,3 +784,186 @@ def test_fill_monitor_carries_only_explicit_broker_fill_timestamp():
     partial_result = check_order_with_broker(_Broker(partial_raw), order)
     assert partial_result["status"] == "EXIT_PARTIAL_FILL"
     assert partial_result["filled_ts"] is None
+
+
+# =====================================================================
+#  PR #579 amendment — P1 pending-exit identity fence
+#
+#  The original guard at converge_position_from_durable_exit_order used
+#  AND between local-id and broker-id conflict checks, so a mismatch on
+#  ONE side alone passed through. This class exercises both sides of
+#  that split-identity failure — which the pre-existing suite could not
+#  reach because the temp positions table lacked the pending-exit
+#  columns. The fixture is now extended so these tests actually bind.
+#
+#  Required behavior:
+#    - If a non-blank pending_exit_local_order_id disagrees with this
+#      exit's local_order_id, HOLD.
+#    - If a non-blank pending_exit_broker_order_id disagrees with this
+#      exit's broker_order_id, HOLD.
+#    - HOLD means zero position, proof, or runtime mutation.
+# =====================================================================
+
+
+def _set_pending_exit_owner(
+    harness: _PostgresHarness,
+    position_id: str,
+    *,
+    local_order_id: str | None,
+    broker_order_id: str | None,
+    qty: int | None = 1,
+) -> None:
+    """Stamp the pending-exit ownership fields on an already-inserted
+    position. Simulates the durable state left behind when a prior EXIT
+    was already routed and is waiting on broker confirmation.
+    """
+    harness.execute(
+        """
+        UPDATE positions
+           SET exit_in_flight = TRUE,
+               pending_exit_qty = %s,
+               pending_exit_local_order_id = %s,
+               pending_exit_broker_order_id = %s,
+               updated_at = NOW()
+         WHERE id = %s
+        """,
+        (qty, local_order_id, broker_order_id, position_id),
+    )
+
+
+def _make_pm(client_id: str = CLIENT_ID):
+    """Fresh position manager pinned to the harness DB."""
+    return APPositionManager(client_id=client_id)
+
+
+def test_pending_exit_local_match_but_broker_conflict_holds_p1(postgres_harness):
+    """
+    Split identity: this exit's local_order_id MATCHES the durable
+    pending_exit_local_order_id, but its broker_order_id DISAGREES
+    with the durable pending_exit_broker_order_id. Under the pre-fix
+    AND-guard this passes (only one field disagrees), producing an
+    unauthorized position mutation. Post-fix it must HOLD.
+    """
+    harness = postgres_harness
+    position_id, entry_id, exit_id, broker_id = _insert_trade(
+        harness, "p1-local-match", exit_status="EXIT_FILLED", filled_qty=1,
+        fill_price=1.17, filled_ts=FILLED_TS,
+    )
+    # Durable pending-exit owner: same local, DIFFERENT broker.
+    _set_pending_exit_owner(
+        harness, position_id,
+        local_order_id=exit_id,                       # match
+        broker_order_id="OTHER-BROKER-ID-CONFLICT",   # conflict
+    )
+    pos_before = _read_position(harness, position_id)
+    order_before = _read_order(harness, exit_id)
+
+    pm = _make_pm()
+    result = pm.converge_position_from_durable_exit_order(
+        exit_local_order_id=exit_id,
+        expected_execution_mode="live",
+    )
+
+    # HOLD outcome
+    assert result.disposition == "HOLD_IDENTITY", (
+        f"broker-side identity conflict must HOLD; got disposition="
+        f"{result.disposition!r} reason={result.reason!r}. This is the "
+        f"P1 leak: AND-fence let a broker-id mismatch through."
+    )
+    # No position mutation
+    pos_after = _read_position(harness, position_id)
+    for key in ("status", "quantity_remaining", "exit_price",
+                "realized_pnl", "contracts_exited", "exit_ts"):
+        assert pos_after.get(key) == pos_before.get(key), (
+            f"pending-exit-owner HOLD must not mutate position.{key}; "
+            f"was {pos_before.get(key)!r} became {pos_after.get(key)!r}"
+        )
+    # No order mutation
+    order_after = _read_order(harness, exit_id)
+    assert order_after.get("status") == order_before.get("status")
+
+
+def test_pending_exit_broker_match_but_local_conflict_holds_p1(postgres_harness):
+    """
+    Split identity: this exit's broker_order_id MATCHES the durable
+    pending_exit_broker_order_id, but its local_order_id DISAGREES
+    with the durable pending_exit_local_order_id. Mirror of the case
+    above; pre-fix AND-guard also lets this through.
+    """
+    harness = postgres_harness
+    position_id, entry_id, exit_id, broker_id = _insert_trade(
+        harness, "p1-broker-match", exit_status="EXIT_FILLED", filled_qty=1,
+        fill_price=1.17, filled_ts=FILLED_TS,
+    )
+    _set_pending_exit_owner(
+        harness, position_id,
+        local_order_id="OTHER-LOCAL-ID-CONFLICT",   # conflict
+        broker_order_id=broker_id,                  # match
+    )
+    pos_before = _read_position(harness, position_id)
+
+    pm = _make_pm()
+    result = pm.converge_position_from_durable_exit_order(
+        exit_local_order_id=exit_id,
+        expected_execution_mode="live",
+    )
+
+    assert result.disposition == "HOLD_IDENTITY", (
+        f"local-side identity conflict must HOLD; got disposition="
+        f"{result.disposition!r} reason={result.reason!r}."
+    )
+    pos_after = _read_position(harness, position_id)
+    for key in ("status", "quantity_remaining", "exit_price", "realized_pnl"):
+        assert pos_after.get(key) == pos_before.get(key)
+
+
+_CONVERGE_OK_DISPOSITIONS = {"APPLIED_FULL", "ALREADY_APPLIED"}
+
+
+def test_pending_exit_owner_matches_both_ids_converges(postgres_harness):
+    """Positive control: durable pending-exit owner matches both this
+    exit's identifiers exactly. Convergence proceeds normally."""
+    harness = postgres_harness
+    position_id, entry_id, exit_id, broker_id = _insert_trade(
+        harness, "p1-both-match", exit_status="EXIT_FILLED", filled_qty=1,
+        fill_price=1.17, filled_ts=FILLED_TS,
+    )
+    _set_pending_exit_owner(
+        harness, position_id,
+        local_order_id=exit_id,
+        broker_order_id=broker_id,
+    )
+
+    pm = _make_pm()
+    result = pm.converge_position_from_durable_exit_order(
+        exit_local_order_id=exit_id,
+        expected_execution_mode="live",
+    )
+
+    assert result.disposition in _CONVERGE_OK_DISPOSITIONS, (
+        f"exact-match pending-exit owner must not HOLD; got "
+        f"disposition={result.disposition!r} reason={result.reason!r}"
+    )
+
+
+def test_no_pending_exit_owner_converges_normally(postgres_harness):
+    """Positive control: when no durable pending-exit owner exists
+    (fields NULL / blank), the identity fence must not fire — that's
+    the normal path for the first exit against a position."""
+    harness = postgres_harness
+    position_id, entry_id, exit_id, broker_id = _insert_trade(
+        harness, "p1-no-owner", exit_status="EXIT_FILLED", filled_qty=1,
+        fill_price=1.17, filled_ts=FILLED_TS,
+    )
+    # Intentionally do NOT stamp pending-exit fields — leave them NULL.
+
+    pm = _make_pm()
+    result = pm.converge_position_from_durable_exit_order(
+        exit_local_order_id=exit_id,
+        expected_execution_mode="live",
+    )
+
+    assert result.disposition in _CONVERGE_OK_DISPOSITIONS, (
+        f"no pending-exit owner should allow convergence; got "
+        f"disposition={result.disposition!r} reason={result.reason!r}"
+    )

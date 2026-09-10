@@ -827,8 +827,19 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
 
         avg_fill = float(raw.get("avg_fill_price") or raw.get("price") or 0.0)
 
+        # PR #579 amendment (2026-09-06): also extract the broker
+        # execution timestamp when the mapped state is terminal
+        # (CANCELED / REJECTED / EXPIRED) but exec_quantity > 0. Those
+        # contracts really executed and carry a real broker timestamp,
+        # and the terminal-failure branch downstream needs that
+        # timestamp to converge the executed delta before terminalizing
+        # the remainder. Without this the delta is silently dropped
+        # (see September 4 2026 audit note on partial-then-cancel).
         broker_filled_at = None
-        if our in {"FILLED", "PARTIAL_FILL", "EXIT_FILLED", "EXIT_PARTIAL_FILL"}:
+        _extract_ts = our in {"FILLED", "PARTIAL_FILL", "EXIT_FILLED", "EXIT_PARTIAL_FILL"}
+        if not _extract_ts and our in {"CANCELED", "REJECTED", "EXPIRED"} and int(filled_qty or 0) > 0:
+            _extract_ts = True
+        if _extract_ts:
             try:
                 broker_filled_at = order_filled_at(raw)
             except Exception:
@@ -2951,6 +2962,159 @@ def process_pending_order(
 
     # ── TERMINAL FAILURES ────────────────────────────────────────────────
     if mapped in TERMINAL_FAILURE_STATUSES:
+        # ── PR #579 amendment: converge-or-hold executed delta first ──
+        #
+        # A bot-owned EXIT that terminalizes with broker cumulative
+        # filled > durable applied has executed contracts that must be
+        # projected into the canonical position BEFORE the remainder is
+        # terminalized. Without this, the executed delta is silently
+        # discarded and local position drifts above broker position —
+        # the leak the September 4 2026 audit called out.
+        #
+        # Rules:
+        #   filled_ts present → advance OSM cumulative + converge
+        #     position exactly once, then fall through to the ordinary
+        #     terminal handling so the remainder cancels.
+        #   filled_ts missing → HOLD the whole terminalization; a
+        #     later poll or the reconciler resolves. Never fabricate
+        #     a timestamp — chronology is the whole point of #579.
+        #   ENTRY orders → out of scope; the entry-fill path owns that
+        #     class of defect.
+        if (
+            kind == "EXIT"
+            and int(new_filled or 0) > int(prev_filled or 0)
+        ):
+            _delta = int(new_filled) - int(prev_filled)
+            _payload_terminal_delta = {
+                "local_order_id": local_id,
+                "broker_order_id": broker_id,
+                "terminal_status": mapped,
+                "prev_filled_qty": int(prev_filled),
+                "new_filled_qty": int(new_filled),
+                "unresolved_delta": _delta,
+                "has_filled_ts": bool(result.get("filled_ts")),
+            }
+            if not result.get("filled_ts"):
+                # HOLD — cannot converge without proven chronology, and
+                # cannot terminalize without losing the executed delta.
+                reason = "EXIT_TERMINAL_WITH_UNRESOLVED_EXECUTED_DELTA_HOLD"
+                log.critical("[%s] %s | %s", client_id, reason, _payload_terminal_delta)
+                audit(client_id, "CRITICAL", reason, _payload_terminal_delta)
+                emit_fill_event(
+                    order,
+                    decision="HOLD",
+                    reason_code=reason,
+                    explanation=(
+                        f"Broker returned {mapped} with cumulative executed "
+                        f"quantity {new_filled} > durable applied {prev_filled} "
+                        f"but no exact broker execution timestamp. Cannot "
+                        f"terminalize (would drop the executed delta) and "
+                        f"cannot converge (would fabricate chronology). "
+                        f"Awaiting next broker poll or reconciler pass."
+                    ),
+                    result=result,
+                    extra_context=_payload_terminal_delta,
+                )
+                if osm:
+                    # Retry cadence increments so the poller does not
+                    # spin on a fixed schedule waiting for a timestamp
+                    # that requires exchange settlement to arrive.
+                    try:
+                        osm.increment_retry(local_id)
+                    except Exception:
+                        pass
+                return
+
+            # Timestamp present — advance OSM cumulative and converge
+            # the delta into the canonical position, then fall through
+            # to the ordinary terminal handling for the remainder.
+            fill_applied = False
+            if osm:
+                try:
+                    fill_applied = bool(
+                        osm.apply_fill_update(
+                            local_order_id=local_id,
+                            cumulative_filled=new_filled,
+                            fill_price=result.get("avg_fill"),
+                            broker_order_id=broker_id,
+                            filled_ts=result.get("filled_ts"),
+                        )
+                    )
+                except Exception as exc:
+                    log.error(
+                        "[%s] OSM apply_fill_update failed on pre-terminal "
+                        "convergence for %s: %s",
+                        client_id, local_id, exc,
+                    )
+            else:
+                # Legacy path parity — advance cumulative locally.
+                _legacy_update_order_status(local_id, "EXIT_PARTIAL_FILL", filled_qty=new_filled)
+                fill_applied = True
+
+            if not fill_applied:
+                # OSM refused the fill update — safest response is HOLD.
+                # The executed delta remains unresolved; terminalizing
+                # now would still drop it. Retry on next poll.
+                reason = "EXIT_TERMINAL_PRE_CONVERGENCE_FILL_APPLY_REFUSED"
+                log.critical("[%s] %s | %s", client_id, reason, _payload_terminal_delta)
+                audit(client_id, "CRITICAL", reason, _payload_terminal_delta)
+                emit_fill_event(
+                    order,
+                    decision="HOLD",
+                    reason_code=reason,
+                    explanation=(
+                        "OSM refused the pre-terminal cumulative fill "
+                        "update; deferring terminalization to preserve "
+                        "the executed delta."
+                    ),
+                    result=result,
+                    extra_context=_payload_terminal_delta,
+                )
+                if osm:
+                    try:
+                        osm.increment_retry(local_id)
+                    except Exception:
+                        pass
+                return
+
+            # Converge the just-applied durable delta into the position.
+            # position_manager reads the order row directly — that is
+            # why the OSM update happens first. A HOLD here is not fatal
+            # to terminalization; #579's reducer is idempotent and the
+            # ordinary terminal transition below still fires the
+            # cancellation-of-remainder side effect.
+            if pm is not None:
+                try:
+                    _exec_mode_for_converge = str(
+                        order.get("execution_mode")
+                        or runtime_execution_mode
+                        or (getattr(exit_engine, "execution_mode", "") if exit_engine else "")
+                        or ""
+                    ).strip().lower()
+                    _converge = pm.converge_position_from_durable_exit_order(
+                        exit_local_order_id=local_id,
+                        expected_execution_mode=_exec_mode_for_converge,
+                    )
+                    _converge_disp = str(getattr(_converge, "disposition", "") or "")
+                    emit_fill_event(
+                        order,
+                        decision="PARTIAL_FILL",
+                        reason_code="EXIT_TERMINAL_DELTA_CONVERGED",
+                        explanation=(
+                            f"Executed delta {_delta} converged before "
+                            f"{mapped} terminalization of remainder."
+                        ),
+                        result={**result, "status": "EXIT_PARTIAL_FILL", "filled_qty": new_filled},
+                        extra_context={**_payload_terminal_delta, "converge_disposition": _converge_disp},
+                    )
+                except Exception as exc:
+                    log.error(
+                        "[%s] Pre-terminal position convergence failed for %s: %s",
+                        client_id, local_id, exc,
+                    )
+            # Fall through to the ordinary terminal handling for the
+            # remainder cancellation, exactly once.
+
         emit_fill_event(
             order,
             decision="REJECT",
@@ -2974,7 +3138,9 @@ def process_pending_order(
             _legacy_update_order_status(local_id, mapped, error=result.get("reason"))
 
         # IMPORTANT: no direct positions table mutation here.
-        # EXIT failure repair is handled by OSM + exit-engine hooks.
+        # EXIT failure repair is handled by OSM + exit-engine hooks,
+        # plus (PR #579 amendment above) the pre-terminal convergence
+        # of any unresolved executed delta.
 
         if kind == "ENTRY":
             _release_entry_guards(order)

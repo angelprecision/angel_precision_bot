@@ -2,9 +2,117 @@
 
 ## STATUS
 
-**SPEC ONLY / HARD HOLD. DO NOT MERGE OR DEPLOY.**
+**WIP IMPLEMENTATION + AMENDMENT / HARD HOLD. DO NOT MERGE OR DEPLOY.**
 
-Base: `main@d3c61850df709fe4c399196b9c509f28c9af2a8a`
+Base after rebase: `main@eb1fdefd8fb35effd1752a8a4de50147c06b066b`
+Original spec base: `main@d3c61850df709fe4c399196b9c509f28c9af2a8a`
+
+Per the audit reply, this PR does **not** wait for #569 (which is
+HARD HOLDed). It sits cleanly on current `main` and is fixed
+independently. Rebase only when safe `main` moves.
+
+## Amendment (2026-09-06) — audit response
+
+Two blockers identified after the initial implementation. Both fixed
+on this branch:
+
+**P0 — partial EXIT → CANCELED/REJECTED/EXPIRED could lose already-executed quantity.**
+`check_order_with_broker` gated `broker_filled_at` extraction on
+FILLED/PARTIAL states only, and the terminal-failure branch in
+`process_pending_order` transitioned OSM to CANCELED/REJECTED/EXPIRED
+with no position convergence. When the broker reported a terminal
+state with `exec_quantity > 0`, the executed contracts were silently
+discarded: broker position = P−K, local position = P; the order was
+now terminal, the pending monitor stopped polling it, and the #579
+reconciler discovery only sees EXIT_PARTIAL_FILL / EXIT_FILLED —
+the exact stale-exposure class #579 was written to eliminate.
+
+Fix (`ap/fill_monitor.py`):
+- `check_order_with_broker` now also extracts the broker execution
+  timestamp on terminal states with `exec_quantity > 0`.
+- `process_pending_order` inserts a converge-or-hold gate before the
+  terminal-failure branch. When an EXIT terminalizes with
+  `new_filled > prev_filled`:
+    - `filled_ts` present → `apply_fill_update` advances the durable
+      cumulative, then `converge_position_from_durable_exit_order`
+      projects the executed delta into the canonical position,
+      then the ordinary terminal handling runs for the remainder.
+    - `filled_ts` missing → HOLD. No OSM terminal transition, no
+      mutation. `increment_retry` for backoff. A later broker poll
+      or the reconciler pass resolves.
+
+Zero new broker submit / cancel / replace authority. No new
+proof_trades authority. Chronology is never fabricated.
+
+**P1 — pending-exit identity fence used AND where independent agreement is required.**
+`converge_position_from_durable_exit_order` combined the
+`pending_exit_local_order_id` and `pending_exit_broker_order_id`
+checks with AND. Both had to disagree for HOLD; a match on either
+side passed through. Split-identity conflicts (`local match /
+broker conflict` and `broker match / local conflict`) both let a
+durable EXIT converge onto the wrong position's authority.
+
+Fix (`ap/position_manager.py`): two independent HOLDs. A non-blank
+durable pending-exit ID that disagrees on EITHER side is now an
+authoritative HOLD with a distinct reason code
+(`pending_exit_local_owner_mismatch` /
+`pending_exit_broker_owner_mismatch`). Blank durable identity (first
+exit against a position) still allows convergence.
+
+**Test coverage extension.** The pre-existing PostgreSQL
+convergence suite did not exercise the pending-exit ownership
+columns because its temp `positions` schema omitted them —
+`_field_text()` returned `""` and the fence was effectively
+bypassed suite-wide. Schema extended with `exit_in_flight`,
+`pending_exit_qty`, `pending_exit_local_order_id`, and
+`pending_exit_broker_order_id`. Four new P1 tests exercise both
+split-identity refusals and both positive controls.
+
+## Amendment file scope
+
+Production:
+- `ap/fill_monitor.py` — `check_order_with_broker` timestamp
+  extraction extension; `process_pending_order` converge-or-hold
+  gate before terminal handling.
+- `ap/position_manager.py` — pending-exit identity fence split into
+  two independent HOLDs.
+
+Tests:
+- `tests/test_p0_pr579_partial_then_cancel_convergence.py` — NEW.
+  10 tests covering the P0 defect class (5 fail-first proven against
+  unpatched code), including ENTRY-scope guard, positive control for
+  pure cancel with zero exec, and idempotency when the delta was
+  already applied.
+- `tests/test_p0_exit_filled_position_convergence.py` — extended
+  temp schema + 4 new P1 tests + `_CONVERGE_OK_DISPOSITIONS`
+  constant. All 21 pre-existing tests still pass.
+
+CI:
+- `.github/workflows/p0_regression.yml` — wire in the new file.
+
+## Adjacent regression status (post-amendment, local run)
+
+| Suite | Result |
+|---|---|
+| `test_p0_pr579_partial_then_cancel_convergence.py` (new) | 10/10 pass |
+| `test_p0_exit_filled_position_convergence.py` | 25/25 pass |
+| `test_p0_canonical_exit_fill_truth.py` | pass |
+| `test_p0_broker_owned_exit_requested_recovery.py` | 1 pre-existing env-only failure (missing `supabase` module in local sandbox), verified by stash-and-rerun against unpatched HEAD |
+| `test_p0_reconciler_exit_filled_query_parameterization.py` | pass |
+| `test_fill_monitor_mvp_hardening.py` | pass |
+| `test_p0_reconciler_canonical_owner_adoption.py` | pass |
+
+Total: 397 / 398 pass, 1 pre-existing environment failure.
+
+## Remaining work before merge
+
+- Rebase onto whatever `main` head exists at merge time (independent
+  of #569 status).
+- Re-run the exact fail-first replay against the rebased head.
+- Full P0 regression at the exact rebased HEAD SHA.
+- Independent audit.
+
+---
 
 This PR owns one invariant only:
 
