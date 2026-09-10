@@ -95,12 +95,14 @@ DURABLE_EXIT_FILLED_STATUSES = frozenset({"EXIT_FILLED", "EXIT_PARTIAL_FILL"})
 ACTIVE_POSITION_STATUSES = ("OPEN", "CLOSING", "PARTIAL", "ACTIVE")
 EXTERNAL_LOCAL_ID_PREFIX = "external-exit:"
 BROKER_FILL_TIMESTAMP_SOURCE = "broker_response"
+# Only fields that identify execution chronology belong in this authority
+# list. Tradier's transaction_date is the order's last-updated time, not a
+# fill timestamp, so transaction_date-only broker rows must remain HOLD.
 BROKER_FILL_TIMESTAMP_KEYS = (
     "last_fill_date",
     "filled_at",
     "filled_ts",
     "fill_ts",
-    "transaction_date",
 )
 
 
@@ -899,12 +901,6 @@ def _broker_fill_timestamp(order: dict) -> tuple[datetime | None, str | None]:
     for key in BROKER_FILL_TIMESTAMP_KEYS:
         raw = order.get(key)
         if raw is None or raw == "":
-            continue
-        # Tradier documents transaction_date as the order's last-updated time,
-        # so it is fill authority only for a terminal FILLED order. Never use
-        # it for working/partial/lifecycle-only rows, and never fall back to
-        # update_date or updated_at.
-        if key == "transaction_date" and order_status(order) != "filled":
             continue
         parsed = parse_broker_fill_timestamp(raw)
         if parsed is None:

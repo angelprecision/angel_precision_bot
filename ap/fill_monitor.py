@@ -2705,7 +2705,6 @@ def process_pending_order(
                     "filled_at",
                     "filled_ts",
                     "fill_ts",
-                    "transaction_date",
                 )
                 if key in (result.get("raw") or {})
             },

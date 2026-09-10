@@ -898,7 +898,7 @@ def test_exit_timestamp_before_entry_holds_before_position_mutation(postgres_har
     assert _read_position(harness, position_id) == before
 
 
-def test_fill_monitor_carries_only_explicit_broker_fill_timestamp():
+def test_fill_monitor_does_not_treat_tradier_transaction_date_as_fill_timestamp():
     from ap.fill_monitor import check_order_with_broker
 
     class _Broker:
@@ -918,11 +918,12 @@ def test_fill_monitor_carries_only_explicit_broker_fill_timestamp():
         "status": "FILLED",
         "exec_quantity": 1,
         "avg_fill_price": 1.17,
+        "remaining_quantity": 0,
         "transaction_date": FILLED_TS.isoformat(),
     }
     result = check_order_with_broker(_Broker(raw), order)
     assert result["status"] == "EXIT_FILLED"
-    assert result["filled_ts"] == FILLED_TS.isoformat()
+    assert result["filled_ts"] is None
 
     partial_raw = dict(raw)
     partial_raw["status"] = "PARTIALLY_FILLED"

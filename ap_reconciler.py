@@ -190,7 +190,7 @@ def _positive_finite_float(value) -> float:
 
 
 _BROKER_FILL_TIMESTAMP_KEYS = (
-    "last_fill_date", "filled_at", "filled_ts", "fill_ts", "transaction_date",
+    "last_fill_date", "filled_at", "filled_ts", "fill_ts",
 )
 
 def _extract_broker_fill_timestamp(raw: dict) -> Optional[str]:

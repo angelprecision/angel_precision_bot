@@ -39,6 +39,18 @@ def fill(**kw):
     x.update(kw)
     return x
 
+def raw_tradier_order(**kw):
+    x = {
+        "id": "145345180",
+        "status": "filled",
+        "exec_quantity": 2,
+        "avg_fill_price": 1.19,
+        "remaining_quantity": 0,
+        "transaction_date": "2026-09-10T14:35:58.000Z",
+    }
+    x.update(kw)
+    return x
+
 def summary():
     return {"orders_corrected":0,"orders_alerted":0,"errors":[],"positions_imported":0}
 
@@ -68,9 +80,45 @@ def _install_stale_rows(monkeypatch, rows):
     monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
 
 
-def test_parser_accepts_exact_tradier_fill_timestamp():
+def test_parser_accepts_explicit_timezone_aware_fill_timestamp():
     ts = _extract_broker_fill_timestamp(fill())
     assert ts and datetime.fromisoformat(ts).utcoffset() is not None
+
+
+def test_raw_tradier_transaction_date_is_not_execution_timestamp():
+    assert _extract_broker_fill_timestamp(raw_tradier_order()) is None
+
+
+def test_raw_tradier_filled_transaction_date_holds_before_osm():
+    o = FakeOSM(); r = rec(o); s = summary()
+    r._advance_order_to_broker_fill(
+        order(qty=5), raw_tradier_order(remaining_quantity=3), "filled", s
+    )
+
+    assert o.calls == []
+    assert s["orders_corrected"] == 0
+    assert s["orders_alerted"] == 1
+    assert "EXIT_FILL_TIMESTAMP_MISSING_OR_INVALID" in r.alerts[-1]
+
+
+@pytest.mark.parametrize("broker_status", ["partially_filled", "canceled", "rejected", "expired"])
+def test_raw_tradier_partial_or_terminal_transaction_date_holds_before_mutation(
+    broker_status,
+):
+    o = FakeOSM(); r = rec(o); s = summary()
+    raw = raw_tradier_order(status=broker_status, remaining_quantity=3)
+
+    if broker_status == "partially_filled":
+        r._advance_order_to_broker_fill(order(qty=5), raw, broker_status, s)
+    else:
+        r._advance_order_to_terminal(
+            order(qty=5, position_id=None), broker_status, s, broker_raw=raw
+        )
+
+    assert o.calls == []
+    assert s["orders_corrected"] == 0
+    assert s["orders_alerted"] == 1
+    assert "EXIT_FILL_TIMESTAMP_MISSING_OR_INVALID" in r.alerts[-1]
 
 def test_normal_exit_fill_propagates_timestamp_and_identity():
     o = FakeOSM(); r = rec(o); s = summary()
