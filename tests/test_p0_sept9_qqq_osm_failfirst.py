@@ -513,18 +513,21 @@ class TestSept9FailFirst:
                 filled_ts=FILL_TS,
             )
         )
-        assert fill_applied is True, "apply_fill_update must succeed before convergence test"
+        # The durable partial fill is written before convergence.  A
+        # convergence HOLD is surfaced as False so callers cannot terminalize
+        # the order while the durable state remains retryable.
+        assert fill_applied is False, "convergence HOLD must fail closed"
 
         # With converge HOLDing, the order must NOT be in terminal status
         # (the fill_monitor code must HOLD and return, not call osm.transition(CANCELED))
         order_after = _order(h)
         # Order remains in partial-fill state (not terminal CANCELED/REJECTED/EXPIRED)
-        assert order_after.get("status") in (
-            "EXIT_PARTIAL_FILL", "EXIT_REQUESTED",
-        ), (
+        assert order_after.get("status") == "EXIT_PARTIAL_FILL", (
             f"Order must not be terminalized when convergence HOLDs. "
             f"Got status={order_after.get('status')}"
         )
+        assert order_after.get("filled_qty") == FILL_QTY
+        assert order_after.get("filled_ts") == FILL_TS
 
         # Position must also remain in non-terminal state (not CLOSED by fabrication)
         pos_after = _pos(h)
