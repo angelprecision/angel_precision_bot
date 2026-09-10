@@ -2723,7 +2723,20 @@ class APOrderStateMachine:
                 cur = c.execute(
                     """
                     UPDATE orders
-                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                    SET meta = COALESCE(meta, '{}'::jsonb)
+                               || %s::jsonb
+                               || jsonb_build_object(
+                                    'trigger_crossed_at_provenance',
+                                    jsonb_build_object(
+                                        'canonical_signal_id', COALESCE(
+                                            NULLIF(TRIM(canonical_signal_id), ''),
+                                            NULLIF(TRIM(meta->>'canonical_signal_id'), '')
+                                        ),
+                                        'client_id', LOWER(TRIM(client_id)),
+                                        'execution_mode', LOWER(TRIM(execution_mode)),
+                                        'local_order_id', local_order_id
+                                    )
+                                  ),
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
@@ -3135,6 +3148,9 @@ class APOrderStateMachine:
 
         if not _owner or not _signal_id or _mode not in ("live", "paper"):
             return False
+        _crossed_at = str(trigger_crossed_at or "").strip()
+        if not _crossed_at:
+            return False
 
         _now = now_utc_iso()
         _patch = {
@@ -3157,7 +3173,7 @@ class APOrderStateMachine:
             "materialization_lease_until": str(lease_until or ""),
             "materialization_started_at": _now,
             "selector_started_at": _now,
-            "trigger_crossed_at": str(trigger_crossed_at or _now),
+            "trigger_crossed_at": _crossed_at,
             "breach_received_at": _now,
             "trigger_price": float(trigger_price or 0),
             "observed_underlying_price": float(observed_underlying_price or 0),
@@ -3295,6 +3311,12 @@ class APOrderStateMachine:
                             COALESCE(meta->>'lifecycle_state','') IN ('', 'RETRY_WAIT')
                          OR COALESCE(meta->>'materialization_lease_until','') < %s
                       )
+                      AND COALESCE(NULLIF(TRIM(canonical_signal_id), ''),
+                                   NULLIF(TRIM(meta->>'canonical_signal_id'), ''), '') <> ''
+                      AND (NULLIF(TRIM(canonical_signal_id), '') IS NULL
+                           OR NULLIF(TRIM(meta->>'canonical_signal_id'), '') IS NULL
+                           OR NULLIF(TRIM(canonical_signal_id), '') =
+                              NULLIF(TRIM(meta->>'canonical_signal_id'), ''))
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                     """ + _attempt_predicate,
                     (
