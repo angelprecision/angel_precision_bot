@@ -147,6 +147,7 @@ env:
     tests/test_p0_manual_rescue_restart_guard_bypass.py
     tests/test_p0_exit_filled_position_convergence.py
     tests/test_p0_pr579_partial_then_cancel_convergence.py
+    tests/test_p0_sept9_qqq_osm_failfirst.py
 
 jobs:
   p0-tests:
