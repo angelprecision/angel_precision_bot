@@ -2329,8 +2329,12 @@ class APExecutionCore:
                 for _field in ("materialization_generation", "trigger_generation"):
                     try:
                         setattr(_approved_plan, _field, _new_generation)
-                    except Exception:
-                        pass
+                    except (AttributeError, TypeError) as _plan_generation_exc:
+                        log.debug(
+                            "[%s] recovered plan generation mirror unavailable: %s",
+                            ticker,
+                            _plan_generation_exc,
+                        )
             return _owned({
                 "owner": owner,
                 "generation": next_generation,

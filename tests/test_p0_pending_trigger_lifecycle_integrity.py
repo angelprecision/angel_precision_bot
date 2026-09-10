@@ -771,6 +771,15 @@ class TestPR580PostgresRecoveryContract:
     ):
         """The real deferred callback carries N+1 through its recovery fence."""
         import ap.deferred_breach_underlying_repair as underlying_module
+        import sys
+
+        # The P0 workflow intentionally omits the optional scanner-only
+        # yfinance dependency.  APExecutionCore dynamically imports the
+        # production quote-refresh helper from ap.execution; provide only the
+        # import-time placeholder so the real helper, callback, OSM and broker
+        # boundary still execute below.
+        if "yfinance" not in sys.modules:
+            monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace())
         import ap.execution as execution_module
         import ap_entry_confirmation as confirmation_module
         import ap_entry_watcher as ew

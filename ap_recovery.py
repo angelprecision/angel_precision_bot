@@ -3683,13 +3683,14 @@ class APStartupRecovery:
         # before the prior process died.  This is deliberately broker-free
         # and runs before watcher admission so a sink outage cannot erase a
         # durable terminal transition.
+        _recovery_osm = getattr(self, "osm", None)
         _replay_observability = getattr(
-            self.osm, "replay_deferred_transition_observability", None
+            _recovery_osm, "replay_deferred_transition_observability", None
         )
         if (
             callable(_replay_observability)
             and getattr(
-                self.osm,
+                _recovery_osm,
                 "_supports_deferred_transition_observability_replay",
                 False,
             ) is True
