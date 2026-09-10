@@ -5885,11 +5885,10 @@ class APEntryWatcher:
                         and _same_timestamp
                         and _same_provenance
                     ):
-                        watched._trigger_authority_persisted = True
-                        watched._durable_trigger_crossed_at_raw = _durable_raw
-                        watched._durable_trigger_crossed_at_provenance = dict(
-                            _readback["trigger_crossed_at_provenance"]
-                        )
+                        # Do not publish in-memory authority until the
+                        # second existing-authority CAS has committed.  A
+                        # readback proves another transaction committed; it
+                        # does not itself make this watcher the durable writer.
                         patch = {
                             "trigger_crossed_at": _durable_raw,
                             "trigger_crossed_at_provenance": dict(
