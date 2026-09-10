@@ -1372,12 +1372,37 @@ class APOrderStateMachine:
                 "[%s] opportunity ledger notify failed (non-fatal): %s",
                 self.client_id, _ledger_exc,
             )
-        self._handle_exit_engine_hooks(
+        exit_hook_result = self._handle_exit_engine_hooks(
             current=current, new_status=new_status, position_id=position_id,
             filled_qty=filled_qty, fill_price=fill_price,
             broker_order_id=broker_order_id or current.get("broker_order_id"),
             local_order_id=local_order_id,
         )
+        if (
+            kind.upper() == "EXIT"
+            and new_status in (
+                OrderStatus.EXIT_PARTIAL_FILL,
+                OrderStatus.EXIT_FILLED,
+            )
+            and exit_hook_result is False
+        ):
+            self._emit_transition_event(
+                local_order_id=local_order_id,
+                old_status=old_status,
+                new_status=new_status,
+                order=current,
+                decision="HOLD",
+                reason_code="EXIT_CONVERGENCE_HOLD",
+                explanation=(
+                    "Durable EXIT fill was persisted but canonical position "
+                    "convergence did not prove exact fill authority."
+                ),
+                broker_order_id=broker_order_id,
+                filled_qty=filled_qty,
+                fill_price=fill_price,
+                last_error=last_error,
+            )
+            return False
         return True
 
     def adopt_broker_owned_exit_request(
@@ -1899,7 +1924,7 @@ class APOrderStateMachine:
         fill_price=None,
         broker_order_id=None,
         local_order_id=None,
-    ) -> None:
+    ) -> bool | None:
         if new_status not in (
             OrderStatus.EXIT_SUBMITTED, OrderStatus.EXIT_FILLED,
             OrderStatus.EXIT_PARTIAL_FILL, OrderStatus.CANCELED,
@@ -1942,7 +1967,10 @@ class APOrderStateMachine:
                         _durable_disposition,
                         getattr(_durable_result, "reason", ""),
                     )
-                    return
+                    # A durable convergence hold is a real control-flow
+                    # failure: the order status may be durable, but no
+                    # position/runtime mutation is authorized.
+                    return False
 
             _ee = _get_exit_engine_for_client(self.client_id)
             if not _ee:
@@ -2153,6 +2181,7 @@ class APOrderStateMachine:
         cumulative_filled: int,
         fill_price=None,
         broker_order_id=None,
+        filled_ts=None,
     ) -> bool:
         order = self._get_order(local_order_id)
         if not order:
@@ -2175,6 +2204,7 @@ class APOrderStateMachine:
             broker_order_id=broker_order_id or order.get("broker_order_id"),
             filled_qty=cumulative_filled,
             fill_price=fill_price,
+            filled_ts=filled_ts,
         )
 
     def increment_retry(self, local_order_id: str):

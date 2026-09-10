@@ -48,6 +48,7 @@ from ap.logger import get_logger
 from ap.config import Config
 from ap.state import release_equity, release_symbol_lock
 from ap.broker import BrokerAdapter
+from ap.manual_close_reconciliation import order_filled_at
 from ap.observability import emit_decision_event, get_git_commit
 
 log = get_logger("ap.fill_monitor")
@@ -826,10 +827,22 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
 
         avg_fill = float(raw.get("avg_fill_price") or raw.get("price") or 0.0)
 
+        broker_filled_at = None
+        if our in {"FILLED", "PARTIAL_FILL", "EXIT_FILLED", "EXIT_PARTIAL_FILL"}:
+            try:
+                broker_filled_at = order_filled_at(raw)
+            except Exception:
+                broker_filled_at = None
+
         result = {
             "status": our,
             "filled_qty": filled_qty,
             "avg_fill": avg_fill,
+            "filled_ts": (
+                broker_filled_at.astimezone(timezone.utc).isoformat()
+                if broker_filled_at is not None
+                else None
+            ),
             "reason": raw.get("reason") or status,
             "raw": raw,
         }
@@ -2659,6 +2672,49 @@ def process_pending_order(
         )
         return
 
+    # EXIT position mutation requires an exact broker execution timestamp.
+    # Do not let OSM persist a new cumulative fill that the canonical
+    # convergence seam cannot chronologically prove.  A later poll or the
+    # reconciler may retry the same broker-confirmed order.
+    if (
+        kind == "EXIT"
+        and mapped in {"EXIT_FILLED", "EXIT_PARTIAL_FILL"}
+        and not result.get("filled_ts")
+    ):
+        reason = "EXIT_FILL_TIMESTAMP_MISSING_OR_INVALID"
+        payload = {
+            "local_order_id": local_id,
+            "broker_order_id": broker_id,
+            "status": mapped,
+            "filled_qty": new_filled,
+            "raw_timestamp_fields": {
+                key: result.get("raw", {}).get(key)
+                for key in (
+                    "last_fill_date",
+                    "filled_at",
+                    "filled_ts",
+                    "fill_ts",
+                    "transaction_date",
+                )
+                if key in (result.get("raw") or {})
+            },
+        }
+        log.critical("[%s] %s | %s", client_id, reason, payload)
+        audit(client_id, "CRITICAL", reason, payload)
+        emit_fill_event(
+            order,
+            decision="HOLD",
+            reason_code=reason,
+            explanation=(
+                "Broker confirmed an EXIT fill without an exact timezone-aware "
+                "execution timestamp; no OSM, position, proof, or runtime "
+                "projection is authorized."
+            ),
+            result=result,
+            extra_context=payload,
+        )
+        return
+
     # ── FILLED / EXIT_FILLED ────────────────────────────────────────────────
     if mapped in ("FILLED", "EXIT_FILLED"):
         emit_fill_event(
@@ -2688,6 +2744,7 @@ def process_pending_order(
                     filled_qty=new_filled,
                     fill_price=result.get("avg_fill"),
                     broker_order_id=broker_id,
+                    filled_ts=result.get("filled_ts"),
                 )
             except Exception as exc:
                 log.error("[%s] OSM transition %s failed for %s: %s", client_id, mapped, local_id, exc)
@@ -2798,8 +2855,8 @@ def process_pending_order(
 
         audit(
             client_id,
-            "INFO",
-            "ORDER_FILLED",
+            "INFO" if ok else "WARNING",
+            "ORDER_FILLED" if ok else "ORDER_FILL_HELD",
             {
                 "local_order_id": local_id,
                 "broker_order_id": broker_id,
@@ -2827,21 +2884,26 @@ def process_pending_order(
             try:
                 current_status = str(order.get("status") or "").upper()
                 if current_status == mapped and current_status in ("PARTIAL_FILL", "EXIT_PARTIAL_FILL"):
-                    osm.apply_fill_update(
-                        local_order_id=local_id,
-                        cumulative_filled=new_filled,
-                        fill_price=result.get("avg_fill"),
-                        broker_order_id=broker_id,
+                    partial_applied = bool(
+                        osm.apply_fill_update(
+                            local_order_id=local_id,
+                            cumulative_filled=new_filled,
+                            fill_price=result.get("avg_fill"),
+                            broker_order_id=broker_id,
+                            filled_ts=result.get("filled_ts"),
+                        )
                     )
                 else:
-                    osm.transition(
-                        local_id,
-                        mapped,
-                        filled_qty=new_filled,
-                        fill_price=result.get("avg_fill"),
-                        broker_order_id=broker_id,
+                    partial_applied = bool(
+                        osm.transition(
+                            local_id,
+                            mapped,
+                            filled_qty=new_filled,
+                            fill_price=result.get("avg_fill"),
+                            broker_order_id=broker_id,
+                            filled_ts=result.get("filled_ts"),
+                        )
                     )
-                partial_applied = True
             except Exception as exc:
                 log.error("[%s] OSM partial update %s failed for %s: %s", client_id, mapped, local_id, exc)
         else:
@@ -2861,8 +2923,8 @@ def process_pending_order(
 
         audit(
             client_id,
-            "INFO",
-            "ORDER_PARTIAL",
+            "INFO" if partial_applied else "WARNING",
+            "ORDER_PARTIAL" if partial_applied else "ORDER_PARTIAL_HELD",
             {
                 "local_order_id": local_id,
                 "broker_order_id": broker_id,
@@ -3049,6 +3111,25 @@ def _sync_exit_price(order: dict, result: dict):
     Runs directly against Supabase proof_trades — no dashboard API hop needed.
     """
     try:
+        if str(order.get("kind") or "").strip().upper() == "EXIT":
+            # Bot-owned EXIT position/proof mutation belongs to OSM/PM. This
+            # compatibility function may only keep the dashboard mirror warm;
+            # it must never become a second proof or position authority.
+            pos_id = order.get("position_id")
+            avg_fill = result.get("avg_fill")
+            if pos_id and avg_fill is not None:
+                try:
+                    from ap.exit_price_sync import sync_exit_price_to_dashboard
+                    sync_exit_price_to_dashboard(
+                        position_id=str(pos_id),
+                        exit_avg_fill=float(avg_fill),
+                        entry_price=None,
+                        ticker=str(order.get("symbol") or "").upper(),
+                    )
+                except Exception:
+                    pass
+            return
+
         pos_id      = order.get("position_id")
         avg_fill    = result.get("avg_fill")
         entry_price = float(order.get("entry_price") or order.get("fill_price") or 0)

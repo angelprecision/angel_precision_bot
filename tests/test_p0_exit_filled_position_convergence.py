@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from types import SimpleNamespace
@@ -693,3 +693,85 @@ def test_osm_exit_filled_without_broker_timestamp_stays_unprojected(
     )
     assert result.disposition == "HOLD_TIMESTAMP"
     assert _read_position(harness, position_id) == before
+
+
+@pytest.mark.parametrize("position_status", ["PARTIAL", "ACTIVE"])
+def test_valid_legacy_active_position_statuses_converge(
+    postgres_harness,
+    position_status,
+):
+    harness = postgres_harness
+    position_id, _, exit_id, _ = _insert_trade(
+        harness,
+        f"legacy-{position_status.lower()}",
+        position_status=position_status,
+        qty=2,
+        remaining=2,
+        exit_status="EXIT_PARTIAL_FILL",
+        filled_qty=1,
+        fill_price=1.17,
+        filled_ts=FILLED_TS,
+    )
+
+    result = APPositionManager(CLIENT_ID).converge_position_from_durable_exit_order(
+        exit_local_order_id=exit_id,
+        expected_execution_mode="live",
+    )
+
+    assert result.disposition == "APPLIED_PARTIAL"
+    assert result.remaining_qty == 1
+    position = _read_position(harness, position_id)
+    assert position["quantity_remaining"] == 1
+    assert position["status"] == "CLOSING"
+
+
+def test_exit_timestamp_before_entry_holds_before_position_mutation(postgres_harness):
+    harness = postgres_harness
+    position_id, _, exit_id, _ = _insert_trade(
+        harness,
+        "reversed-timestamp",
+        filled_ts=ENTRY_TS - timedelta(seconds=1),
+    )
+    before = _read_position(harness, position_id)
+
+    result = APPositionManager(CLIENT_ID).converge_position_from_durable_exit_order(
+        exit_local_order_id=exit_id,
+        expected_execution_mode="live",
+    )
+
+    assert result.disposition == "HOLD_TIMESTAMP"
+    assert result.reason == "exit_timestamp_before_entry"
+    assert _read_position(harness, position_id) == before
+
+
+def test_fill_monitor_carries_only_explicit_broker_fill_timestamp():
+    from ap.fill_monitor import check_order_with_broker
+
+    class _Broker:
+        def __init__(self, raw):
+            self.raw = raw
+
+        def get_order(self, broker_order_id):
+            return dict(self.raw)
+
+    order = {
+        "client_id": CLIENT_ID,
+        "local_order_id": "exit-timestamp-transport",
+        "broker_order_id": "broker-timestamp-transport",
+        "kind": "EXIT",
+    }
+    raw = {
+        "status": "FILLED",
+        "exec_quantity": 1,
+        "avg_fill_price": 1.17,
+        "transaction_date": FILLED_TS.isoformat(),
+    }
+    result = check_order_with_broker(_Broker(raw), order)
+    assert result["status"] == "EXIT_FILLED"
+    assert result["filled_ts"] == FILLED_TS.isoformat()
+
+    partial_raw = dict(raw)
+    partial_raw["status"] = "PARTIALLY_FILLED"
+    partial_result = check_order_with_broker(_Broker(partial_raw), order)
+    assert partial_result["status"] == "EXIT_PARTIAL_FILL"
+    assert partial_result["filled_ts"] is None

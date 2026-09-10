@@ -1017,6 +1017,51 @@ class APPositionManager:
                 if position_contract != order_contract:
                     return _convergence_hold("HOLD_IDENTITY", "position_order_contract_mismatch", position_id=position_id)
 
+                # Preserve the identity dimensions that exist in the deployed
+                # row shape.  Missing optional metadata remains legacy-compatible,
+                # but conflicting authorities are never allowed to project money.
+                for identity_key in ("signal_id", "canonical_signal_id"):
+                    order_identity = _field_text(order, identity_key)
+                    position_identity = _field_text(position, identity_key)
+                    if order_identity and position_identity and order_identity != position_identity:
+                        return _convergence_hold(
+                            "HOLD_IDENTITY",
+                            f"{identity_key}_mismatch",
+                            position_id=position_id,
+                        )
+
+                order_generation_raw = meta.get("materialization_generation")
+                if order_generation_raw is not None:
+                    order_generation = _strict_integral(order_generation_raw, positive=True)
+                    if order_generation is None:
+                        return _convergence_hold(
+                            "HOLD_IDENTITY",
+                            "invalid_materialization_generation",
+                            position_id=position_id,
+                        )
+                    position_generation_raw = position.get("materialization_generation")
+                    if position_generation_raw is None:
+                        position_meta, _ = _projection_meta(position.get("meta"))
+                        if position_meta:
+                            position_generation_raw = position_meta.get("materialization_generation")
+                    if position_generation_raw is not None:
+                        position_generation = _strict_integral(
+                            position_generation_raw,
+                            positive=True,
+                        )
+                        if position_generation is None:
+                            return _convergence_hold(
+                                "HOLD_IDENTITY",
+                                "invalid_position_materialization_generation",
+                                position_id=position_id,
+                            )
+                        if position_generation != order_generation:
+                            return _convergence_hold(
+                                "HOLD_IDENTITY",
+                                "materialization_generation_mismatch",
+                                position_id=position_id,
+                            )
+
                 position_qty = _strict_integral(position.get("qty"), positive=True)
                 avg_fill = _strict_decimal(
                     position.get("avg_fill") if position.get("avg_fill") is not None
@@ -1043,13 +1088,48 @@ class APPositionManager:
                         return _convergence_hold("HOLD_STATE", "invalid_position_remaining_quantity", position_id=position_id)
 
                 position_status = _field_text(position, "status").upper()
-                if position_status not in PositionStatus.TERMINAL | {
-                    PositionStatus.OPEN,
-                    PositionStatus.CLOSING,
-                }:
+                if position_status not in PositionStatus.TERMINAL | PositionStatus.ACTIVE:
                     return _convergence_hold(
                         "HOLD_STATE", "invalid_position_status", position_id=position_id
                     )
+
+                entry_timestamp_raw = (
+                    position.get("entry_ts")
+                    or position.get("opened_at")
+                    or position.get("created_at")
+                )
+                if entry_timestamp_raw not in (None, ""):
+                    entry_dt, _entry_ts = _exact_aware_timestamp(entry_timestamp_raw)
+                    if entry_dt is None:
+                        return _convergence_hold(
+                            "HOLD_TIMESTAMP",
+                            "invalid_position_entry_timestamp",
+                            position_id=position_id,
+                        )
+                    if fill_dt < entry_dt:
+                        return _convergence_hold(
+                            "HOLD_TIMESTAMP",
+                            "exit_timestamp_before_entry",
+                            position_id=position_id,
+                        )
+
+                pending_exit_local_id = _field_text(
+                    position, "pending_exit_local_order_id"
+                )
+                pending_exit_broker_id = _field_text(
+                    position, "pending_exit_broker_order_id"
+                )
+                if (
+                    (pending_exit_local_id or pending_exit_broker_id)
+                    and pending_exit_local_id != local_order_id
+                    and pending_exit_broker_id != broker_order_id
+                ):
+                    return _convergence_hold(
+                        "HOLD_IDENTITY",
+                        "pending_exit_owner_mismatch",
+                        position_id=position_id,
+                    )
+
                 position_terminal = position_status in PositionStatus.TERMINAL
                 if position_terminal and remaining_qty > 0:
                     return _convergence_hold("HOLD_STATE", "terminal_position_has_remaining_quantity", position_id=position_id)
@@ -1195,6 +1275,28 @@ class APPositionManager:
                     float(realized_pnl_pct),
                     fill_dt,
                 ]
+                current_order_remaining = requested_qty - cumulative_qty
+                partial_owner_active = (
+                    order_status == "EXIT_PARTIAL_FILL"
+                    and current_order_remaining > 0
+                )
+                ownership_updates = (
+                    {
+                        "exit_in_flight": True,
+                        "pending_exit_qty": current_order_remaining,
+                        "pending_exit_local_order_id": local_order_id,
+                        "pending_exit_broker_order_id": broker_order_id,
+                    }
+                    if partial_owner_active
+                    else {
+                        "exit_in_flight": False,
+                        "pending_exit_action": None,
+                        "pending_exit_reason": None,
+                        "pending_exit_qty": None,
+                        "pending_exit_local_order_id": None,
+                        "pending_exit_broker_order_id": None,
+                    }
+                )
                 optional_position_updates = {
                     # This is the position-wide exited quantity.  The
                     # watermark quantity is scoped to this exact EXIT order.
@@ -1202,6 +1304,7 @@ class APPositionManager:
                     "exit_reason": "exit_filled",
                     "close_source": "durable_exit_fill_convergence",
                     "close_confidence": "HIGH",
+                    **ownership_updates,
                 }
                 for column, value in optional_position_updates.items():
                     if column in position_columns:
@@ -1308,26 +1411,18 @@ class APPositionManager:
             )
             return _convergence_hold("DB_ERROR", f"{type(exc).__name__}:{exc}")
 
-        # Proof is downstream of the committed position/watermark state.  A
-        # proof outage leaves the durable money state correct and discoverable;
-        # the next replay repairs proof without applying another quantity delta.
+        # Proof materialization belongs to the dedicated proof-recovery path
+        # (PR #581).  This seam may synchronize one already-bound proof row,
+        # but it must never create a missing proof row while projecting an
+        # EXIT fill.  A missing proof remains discoverable for #581.
         if result.terminal and result.disposition in {"APPLIED_FULL", "ALREADY_APPLIED"}:
             try:
-                proof_ok, proof_reason = self.repair_terminal_proof_from_persisted(
-                    result.position_id,
-                    expected_execution_mode=expected_mode,
-                    durable_exit_evidence={
-                        "filled_qty": result.cumulative_applied_qty,
-                        "fill_price": result.exit_price,
-                    },
-                )
-            except Exception as exc:
-                proof_ok, proof_reason = False, f"proof_sync_exception:{type(exc).__name__}"
-            if proof_ok:
                 proof_ok, proof_reason = self._synchronize_convergence_proof(
                     result,
                     expected_execution_mode=expected_mode,
                 )
+            except Exception as exc:
+                proof_ok, proof_reason = False, f"proof_sync_exception:{type(exc).__name__}"
             if not proof_ok:
                 log.critical(
                     "[%s] durable EXIT position committed but proof remains pending | "

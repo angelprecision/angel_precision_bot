@@ -42,6 +42,7 @@ from ap_entry_watcher import (
 )
 from ap.pending_trigger_classifier import is_active_materialization_in_flight
 from ap.pending_trigger_restart_recovery import _RecoveryPlan
+from ap.manual_close_reconciliation import order_filled_at
 
 log = logging.getLogger("ap.recovery")
 
@@ -134,6 +135,22 @@ def _extract_avg_fill_price(raw: dict) -> Optional[float]:
         except Exception:
             continue
     return None
+
+
+def _extract_broker_fill_timestamp(raw: dict) -> Optional[str]:
+    """Return only an explicit timezone-aware broker execution timestamp."""
+    try:
+        filled_at = order_filled_at(raw)
+    except Exception:
+        return None
+    if not isinstance(filled_at, datetime):
+        return None
+    try:
+        if filled_at.tzinfo is None or filled_at.utcoffset() is None:
+            return None
+        return filled_at.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return None
 
 
 def _write_fill_truth_blocked_meta(
@@ -792,6 +809,7 @@ class APStartupRecovery:
                         local_id, new_status,
                         filled_qty=filled_qty,
                         fill_price=avg_fill,
+                        filled_ts=_extract_broker_fill_timestamp(broker_raw),
                     )
                     if ok:
                         result["entries_corrected"] += 1
@@ -1053,11 +1071,19 @@ class APStartupRecovery:
             if broker_status in BROKER_FILLED:
                 filled_qty = _extract_explicit_fill_qty(broker_raw)
                 avg_fill   = _extract_avg_fill_price(broker_raw)
-                if not filled_qty or filled_qty <= 0 or not avg_fill or avg_fill <= 0:
+                filled_ts  = _extract_broker_fill_timestamp(broker_raw)
+                if (
+                    not filled_qty
+                    or filled_qty <= 0
+                    or not avg_fill
+                    or avg_fill <= 0
+                    or not filled_ts
+                ):
                     msg = (
                         f"RECOVERY_EXIT_FILL_TRUTH_MISSING local={local_id} "
                         f"broker={broker_oid} pos={pos_id} broker_status={broker_status} "
-                        "missing explicit filled_qty/avg_fill; keeping CLOSING for reconciler/fill_monitor"
+                        "missing explicit filled_qty/avg_fill/exact_filled_ts; "
+                        "keeping CLOSING for reconciler/fill_monitor"
                     )
                     log.critical("[%s] %s", self.client_id, msg)
                     result.setdefault("errors", []).append(msg)
@@ -1083,6 +1109,7 @@ class APStartupRecovery:
                         exit_status,
                         filled_qty=filled_qty,
                         fill_price=avg_fill,
+                        filled_ts=filled_ts,
                     )
                 except Exception as e:
                     log.error("[%s] RECOVERY: %s transition failed: %s",
