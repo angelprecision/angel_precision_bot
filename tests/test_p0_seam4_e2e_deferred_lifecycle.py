@@ -40,6 +40,7 @@ def _row() -> dict:
     return {
         "local_order_id": LOCAL_ORDER_ID,
         "client_id": CLIENT_ID,
+        "canonical_signal_id": SIGNAL_ID,
         "execution_mode": "live",
         "signal_id": SIGNAL_ID,
         "plan_id": "plan-pr323-e2e-1",
@@ -188,6 +189,81 @@ class _StatefulOSM:
             self.fail_next_row_read = False
             raise RuntimeError("db_hiccup")
         return self._copy_row()
+
+    def read_trigger_confirmation_authority(
+        self,
+        local_order_id,
+        *,
+        client_id,
+        execution_mode,
+        signal_id,
+        canonical_signal_id,
+        expected_materialization_generation=None,
+    ):
+        """Strict in-memory equivalent of the production durable readback."""
+        row = self.get_order(local_order_id)
+        if not row:
+            return None
+        meta = row.get("meta") or {}
+        if (
+            str(row.get("client_id") or "").strip().lower()
+            != str(client_id or "").strip().lower()
+            or str(row.get("execution_mode") or "").strip().lower()
+            != str(execution_mode or "").strip().lower()
+            or str(row.get("signal_id") or "").strip()
+            != str(signal_id or "").strip()
+            or str(
+                row.get("canonical_signal_id")
+                or meta.get("canonical_signal_id")
+                or ""
+            ).strip()
+            != str(canonical_signal_id or "").strip()
+            or str(row.get("status") or "").upper() != "PENDING_TRIGGER"
+            or row.get("broker_order_id") not in (None, "")
+            or row.get("submitted_ts") is not None
+            or meta.get("submit_intent_at") not in (None, "")
+            or meta.get("broker_ready") not in (None, False, "")
+        ):
+            return None
+        crossed = meta.get("trigger_crossed_at")
+        provenance = meta.get("trigger_crossed_at_provenance")
+        if not isinstance(crossed, str) or not crossed.strip() or not isinstance(provenance, dict):
+            return None
+        expected_provenance = {
+            "canonical_signal_id": str(canonical_signal_id or "").strip(),
+            "client_id": str(client_id or "").strip().lower(),
+            "execution_mode": str(execution_mode or "").strip().lower(),
+            "local_order_id": str(local_order_id or "").strip(),
+        }
+        actual_provenance = {
+            "canonical_signal_id": str(provenance.get("canonical_signal_id") or "").strip(),
+            "client_id": str(provenance.get("client_id") or "").strip().lower(),
+            "execution_mode": str(provenance.get("execution_mode") or "").strip().lower(),
+            "local_order_id": str(provenance.get("local_order_id") or "").strip(),
+        }
+        if actual_provenance != expected_provenance:
+            return None
+        generation = meta.get("materialization_generation")
+        if generation is not None and (
+            isinstance(generation, bool) or not isinstance(generation, int) or generation < 1
+        ):
+            return None
+        if expected_materialization_generation is not None and generation != expected_materialization_generation:
+            return None
+        try:
+            parsed = datetime.fromisoformat(
+                crossed[:-1] + "+00:00" if crossed.endswith("Z") else crossed
+            )
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                return None
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return {
+            "proven": True,
+            "trigger_crossed_at": crossed,
+            "trigger_crossed_at_provenance": copy.deepcopy(provenance),
+            "materialization_generation": generation,
+        }
 
     def update_order_meta(self, local_order_id, patch, **_expected):
         assert local_order_id == LOCAL_ORDER_ID

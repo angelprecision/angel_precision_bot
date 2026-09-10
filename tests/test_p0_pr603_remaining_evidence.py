@@ -857,7 +857,10 @@ def test_postgres_restart_after_selector_claim_has_one_materialization_owner(
         claimed_meta = dict(claimed["meta"] or {})
         assert claimed_meta["materialization_generation"] == 8
         assert claimed_meta["retry_attempt"] == 3
-        assert claimed_meta["materialization_owner"] == f"crash-owner:{local_order_id}"
+        # Scheduling the retry releases the active materialization lease.  The
+        # durable retry owner is the surviving authority for the next attempt.
+        assert claimed_meta["materialization_owner"] == ""
+        assert claimed_meta["retry_owner"] == f"crash-owner:{local_order_id}"
         assert claimed_meta["lifecycle_state"] == "RETRY_WAIT"
         assert claimed_meta["materialization_status"] == "RETRY_PENDING"
 

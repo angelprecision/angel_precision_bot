@@ -2503,8 +2503,15 @@ class APOrderStateMachine:
             or str(_row.get("client_id") or "").strip().lower() != _client
             or str(_row.get("signal_id") or "").strip() != _signal
             or str(_row.get("execution_mode") or "").strip().lower() != _mode
-            or str(_row.get("canonical_signal_id") or "").strip() != _canonical
         ):
+            return None
+        _row_canonical = str(_row.get("canonical_signal_id") or "").strip()
+        _meta_canonical = str(_meta.get("canonical_signal_id") or "").strip()
+        if _row_canonical and _row_canonical != _canonical:
+            return None
+        if _meta_canonical and _meta_canonical != _canonical:
+            return None
+        if not _row_canonical and not _meta_canonical:
             return None
         for _key, _expected in (
             ("local_order_id", _local),
@@ -2557,7 +2564,10 @@ class APOrderStateMachine:
                 isinstance(_generation, bool)
                 or not isinstance(_generation, int)
                 or _generation < 1
-                or expected_materialization_generation != _generation
+                or (
+                    expected_materialization_generation is not None
+                    and expected_materialization_generation != _generation
+                )
             ):
                 return None
         elif expected_materialization_generation is not None:
