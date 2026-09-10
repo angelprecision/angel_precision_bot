@@ -117,18 +117,25 @@ class _FakeBroker:
 
 
 class _FakeOSM:
-    """Captures OSM transitions and apply_fill_update calls without touching DB."""
-    def __init__(self):
+    """Adversarial OSM double: apply_fill_update is legal only in partial state."""
+    def __init__(self, initial_status="EXIT_ACKNOWLEDGED", trace=None):
+        self.status = initial_status
+        self.trace = trace if trace is not None else []
         self.transitions: list = []
         self.fill_updates: list = []
         self.retry_increments: list = []
 
     def transition(self, local_order_id, mapped, **kwargs):
+        self.trace.append(("transition", mapped))
         self.transitions.append({"local_order_id": local_order_id, "mapped": mapped, **kwargs})
+        self.status = mapped
         return True
 
     def apply_fill_update(self, *, local_order_id, cumulative_filled,
                           fill_price=None, broker_order_id=None, filled_ts=None):
+        if self.status not in {"PARTIAL_FILL", "EXIT_PARTIAL_FILL"}:
+            return False
+        self.trace.append(("apply", cumulative_filled))
         self.fill_updates.append({
             "local_order_id": local_order_id,
             "cumulative_filled": cumulative_filled,
@@ -148,11 +155,13 @@ class _FakePM:
     with the exit order's local_order_id, and only when a fill delta
     with a valid timestamp is present.
     """
-    def __init__(self, converge_result: str = "APPLIED_FULL"):
+    def __init__(self, converge_result: str = "APPLIED_FULL", trace=None):
         self.converge_calls: list = []
         self._converge_result = converge_result
+        self.trace = trace if trace is not None else []
 
     def converge_position_from_durable_exit_order(self, *, exit_local_order_id, expected_execution_mode):
+        self.trace.append(("converge", exit_local_order_id))
         self.converge_calls.append({
             "exit_local_order_id": exit_local_order_id,
             "expected_execution_mode": expected_execution_mode,
@@ -300,8 +309,9 @@ class TestPartialThenCancelPreservesExecutedQuantity:
             exec_qty=2,
             filled_at_iso="2026-09-04T14:42:34.680787+00:00",
         ))
-        osm = _FakeOSM()
-        pm = _FakePM()
+        trace = []
+        osm = _FakeOSM(trace=trace)
+        pm = _FakePM(trace=trace)
         order = _exit_order(filled_qty=0)   # previously no fill applied
 
         fm.process_pending_order(broker, order, osm=osm, pm=pm)
@@ -315,16 +325,20 @@ class TestPartialThenCancelPreservesExecutedQuantity:
         assert pm.converge_calls[0]["exit_local_order_id"] == order["local_order_id"]
         assert pm.converge_calls[0]["expected_execution_mode"] == "live"
 
-        # ── OSM: fill must be applied (with the exact broker cumulative
-        # and timestamp) BEFORE the terminal transition ─────────────────
-        assert len(osm.fill_updates) == 1, (
-            f"expected exactly one apply_fill_update to advance the durable "
-            f"cumulative before terminalization; got {len(osm.fill_updates)}."
+        # ── OSM: non-partial EXITs must first enter the legal partial
+        # state. The adversarial fake rejects apply_fill_update from ACK.
+        assert osm.fill_updates == [], (
+            "non-partial terminal recovery must use transition, not "
+            "apply_fill_update from EXIT_ACKNOWLEDGED"
         )
-        fu = osm.fill_updates[0]
-        assert fu["cumulative_filled"] == 2
-        assert fu["filled_ts"] is not None
-        assert fu["broker_order_id"] == "TBK-9001"
+        assert [t["mapped"] for t in osm.transitions] == [
+            "EXIT_PARTIAL_FILL", "CANCELED"
+        ]
+        assert trace == [
+            ("transition", "EXIT_PARTIAL_FILL"),
+            ("converge", order["local_order_id"]),
+            ("transition", "CANCELED"),
+        ]
 
         # ── The terminal OSM transition happens after — remainder cancels
         assert any(t["mapped"] == "CANCELED" for t in osm.transitions), (
@@ -462,6 +476,79 @@ class TestPartialThenCancelPreservesExecutedQuantity:
         assert pm.converge_calls == []
         # Terminal transition proceeds for the remainder.
         assert any(t["mapped"] == "CANCELED" for t in osm.transitions)
+
+
+# =====================================================================
+#  Startup recovery: positive executed quantity must never bypass gates
+# =====================================================================
+
+class _RecoveryOSM:
+    def __init__(self, results):
+        self.results = list(results)
+        self.transitions = []
+
+    def transition(self, local_order_id, mapped, **kwargs):
+        self.transitions.append({"local_order_id": local_order_id, "mapped": mapped, **kwargs})
+        return self.results.pop(0) if self.results else True
+
+
+def _run_recovery_terminal_case(monkeypatch, *, pm, osm):
+    import ap_recovery as recovery_mod
+
+    broker = _FakeBroker(_broker_response_terminal_with_executed(
+        status="CANCELED",
+        exec_qty=2,
+        filled_at_iso="2026-09-04T14:42:34.680787+00:00",
+    ))
+    order = _exit_order(filled_qty=0)
+    order["position_id"] = "position-001"
+    rec = recovery_mod.APStartupRecovery(
+        client_id="jason@example.com",
+        broker=broker,
+        osm=osm,
+        pm=pm,
+        master_control=SimpleNamespace(mode="LIVE"),
+    )
+    rec._load_closing_positions = lambda: [{"id": "position-001", "underlying": "PEP"}]
+    rec._resolve_active_exit_order_for_position = lambda position, result: order
+    rec._load_persisted_exit_order = lambda local_id: {
+        **order,
+        "status": "EXIT_PARTIAL_FILL",
+        "filled_qty": 2,
+        "fill_price": 1.42,
+        "filled_ts": "2026-09-04T14:42:34.680787+00:00",
+    }
+    result = {"errors": [], "exits_reattached": 0}
+    rec._recover_exit_fills_that_occurred_during_downtime(result)
+    return result
+
+
+def test_recovery_positive_terminal_delta_holds_without_position_manager(monkeypatch):
+    osm = _RecoveryOSM([True, True])
+    result = _run_recovery_terminal_case(monkeypatch, pm=None, osm=osm)
+    assert osm.transitions == []
+    assert result["exits_reattached"] == 0
+    assert any("missing position manager" in error for error in result["errors"])
+
+
+def test_recovery_positive_terminal_delta_holds_when_partial_transition_refused(monkeypatch):
+    osm = _RecoveryOSM([False])
+    pm = _FakePM()
+    result = _run_recovery_terminal_case(monkeypatch, pm=pm, osm=osm)
+    assert [t["mapped"] for t in osm.transitions] == ["EXIT_PARTIAL_FILL"]
+    assert pm.converge_calls == []
+    assert result["exits_reattached"] == 0
+
+
+def test_recovery_positive_terminal_delta_holds_when_terminal_transition_refused(monkeypatch):
+    osm = _RecoveryOSM([True, False])
+    pm = _FakePM()
+    result = _run_recovery_terminal_case(monkeypatch, pm=pm, osm=osm)
+    assert [t["mapped"] for t in osm.transitions] == [
+        "EXIT_PARTIAL_FILL", "CANCELED"
+    ]
+    assert len(pm.converge_calls) == 1
+    assert result["exits_reattached"] == 0
 
 
 # =====================================================================
