@@ -3679,6 +3679,32 @@ class APStartupRecovery:
         from datetime import datetime, timezone, timedelta
         from zoneinfo import ZoneInfo
 
+        # Recover observability for any incumbent cancellation that committed
+        # before the prior process died.  This is deliberately broker-free
+        # and runs before watcher admission so a sink outage cannot erase a
+        # durable terminal transition.
+        _replay_observability = getattr(
+            self.osm, "replay_deferred_transition_observability", None
+        )
+        if (
+            callable(_replay_observability)
+            and getattr(
+                self.osm,
+                "_supports_deferred_transition_observability_replay",
+                False,
+            ) is True
+        ):
+            try:
+                result["recovery_transition_observability_replayed"] = int(
+                    _replay_observability() or 0
+                )
+            except Exception as exc:
+                log.warning(
+                    "[%s] recovery transition observability replay failed: %s",
+                    self.client_id,
+                    exc,
+                )
+
         ET = ZoneInfo("America/New_York")
         now_et   = datetime.now(ET)
         # Default 48 hours covers Sunday evening scanner signals for Monday open.

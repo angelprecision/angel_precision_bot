@@ -4757,42 +4757,65 @@ class APEntryWatcher:
             return _hold(_admission_abort_reason)
 
         # The admission context has committed here.  Only now may the
-        # incumbent's process-local ownership be released.  Both canonical
-        # observability surfaces are deliberately deferred until the durable
-        # cancellation transaction has committed, so rollback leaves no
-        # opportunity-state side effect behind.
+        # incumbent's process-local ownership be released.  The transactional
+        # cancellation wrote a durable replay marker, so a sink/process
+        # failure remains recoverable on the next startup.  Rollback paths
+        # return above and therefore never create that marker.
         osm = getattr(self, "order_state_machine", None)
-        # OSM's transactional cancellation deliberately defers all
-        # observability side effects. Replay the canonical transition event
-        # only after the admission context has committed; rollback paths return
-        # above and therefore emit neither a ledger notification nor an event.
-        emit_transition = getattr(osm, "_emit_transition_event", None)
-        if callable(emit_transition):
-            for transition_event in _deferred_transition_events:
-                try:
-                    emit_transition(**transition_event)
-                except Exception as exc:
-                    log.debug(
-                        "[%s] deferred recovery transition event failed: %s",
-                        watched.ticker,
-                        exc,
-                    )
+        replay_observability = getattr(
+            osm, "replay_deferred_transition_observability", None
+        )
+        if (
+            callable(replay_observability)
+            and getattr(
+                osm,
+                "_supports_deferred_transition_observability_replay",
+                False,
+            ) is True
+        ):
+            try:
+                replay_observability(
+                    local_order_ids=[
+                        event["local_order_id"]
+                        for event in _deferred_transition_events
+                    ]
+                )
+            except Exception as exc:
+                log.debug(
+                    "[%s] deferred recovery observability replay failed: %s",
+                    watched.ticker,
+                    exc,
+                )
+        else:
+            # Keep the explicit unit-test seam compatible with lightweight
+            # OSM doubles that predate the durable replay method.
+            emit_transition = getattr(osm, "_emit_transition_event", None)
+            if callable(emit_transition):
+                for transition_event in _deferred_transition_events:
+                    try:
+                        emit_transition(**transition_event)
+                    except Exception as exc:
+                        log.debug(
+                            "[%s] deferred recovery transition event failed: %s",
+                            watched.ticker,
+                            exc,
+                        )
 
-        notify_ledger = getattr(osm, "_notify_opportunity_ledger", None)
-        if callable(notify_ledger):
-            for ledger_row in _deferred_ledger_rows:
-                try:
-                    notify_ledger(
-                        current=ledger_row["current"],
-                        new_status=ledger_row["new_status"],
-                        last_error=ledger_row["last_error"],
-                    )
-                except Exception as exc:
-                    log.debug(
-                        "[%s] deferred recovery cancellation ledger notify failed: %s",
-                        watched.ticker,
-                        exc,
-                    )
+            notify_ledger = getattr(osm, "_notify_opportunity_ledger", None)
+            if callable(notify_ledger):
+                for ledger_row in _deferred_ledger_rows:
+                    try:
+                        notify_ledger(
+                            current=ledger_row["current"],
+                            new_status=ledger_row["new_status"],
+                            last_error=ledger_row["last_error"],
+                        )
+                    except Exception as exc:
+                        log.debug(
+                            "[%s] deferred recovery cancellation ledger notify failed: %s",
+                            watched.ticker,
+                            exc,
+                        )
 
         for incumbent, incumbent_token, _incumbent_row in _terminal_proven:
             # The outer registry lock prevents normal concurrent replacement,

@@ -135,6 +135,9 @@ class TestPR580PostgresRecoveryContract:
                         direction TEXT,
                         plan_id TEXT,
                         contract TEXT,
+                        contract_selection_status TEXT,
+                        limit_price DOUBLE PRECISION,
+                        reserved_cost DOUBLE PRECISION,
                         qty INTEGER,
                         score DOUBLE PRECISION,
                         tier TEXT,
@@ -396,7 +399,8 @@ class TestPR580PostgresRecoveryContract:
             "broker_order_id", "submitted_ts", "filled_ts",
             "execution_mode", "signal_id", "canonical_signal_id",
             "ticker", "symbol", "side", "direction", "plan_id",
-            "contract", "qty", "score", "tier", "pattern", "timeframe",
+            "contract", "limit_price", "reserved_cost", "qty", "score",
+            "tier", "pattern", "timeframe",
             "trigger_price", "stop_underlying", "target_underlying",
             "materialization_generation", "trigger_generation", "meta",
             "metadata",
@@ -762,6 +766,253 @@ class TestPR580PostgresRecoveryContract:
         assert durable["meta"]["recovery_trigger_dispatch_finished_at"]
         self._assert_no_broker_calls(broker)
 
+    def test_actual_startup_restart_deferred_live_callback_advances_generation_once(
+        self, pg, monkeypatch,
+    ):
+        """The real deferred callback carries N+1 through its recovery fence."""
+        import ap.deferred_breach_underlying_repair as underlying_module
+        import ap.execution as execution_module
+        import ap_entry_confirmation as confirmation_module
+        import ap_entry_watcher as ew
+        from ap.contract_selector import SelectedContract
+        from ap_execution_core import APExecutionCore
+
+        class _Response:
+            status_code = 200
+            text = '{"order":{"id":"broker-pr580-1","status":"open"}}'
+
+            @staticmethod
+            def json():
+                return {"order": {"id": "broker-pr580-1", "status": "open"}}
+
+        class _Session:
+            def __init__(self):
+                self.posts = []
+
+            def post(self, url, *, data, headers, timeout):
+                self.posts.append({
+                    "url": url,
+                    "data": dict(data),
+                    "headers": dict(headers),
+                    "timeout": timeout,
+                })
+                return _Response()
+
+        class _BrokerSpy:
+            base_url = "https://api.tradier.com"
+            account_id = "pr580-test-account"
+            sandbox = False
+
+            def __init__(self):
+                self.cfg = types.SimpleNamespace(
+                    base_url=self.base_url,
+                    account_id=self.account_id,
+                )
+                self.session = _Session()
+                self.quote_calls = []
+
+            def get_quote(self, symbol):
+                symbol = str(symbol or "").upper()
+                self.quote_calls.append(symbol)
+                if symbol == "AAPL":
+                    return {
+                        "bid": 200.00,
+                        "ask": 200.10,
+                        "last": 200.05,
+                        "quote_age_ms": 10,
+                        "source": "tradier_live",
+                    }
+                return {
+                    "bid": 1.90,
+                    "ask": 2.00,
+                    "last": 1.95,
+                    "quote_age_ms": 10,
+                    "source": "tradier_live",
+                }
+
+        class _Selector:
+            def __init__(self, selected):
+                self.selected = selected
+                self.calls = []
+
+            def select(self, plan, *, request_context):
+                self.calls.append((plan, request_context))
+                return self.selected
+
+            @staticmethod
+            def get_last_failure():
+                return None
+
+        class _Confirmation:
+            passed = True
+            fail_reason = ""
+            metadata = {"live_entry_ts": datetime.now(timezone.utc).isoformat()}
+
+            def to_meta(self, *, started_at, completed_at):
+                return {
+                    "confirmation_required": False,
+                    "confirmation_passed": True,
+                    "started_at": started_at,
+                    "completed_at": completed_at,
+                }
+
+        signal = self._ready_signal()
+        crossed_at = datetime.now(timezone.utc).isoformat()
+        row = self._ready_row(signal)
+        row.update({
+            "limit_price": 0.01,
+            "reserved_cost": 200.00,
+        })
+        for metadata in (row["meta"], row["metadata"]):
+            metadata.update({
+                "contract_deferred": True,
+                "deferred_reservation_cost": 200.00,
+                "entry_cutoff_et": 2359,
+                "trigger_crossed_at": crossed_at,
+                "original_trigger_crossed_at": crossed_at,
+            })
+        self._insert_row(pg, row)
+
+        selected = SelectedContract(
+            contract_symbol="AAPL260918C00200000",
+            expiration="2026-09-18",
+            strike=200.0,
+            option_type="CALL",
+            bid=1.90,
+            ask=2.00,
+            mid=1.95,
+            spread_pct=0.05,
+            delta=0.50,
+            open_interest=1000,
+            volume=1000,
+            premium_per_share=2.00,
+            premium_per_contract=200.00,
+            affordable_contracts=1,
+            selection_reason="test_survivor",
+            selection_score=1.0,
+            dte=8,
+            execution_price_per_share=2.00,
+        )
+        broker = _BrokerSpy()
+        selector = _Selector(selected)
+        osm = self._new_osm(signal)
+        osm.execution_mode = "live"
+        # Keep this test focused on the durable lifecycle and broker boundary;
+        # the observability sinks have their own PostgreSQL replacement tests.
+        osm._emit_transition_event = lambda **kwargs: None
+        osm._notify_opportunity_ledger = lambda **kwargs: None
+
+        watcher = ew.APEntryWatcher(
+            broker=broker,
+            order_state_machine=osm,
+            require_on_trigger=False,
+            mode="LIVE",
+        )
+        watcher._persist_watcher_audit = lambda *args, **kwargs: None
+        result = self._run_startup_reseed(signal, watcher, osm, broker)
+        assert result["pending_trigger_watchers_rearmed"] == 1
+        registered = watcher._pending[0]
+        assert registered.signal["__recovered_trigger_ready"] is True
+
+        master_control = types.SimpleNamespace(
+            mode="LIVE",
+            max_positions=7,
+            get_entry_capacity=lambda **kwargs: {
+                "ok": True,
+                "selector_budget": 1000.0,
+                "remaining_total_capacity": 1000.0,
+                "per_trade_budget": 1000.0,
+                "account_equity": 10000.0,
+                "total_capital_cap": 10000.0,
+                "current_total_exposure": 0.0,
+                "max_affordable_premium": 10.0,
+            },
+            revalidate_exposure=lambda plan, client_id: types.SimpleNamespace(
+                ok=True, reason=""
+            ),
+        )
+        core = APExecutionCore(
+            broker=broker,
+            supabase_client=None,
+            email=signal["client_id"],
+            order_state_machine=osm,
+            master_control=master_control,
+            contract_selector=selector,
+        )
+        core.store = types.SimpleNamespace(
+            update_status=lambda *args, **kwargs: None,
+            update_signal_fields=lambda *args, **kwargs: None,
+        )
+        core._breach_risk_check = lambda watched: True
+        watcher.on_trigger = core._on_entry_trigger
+
+        monkeypatch.setattr(
+            execution_module,
+            "_refresh_ask_at_submit",
+            lambda _broker, _contract: (
+                2.00,
+                10,
+                True,
+                "",
+                {
+                    "submit_bid": 1.90,
+                    "submit_ask": 2.00,
+                    "submit_last": 1.95,
+                    "submit_mid": 1.95,
+                    "spread_pct": 0.05,
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            confirmation_module,
+            "check_entry_confirmation",
+            lambda **kwargs: _Confirmation(),
+        )
+        monkeypatch.setattr(
+            underlying_module,
+            "resolve_positive_underlying_for_breach",
+            lambda **kwargs: (200.05, "broker_spy", {"source": "broker_spy"}),
+        )
+        monkeypatch.setenv("SELECTOR_DURABLE_RECOVERY_CURSOR_ENABLED", "0")
+
+        watcher._poll_active_signals(False)
+
+        assert len(selector.calls) == 1
+        assert len(broker.session.posts) == 1
+        durable = pg["read"](
+            "SELECT status, broker_order_id, materialization_generation, "
+            "trigger_generation, meta, metadata FROM orders "
+            "WHERE local_order_id=%s",
+            (signal["local_order_id"],),
+        )
+        assert durable["status"] == "SUBMITTED"
+        assert durable["broker_order_id"] == "broker-pr580-1"
+        assert durable["materialization_generation"] == "8"
+        assert durable["trigger_generation"] == "8"
+        for metadata in (durable["meta"], durable["metadata"]):
+            assert metadata["materialization_generation"] == 8
+            assert metadata["trigger_generation"] == 8
+            assert metadata["recovery_trigger_dispatch_generation"] == 8
+            assert metadata["recovery_trigger_dispatch_trigger_generation"] == 8
+            assert metadata["recovery_trigger_dispatch_state"] == "COMPLETED"
+        assert watcher._pending == []
+
+        # A new process-shaped recovery caller sees SUBMITTED durable broker
+        # ownership and cannot recreate the trigger or post a second order.
+        watcher2 = ew.APEntryWatcher(
+            broker=broker,
+            order_state_machine=self._new_osm(signal),
+            require_on_trigger=False,
+            mode="LIVE",
+        )
+        watcher2._persist_watcher_audit = lambda *args, **kwargs: None
+        result2 = self._run_startup_reseed(
+            signal, watcher2, watcher2.order_state_machine, broker
+        )
+        assert result2["pending_trigger_watchers_rearmed"] == 0
+        assert watcher2._pending == []
+        assert len(broker.session.posts) == 1
+
     def _run_postgres_claim_race(self, pg, signal, owners):
         import uuid
 
@@ -961,6 +1212,7 @@ class TestPR580PostgresRecoveryContract:
         import ap.opportunity_ledger as ledger_module
         import ap_entry_watcher as ew
         import ap_lifecycle as lifecycle
+        import ap.order_state_machine as osm_module
 
         self._clear_ledger()
         suffix = uuid.uuid4().hex
@@ -1030,6 +1282,15 @@ class TestPR580PostgresRecoveryContract:
         assert events[0]["reason_code"] == "ORDER_CANCELED"
         assert events[0]["inputs_json"]["old_status"] == "PENDING_TRIGGER"
         assert events[0]["inputs_json"]["new_status"] == "CANCELED"
+        assert durable_incumbent["status"] == "CANCELED"
+        marker_row = pg["read"](
+            "SELECT meta, metadata FROM orders WHERE local_order_id=%s",
+            (incumbent["local_order_id"],),
+        )
+        for metadata in (marker_row["meta"], marker_row["metadata"]):
+            assert metadata["recovery_transition_observability_v1"]["state"] == (
+                "DONE"
+            )
 
         assert len(watcher._pending) == 1
         registered = watcher._pending[0]
@@ -1044,54 +1305,79 @@ class TestPR580PostgresRecoveryContract:
             lifecycle.SignalState.TRIGGER_READY
         )
 
-        # A repeated canonical ledger delivery is monotonic/idempotent.  It
-        # cannot reopen the incumbent or create a broker-side effect.
-        osm._notify_opportunity_ledger(
-            current={
-                **durable_incumbent,
-                "kind": "ENTRY",
-                "local_order_id": incumbent["local_order_id"],
-                "signal_id": incumbent["signal_id"],
-                "canonical_signal_id": incumbent["canonical_signal_id"],
-                "client_id": incumbent["client_id"],
-            },
-            new_status="CANCELED",
-            last_error="recovery_watcher_replacement_converged",
+        # Simulate process death after both sinks ran but before the marker
+        # acknowledgement. A fresh OSM must retry the marker; the event key
+        # makes the append-only event sink idempotent and the ledger update is
+        # monotonic.
+        replay_meta = marker_row["meta"]
+        replay_metadata = marker_row["metadata"]
+        for metadata in (replay_meta, replay_metadata):
+            marker = dict(metadata["recovery_transition_observability_v1"])
+            marker.update({
+                "state": "PENDING",
+                "event_delivered": False,
+                "ledger_delivered": False,
+            })
+            marker.pop("replay_token", None)
+            marker.pop("replay_started_at", None)
+            metadata["recovery_transition_observability_v1"] = marker
+        pg["exec"](
+            "UPDATE orders SET meta=%s::jsonb, metadata=%s::jsonb "
+            "WHERE local_order_id=%s",
+            (
+                json.dumps(replay_meta),
+                json.dumps(replay_metadata),
+                incumbent["local_order_id"],
+            ),
         )
-        assert pg["read"](
-            "SELECT count(*) AS count FROM client_signal_opportunities "
-            "WHERE canonical_signal_id=%s AND client_id=%s",
-            (incumbent["canonical_signal_id"], incumbent["client_id"]),
-        )["count"] == 1
-        assert pg["read"](
-            "SELECT opportunity_status FROM client_signal_opportunities "
-            "WHERE canonical_signal_id=%s AND client_id=%s",
-            (incumbent["canonical_signal_id"], incumbent["client_id"]),
-        )["opportunity_status"] == "CANCELED"
+        original_transition_event = osm_module.emit_decision_event
+        failing_osm = self._new_osm(incumbent)
+        failing_osm.run_id = "pr580-postgres-replacement-sink-failure"
+        failing_osm.strategy_version = "pr580-test"
+        failing_osm.config_hash = "pr580-test-config"
+        failing_osm.git_commit = "pr580-test-sha"
 
-        # The transition-event sink is append-only observability.  A duplicate
-        # post-commit delivery is therefore harmless: it may add an audit row,
-        # but it cannot reopen the durable order, regress the canonical ledger,
-        # or reach the broker boundary.
-        osm._emit_transition_event(
-            local_order_id=incumbent["local_order_id"],
-            old_status="PENDING_TRIGGER",
-            new_status="CANCELED",
-            order={
-                **durable_incumbent,
-                "kind": "ENTRY",
-                "local_order_id": incumbent["local_order_id"],
-                "signal_id": incumbent["signal_id"],
-                "canonical_signal_id": incumbent["canonical_signal_id"],
-                "client_id": incumbent["client_id"],
-            },
-            decision="TERMINAL",
-            last_error="recovery_watcher_replacement_converged",
+        def _fail_transition_event(**_kwargs):
+            raise RuntimeError("injected decision-event sink failure")
+
+        monkeypatch.setattr(osm_module, "emit_decision_event", _fail_transition_event)
+        assert failing_osm.replay_deferred_transition_observability(
+            local_order_ids=[incumbent["local_order_id"]]
+        ) == 0
+        pending_marker = pg["read"](
+            "SELECT meta FROM orders WHERE local_order_id=%s",
+            (incumbent["local_order_id"],),
+        )["meta"]["recovery_transition_observability_v1"]
+        assert pending_marker["state"] == "PENDING"
+        assert pending_marker["event_delivered"] is False
+        assert pending_marker["ledger_delivered"] is True
+
+        # A fresh startup caller retries the failed sink. The original event
+        # was already durable before the simulated crash, so its deterministic
+        # key prevents a duplicate append while the marker converges to DONE.
+        monkeypatch.setattr(
+            osm_module, "emit_decision_event", original_transition_event
         )
+        replay_osm = self._new_osm(incumbent)
+        replay_osm.run_id = "pr580-postgres-replacement-restart"
+        replay_osm.strategy_version = "pr580-test"
+        replay_osm.config_hash = "pr580-test-config"
+        replay_osm.git_commit = "pr580-test-sha"
+        replay_watcher = ew.APEntryWatcher(
+            broker=broker,
+            order_state_machine=replay_osm,
+            require_on_trigger=False,
+            mode="LIVE",
+        )
+        replay_watcher._persist_watcher_audit = lambda *args, **kwargs: None
+        replay_result = self._run_startup_reseed(
+            incumbent, replay_watcher, replay_osm, broker
+        )
+        assert replay_result["recovery_transition_observability_replayed"] == 1
         assert pg["read"](
             "SELECT count(*) AS count FROM decision_events WHERE trade_id=%s",
             (incumbent["local_order_id"],),
-        )["count"] == 2
+        )["count"] == 1
         assert pg["read"](
             "SELECT status FROM orders WHERE local_order_id=%s",
             (incumbent["local_order_id"],),
@@ -1101,6 +1387,9 @@ class TestPR580PostgresRecoveryContract:
             "WHERE canonical_signal_id=%s AND client_id=%s",
             (incumbent["canonical_signal_id"], incumbent["client_id"]),
         )["opportunity_status"] == "CANCELED"
+        assert replay_osm.replay_deferred_transition_observability(
+            local_order_ids=[incumbent["local_order_id"]]
+        ) == 0
         osm._handle_exit_engine_hooks.assert_not_called()
         self._assert_no_broker_calls(broker)
 
@@ -1177,10 +1466,12 @@ class TestPR580PostgresRecoveryContract:
         )
         for signal in incumbents:
             durable = pg["read"](
-                "SELECT status FROM orders WHERE local_order_id=%s",
+                "SELECT status, meta, metadata FROM orders WHERE local_order_id=%s",
                 (signal["local_order_id"],),
             )
             assert durable["status"] == "PENDING_TRIGGER"
+            for metadata in (durable["meta"], durable["metadata"]):
+                assert "recovery_transition_observability_v1" not in metadata
             opportunity = pg["read"](
                 "SELECT opportunity_status FROM client_signal_opportunities "
                 "WHERE canonical_signal_id=%s AND client_id=%s",

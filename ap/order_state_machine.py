@@ -410,6 +410,8 @@ PENDING_EXIT_STATUSES = (
 
 
 class APOrderStateMachine:
+    _supports_deferred_transition_observability_replay = True
+
 
     def __init__(self, client_id: str):
         # AUDIT-4: strip client_id — DB whitespace artifacts caused log noise and
@@ -560,13 +562,26 @@ class APOrderStateMachine:
         last_error=None,
         extra_inputs: Optional[dict] = None,
         extra_context: Optional[dict] = None,
-    ) -> None:
+        idempotency_key: Optional[str] = None,
+        strict: bool = False,
+    ) -> bool:
         if emit_decision_event is None:
-            return
+            return False
         try:
             order = dict(order or {})
             kind  = str(order.get("kind") or "")
-            emit_decision_event(
+            _event_inputs = {
+                "kind":             kind,
+                "old_status":       old_status,
+                "new_status":       new_status,
+                "local_order_id":   local_order_id,
+                "broker_order_id":  broker_order_id or order.get("broker_order_id"),
+                "filled_qty":       filled_qty,
+                "fill_price":       fill_price,
+                "last_error":       last_error,
+                **(extra_inputs or {}),
+            }
+            _event_kwargs = dict(
                 run_id=self.run_id,
                 candidate_id=str(order.get("signal_id") or local_order_id or ""),
                 trade_id=str(local_order_id or ""),
@@ -583,21 +598,18 @@ class APOrderStateMachine:
                 strategy_version=self.strategy_version,
                 config_hash=self.config_hash,
                 git_commit=self.git_commit,
-                inputs={
-                    "kind":             kind,
-                    "old_status":       old_status,
-                    "new_status":       new_status,
-                    "local_order_id":   local_order_id,
-                    "broker_order_id":  broker_order_id or order.get("broker_order_id"),
-                    "filled_qty":       filled_qty,
-                    "fill_price":       fill_price,
-                    "last_error":       last_error,
-                    **(extra_inputs or {}),
-                },
+                inputs=_event_inputs,
                 context=extra_context or {},
             )
+            if idempotency_key:
+                _event_kwargs["idempotency_key"] = idempotency_key
+            if strict:
+                _event_kwargs["strict"] = True
+            emit_decision_event(**_event_kwargs)
+            return True
         except Exception as e:
             log.debug("OSM observability emit failed (non-critical): %s", e)
+            return False
 
     # ------------------------------------------------------------------
     # Order creation
@@ -1246,10 +1258,54 @@ class APOrderStateMachine:
         elif new_status in (OrderStatus.EXIT_PARTIAL_FILL, OrderStatus.EXIT_FILLED) and filled_ts:
             updates.append("filled_ts=%s"); params.append(filled_ts)
         if kind.upper() == "ENTRY" and OrderStatus.is_terminal(new_status):
+            _terminal_meta_patch = {
+                "selector_recovery_cursor_v1": None,
+            }
+            if _defer_side_effects and new_status == OrderStatus.CANCELED:
+                # Transactional recovery cancellation must leave a durable
+                # replay marker in the same UPDATE as the terminal status.
+                # If the process dies after commit but before the external
+                # sinks run, startup can replay this marker without touching
+                # broker authority or reopening the order.
+                _observability_key = ":".join(
+                    (
+                        "recovery-transition",
+                        str(self.client_id or "").strip(),
+                        str(local_order_id or "").strip(),
+                        str(old_status or "").strip().upper(),
+                        str(new_status or "").strip().upper(),
+                        str(last_error or "").strip(),
+                    )
+                )
+                _terminal_meta_patch[
+                    "recovery_transition_observability_v1"
+                ] = {
+                    "key": _observability_key,
+                    "state": "PENDING",
+                    "event_delivered": False,
+                    "ledger_delivered": False,
+                    "old_status": old_status,
+                    "new_status": new_status,
+                    "decision": "TERMINAL",
+                    "reason_code": self._reason_code_for_transition(
+                        old_status, new_status, kind
+                    ),
+                    "explanation": (
+                        f"Order transition {old_status} -> {new_status}"
+                    ),
+                    "last_error": last_error,
+                    "created_at": now_utc_iso(),
+                }
+            _terminal_meta_json = json.dumps(_terminal_meta_patch, default=str)
             updates.append(
-                "meta=COALESCE(meta, '{}'::jsonb) "
-                "|| '{\"selector_recovery_cursor_v1\":null}'::jsonb"
+                "meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb"
             )
+            params.append(_terminal_meta_json)
+            if "metadata" in current:
+                updates.append(
+                    "metadata=COALESCE(metadata, '{}'::jsonb) || %s::jsonb"
+                )
+                params.append(_terminal_meta_json)
         # COMPARE-AND-SWAP: guard the UPDATE on the status we read above.
         # Without this, two concurrent callers (fill_monitor / order_monitor /
         # reconciler all run in separate threads) can both pass the Python-side
@@ -1900,7 +1956,7 @@ class APOrderStateMachine:
         fill_price=None,
         filled_qty=None,
         filled_ts=None,
-    ) -> None:
+    ) -> bool:
         """Translate an OSM transition into the appropriate opportunity-
         ledger update. ENTRY orders only. Wires Final Amendment v2 §3.
 
@@ -1915,10 +1971,10 @@ class APOrderStateMachine:
         """
         kind = str((current or {}).get("kind") or "").upper()
         if kind != "ENTRY":
-            return
+            return False
         opp_status = self._ENTRY_OSM_TO_OPPORTUNITY.get(new_status)
         if not opp_status:
-            return
+            return False
 
         signal_id  = str((current or {}).get("signal_id") or "")
         canonical  = str((current or {}).get("canonical_signal_id") or signal_id)
@@ -1933,7 +1989,7 @@ class APOrderStateMachine:
                 "signal_id=%r canonical=%r client=%r",
                 self.client_id, signal_id, canonical, client_id,
             )
-            return
+            return False
 
         try:
             from ap.opportunity_ledger import (
@@ -1941,7 +1997,7 @@ class APOrderStateMachine:
                 STAGE_BROKER_ACK, STAGE_FILL_MONITOR,
             )
         except Exception:
-            return
+            return False
 
         miss_stage = self._ENTRY_TERMINAL_MISS_STAGE.get(opp_status)
         miss_reason = None
@@ -1952,7 +2008,7 @@ class APOrderStateMachine:
             # Amendment v3: FILLED carries full broker-truth proof so the
             # repair is auditable. The transition() caller supplies fill
             # price / qty / ts; we tag the source as the OSM transition.
-            mark_filled(
+            return bool(mark_filled(
                 signal_id or canonical, client_id,
                 canonical_signal_id=canonical,
                 order_local_id=local_id or None,
@@ -1962,10 +2018,9 @@ class APOrderStateMachine:
                 filled_qty=(int(filled_qty) if filled_qty is not None else None),
                 fill_ts=(str(filled_ts) if filled_ts else None),
                 source="osm_transition",
-            )
-            return
+            ))
 
-        update_opportunity(
+        return bool(update_opportunity(
             signal_id or canonical, client_id, opp_status,
             canonical_signal_id=canonical,
             order_local_id=local_id or None,
@@ -1973,7 +2028,249 @@ class APOrderStateMachine:
             position_id=None,
             miss_stage=miss_stage,
             miss_reason=miss_reason,
-        )
+        ))
+
+    def replay_deferred_transition_observability(
+        self,
+        *,
+        local_order_ids: Optional[list[str]] = None,
+        limit: int = 100,
+    ) -> int:
+        """Replay committed deferred transitions with a durable marker.
+
+        Recovery incumbent cancellation intentionally commits before calling
+        the event and opportunity sinks.  The marker is written in that same
+        transaction, so a process death cannot turn a committed cancellation
+        into an unobservable one.  Sink delivery is outside the transaction;
+        a short lease prevents concurrent replay, and the deterministic event
+        key makes a crash between sink delivery and marker acknowledgement
+        harmless.
+        """
+        _marker_key = "recovery_transition_observability_v1"
+        _ids = [
+            str(local_order_id or "").strip()
+            for local_order_id in (local_order_ids or [])
+            if str(local_order_id or "").strip()
+        ]
+        try:
+            _limit = max(1, min(int(limit), 500))
+        except (TypeError, ValueError):
+            _limit = 100
+
+        def _decode(raw):
+            if isinstance(raw, dict):
+                return dict(raw)
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    parsed = json.loads(raw)
+                except Exception:
+                    return None
+                return dict(parsed) if isinstance(parsed, dict) else None
+            return {}
+
+        def _parse_ts(raw):
+            if not isinstance(raw, str) or not raw.strip():
+                return None
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                return None
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                return None
+            return parsed.astimezone(timezone.utc)
+
+        def _claim():
+            with conn() as c:
+                _params: list[object] = [self.client_id]
+                _id_clause = ""
+                if _ids:
+                    _id_clause = (
+                        " AND local_order_id IN ("
+                        + ",".join(["%s"] * len(_ids))
+                        + ")"
+                    )
+                    _params.extend(_ids)
+                _params.append(_limit)
+                rows = c.execute(
+                    "SELECT * FROM orders "
+                    "WHERE client_id=%s AND kind='ENTRY' "
+                    "AND meta ? %s "
+                    "AND meta->%s->>'state' IN ('PENDING','REPLAYING')"
+                    + _id_clause
+                    + " ORDER BY updated_ts ASC LIMIT %s "
+                    "FOR UPDATE SKIP LOCKED",
+                    tuple([_params[0], _marker_key, _marker_key] + _params[1:]),
+                ).fetchall()
+                _claimed = []
+                _now = datetime.now(timezone.utc)
+                for raw_row in rows:
+                    row = dict(raw_row or {})
+                    meta = _decode(row.get("meta"))
+                    marker = meta.get(_marker_key) if isinstance(meta, dict) else None
+                    if not isinstance(marker, dict):
+                        continue
+                    state = str(marker.get("state") or "").strip().upper()
+                    if state == "REPLAYING":
+                        started = _parse_ts(marker.get("replay_started_at"))
+                        if started is not None and (
+                            _now - started
+                        ) < timedelta(minutes=5):
+                            continue
+                    token = uuid.uuid4().hex
+                    claimed_marker = dict(marker)
+                    try:
+                        replay_attempts = int(
+                            claimed_marker.get("replay_attempts") or 0
+                        )
+                    except (TypeError, ValueError):
+                        replay_attempts = 0
+                    claimed_marker.update({
+                        "state": "REPLAYING",
+                        "replay_token": token,
+                        "replay_started_at": _now.isoformat(),
+                        "replay_attempts": replay_attempts + 1,
+                    })
+                    patch = json.dumps(
+                        {_marker_key: claimed_marker}, default=str
+                    )
+                    _set_parts = [
+                        "meta=COALESCE(meta,'{}'::jsonb) || %s::jsonb"
+                    ]
+                    _update_params: list[object] = [patch]
+                    if "metadata" in row:
+                        _set_parts.append(
+                            "metadata=COALESCE(metadata,'{}'::jsonb) || %s::jsonb"
+                        )
+                        _update_params.append(patch)
+                    _set_parts.append("updated_ts=NOW()")
+                    result = c.execute(
+                        "UPDATE orders SET " + ", ".join(_set_parts)
+                        + " WHERE local_order_id=%s AND client_id=%s "
+                        + "AND meta->%s->>'state'=%s",
+                        tuple(
+                            _update_params
+                            + [
+                                row.get("local_order_id"),
+                                self.client_id,
+                                _marker_key,
+                                state,
+                            ]
+                        ),
+                    )
+                    rowcount = getattr(
+                        result, "rowcount", getattr(c, "rowcount", 0)
+                    )
+                    if rowcount and rowcount > 0:
+                        _claimed.append((row, claimed_marker, token))
+                return _claimed
+
+        try:
+            _claimed_rows = run_with_retry(_claim) or []
+        except Exception as exc:
+            log.debug(
+                "[%s] deferred transition observability claim failed: %s",
+                self.client_id,
+                exc,
+            )
+            return 0
+
+        def _save(row, marker, token) -> bool:
+            patch = json.dumps({_marker_key: marker}, default=str)
+            try:
+                with conn() as c:
+                    _set_parts = [
+                        "meta=COALESCE(meta,'{}'::jsonb) || %s::jsonb"
+                    ]
+                    _params: list[object] = [patch]
+                    if "metadata" in row:
+                        _set_parts.append(
+                            "metadata=COALESCE(metadata,'{}'::jsonb) || %s::jsonb"
+                        )
+                        _params.append(patch)
+                    _set_parts.append("updated_ts=NOW()")
+                    result = c.execute(
+                        "UPDATE orders SET " + ", ".join(_set_parts)
+                        + " WHERE local_order_id=%s AND client_id=%s "
+                        + "AND meta->%s->>'replay_token'=%s",
+                        tuple(
+                            _params
+                            + [
+                                row.get("local_order_id"),
+                                self.client_id,
+                                _marker_key,
+                                token,
+                            ]
+                        ),
+                    )
+                    rowcount = getattr(
+                        result, "rowcount", getattr(c, "rowcount", 0)
+                    )
+                    return bool(rowcount and rowcount > 0)
+            except Exception as exc:
+                log.debug(
+                    "[%s] deferred transition observability marker save failed "
+                    "order=%s: %s",
+                    self.client_id,
+                    row.get("local_order_id"),
+                    exc,
+                )
+                return False
+
+        _completed = 0
+        for row, marker, token in _claimed_rows:
+            key = str(marker.get("key") or "").strip()
+            old_status = str(marker.get("old_status") or "").strip()
+            new_status = str(marker.get("new_status") or "").strip()
+            event_ok = bool(marker.get("event_delivered"))
+            ledger_ok = bool(marker.get("ledger_delivered"))
+            errors = []
+            marker_identity_ok = bool(key and old_status and new_status)
+            if not marker_identity_ok:
+                errors.append("marker_identity_invalid")
+            if marker_identity_ok and not event_ok:
+                try:
+                    event_ok = bool(self._emit_transition_event(
+                        local_order_id=str(row.get("local_order_id") or ""),
+                        old_status=old_status,
+                        new_status=new_status,
+                        order=row,
+                        decision=str(marker.get("decision") or "TERMINAL"),
+                        reason_code=marker.get("reason_code"),
+                        explanation=str(marker.get("explanation") or ""),
+                        last_error=marker.get("last_error"),
+                        idempotency_key=key,
+                        strict=True,
+                    ))
+                except Exception as exc:
+                    errors.append(f"event:{type(exc).__name__}")
+            if not event_ok and "event_delivery_failed" not in errors:
+                errors.append("event_delivery_failed")
+            if marker_identity_ok and not ledger_ok:
+                try:
+                    ledger_ok = bool(self._notify_opportunity_ledger(
+                        current=row,
+                        new_status=new_status,
+                        last_error=marker.get("last_error"),
+                    ))
+                except Exception as exc:
+                    errors.append(f"ledger:{type(exc).__name__}")
+            if not ledger_ok and "ledger_delivery_failed" not in errors:
+                errors.append("ledger_delivery_failed")
+
+            marker["event_delivered"] = event_ok
+            marker["ledger_delivered"] = ledger_ok
+            marker["state"] = "DONE" if event_ok and ledger_ok else "PENDING"
+            marker.pop("replay_token", None)
+            marker.pop("replay_started_at", None)
+            if marker["state"] == "DONE":
+                marker["completed_at"] = now_utc_iso()
+                marker.pop("last_replay_error", None)
+            else:
+                marker["last_replay_error"] = ";".join(errors) or "delivery_failed"
+            if _save(row, marker, token):
+                if marker["state"] == "DONE":
+                    _completed += 1
+        return _completed
 
     def _handle_exit_engine_hooks(
         self,
@@ -2317,13 +2614,37 @@ class APOrderStateMachine:
 
         def _fn():
             with conn() as c:
+                # #580 recovery rows may expose the same lifecycle authority
+                # through both ``meta`` and the legacy ``metadata`` alias.
+                # Keep those aliases converged when the normal callback path
+                # advances the row after deferred materialization.  The
+                # production orders table on older installs has no
+                # ``metadata`` column, so discover the optional alias inside
+                # this transaction instead of making the ordinary merge
+                # depend on a migration that is not present everywhere.
+                _metadata_column = c.execute(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_schema = ANY(current_schemas(false)) "
+                    "  AND table_name = 'orders' "
+                    "  AND column_name = 'metadata' "
+                    "LIMIT 1"
+                ).fetchone()
+                _metadata_set = (
+                    "    metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb, "
+                    if _metadata_column
+                    else ""
+                )
                 _sql = (
                     "UPDATE orders "
                     "SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
-                    "    updated_ts = NOW() "
+                    + _metadata_set
+                    + "    updated_ts = NOW() "
                     "WHERE local_order_id = %s AND client_id = %s"
                 )
-                _params = [_patch_json, local_order_id, self.client_id]
+                _params = [_patch_json]
+                if _metadata_column:
+                    _params.append(_patch_json)
+                _params.extend([local_order_id, self.client_id])
                 if expected_status is not None:
                     _sql += " AND UPPER(COALESCE(status, '')) = %s"
                     _params.append(str(expected_status).strip().upper())
@@ -2696,9 +3017,21 @@ class APOrderStateMachine:
                         "recovery_trigger_dispatch_finished_at": None,
                     }
                 )
+                _set_parts = ["meta=COALESCE(meta,'{}'::jsonb) || %s::jsonb"]
+                _update_params: list[object] = [
+                    patch,
+                ]
+                # Keep the legacy metadata alias in the same transaction as
+                # the durable dispatch claim.  Recovery proof reads every
+                # populated authority, so leaving this alias stale would
+                # make a valid claim look partially installed after restart.
+                if "metadata" in row:
+                    _set_parts.append("metadata=COALESCE(metadata,'{}'::jsonb) || %s::jsonb")
+                    _update_params.append(patch)
+                _set_parts.append("updated_ts=NOW()")
                 _update_sql = (
-                    "UPDATE orders SET meta=COALESCE(meta,'{}'::jsonb) || %s::jsonb, "
-                    "updated_ts=NOW() WHERE local_order_id=%s AND client_id=%s "
+                    "UPDATE orders SET " + ", ".join(_set_parts)
+                    + " WHERE local_order_id=%s AND client_id=%s "
                     "AND kind='ENTRY' AND status='PENDING_TRIGGER' "
                     "AND LOWER(TRIM(COALESCE(execution_mode,'')))=%s "
                     "AND ("
@@ -2710,13 +3043,14 @@ class APOrderStateMachine:
                     ")"
                     ")"
                 )
-                _update_params: list[object] = [
-                    patch,
-                    local_order_id,
-                    client_id,
-                    execution_mode,
-                    str(candidate_trigger_generation),
-                ]
+                _update_params.extend(
+                    [
+                        local_order_id,
+                        client_id,
+                        execution_mode,
+                        str(candidate_trigger_generation),
+                    ]
+                )
                 # The Python proof above covers every top-level and metadata
                 # generation authority while this exact row is locked.  Do
                 # not add a meta-only SQL predicate here: a valid row may
@@ -2890,21 +3224,29 @@ class APOrderStateMachine:
                         "recovery_trigger_dispatch_finished_at": now_utc_iso(),
                     }
                 )
+                _set_parts = ["meta=COALESCE(meta,'{}'::jsonb) || %s::jsonb"]
+                _update_params: list[object] = [patch]
+                if "metadata" in row:
+                    _set_parts.append("metadata=COALESCE(metadata,'{}'::jsonb) || %s::jsonb")
+                    _update_params.append(patch)
+                _set_parts.append("updated_ts=NOW()")
                 result = connection.execute(
-                    "UPDATE orders SET meta=COALESCE(meta,'{}'::jsonb) || %s::jsonb, "
-                    "updated_ts=NOW() WHERE local_order_id=%s AND client_id=%s "
+                    "UPDATE orders SET " + ", ".join(_set_parts)
+                    + " WHERE local_order_id=%s AND client_id=%s "
                     "AND kind='ENTRY' AND meta->>'recovery_trigger_dispatch_attempt_id'=%s "
                     "AND meta->>'recovery_trigger_dispatch_state'=%s "
                     "AND meta->>'recovery_trigger_dispatch_generation'=%s "
                     "AND meta->>'recovery_trigger_dispatch_trigger_generation'=%s",
-                    (
-                        patch,
-                        local_order_id,
-                        client_id,
-                        dispatch_attempt_id,
-                        expected_state,
-                        str(materialization),
-                        str(trigger),
+                    tuple(
+                        _update_params
+                        + [
+                            local_order_id,
+                            client_id,
+                            dispatch_attempt_id,
+                            expected_state,
+                            str(materialization),
+                            str(trigger),
+                        ]
                     ),
                 )
                 rowcount = getattr(result, "rowcount", getattr(connection, "rowcount", None))
@@ -3095,6 +3437,9 @@ class APOrderStateMachine:
                         assignment_params.append(generation)
                 assignments.append("meta=COALESCE(meta,'{}'::jsonb) || %s::jsonb")
                 assignment_params.append(patch)
+                if "metadata" in row:
+                    assignments.append("metadata=COALESCE(metadata,'{}'::jsonb) || %s::jsonb")
+                    assignment_params.append(patch)
                 assignments.append("updated_ts=NOW()")
                 result = connection.execute(
                     "UPDATE orders SET " + ", ".join(assignments)
@@ -3639,6 +3984,11 @@ class APOrderStateMachine:
         # always shows the correct attempt count for the in-flight claim, even
         # if the process crashes between claim and schedule_deferred_materialization_retry.
         retry_attempt: int | None = None,
+        # PR #580: a recovered TRIGGER_READY callback already owns a durable
+        # dispatch attempt.  Its materialization claim must advance the same
+        # generation family and dispatch marker in this transaction; otherwise
+        # the callback can submit at N+1 and finish an N/N dispatch fence.
+        recovery_dispatch_attempt_id: str | None = None,
     ) -> bool:
         """Atomically fence one deferred-breach materialization worker.
 
@@ -3690,6 +4040,13 @@ class APOrderStateMachine:
         if not _owner or not _signal_id or _mode not in ("live", "paper"):
             return False
 
+        _recovery_attempt = str(recovery_dispatch_attempt_id or "").strip()
+        if recovery_dispatch_attempt_id is not None and (
+            not _recovery_attempt
+            or _recovery_attempt != str(recovery_dispatch_attempt_id)
+        ):
+            return False
+
         _now = now_utc_iso()
         _patch = {
             "lifecycle_state": "MATERIALIZING",
@@ -3721,6 +4078,17 @@ class APOrderStateMachine:
             "execution_mode": _mode,
             "broker_ready": False,
         }
+        if _recovery_attempt:
+            # The recovered trigger claim and the deferred materialization
+            # claim are one logical dispatch attempt.  Advance both generation
+            # authorities and the durable dispatch marker together.  The
+            # marker's claimed_at/attempt identity remain unchanged.
+            _patch.update({
+                "trigger_generation": _new_generation,
+                "recovery_trigger_dispatch_generation": _new_generation,
+                "recovery_trigger_dispatch_trigger_generation": _new_generation,
+                "recovery_trigger_dispatch_generation_advanced_at": _now,
+            })
         # P0 AMENDMENT (fix/p0-attempt-mirror-atomic-advance-20260827,
         # post-audit blocker §3-§5): ``retry_attempt``, ``breach_attempt_count``,
         # and ``materialization_attempts`` are one durable selector-attempt
@@ -3801,6 +4169,178 @@ class APOrderStateMachine:
 
         def _claim():
             with conn() as c:
+                if _recovery_attempt:
+                    # The normal materialization CAS historically writes only
+                    # ``meta``.  Recovered #580 rows can legitimately expose
+                    # the same authority through top-level columns and the
+                    # secondary ``metadata`` JSONB alias, so lock the exact
+                    # row and update every populated authority atomically.
+                    cursor = c.execute(
+                        "SELECT * FROM orders "
+                        "WHERE local_order_id=%s AND client_id=%s "
+                        "AND kind='ENTRY' "
+                        "AND UPPER(COALESCE(status,''))='PENDING_TRIGGER' "
+                        "FOR UPDATE",
+                        (local_order_id, self.client_id),
+                    )
+                    fetchone = getattr(cursor, "fetchone", None)
+                    if not callable(fetchone):
+                        return 0
+                    row = fetchone()
+                    if not isinstance(row, dict):
+                        return 0
+
+                    def _json_source(raw):
+                        if isinstance(raw, dict):
+                            return dict(raw)
+                        if isinstance(raw, str) and raw.strip():
+                            try:
+                                parsed = json.loads(raw)
+                            except Exception:
+                                return None
+                            return dict(parsed) if isinstance(parsed, dict) else None
+                        return None
+
+                    _sources = []
+                    for _key in ("meta", "metadata"):
+                        if _key in row:
+                            _parsed = _json_source(row.get(_key))
+                            if _parsed is None:
+                                return 0
+                            _sources.append((_key, _parsed))
+
+                    def _strict_positive(raw):
+                        if isinstance(raw, bool):
+                            return None
+                        if isinstance(raw, int):
+                            value = raw
+                        elif isinstance(raw, str) and re.fullmatch(r"[0-9]+", raw):
+                            value = int(raw)
+                        else:
+                            return None
+                        return value if value > 0 else None
+
+                    def _authority_values(aliases):
+                        _values = []
+                        for _raw in (
+                            row.get(aliases[0]),
+                            *[
+                                source.get(alias)
+                                for _name, source in _sources
+                                for alias in aliases
+                                if alias in source
+                            ],
+                        ):
+                            if _raw is not None:
+                                _values.append(_raw)
+                        return _values
+
+                    _materialization_values = _authority_values(
+                        ("materialization_generation", "generation")
+                    )
+                    _trigger_values = _authority_values(("trigger_generation",))
+                    _materialization_parsed = [
+                        _strict_positive(value) for value in _materialization_values
+                    ]
+                    _trigger_parsed = [
+                        _strict_positive(value) for value in _trigger_values
+                    ]
+                    _previous_generation = _new_generation - 1
+                    if (
+                        not _materialization_parsed
+                        or not _trigger_parsed
+                        or any(value is None for value in _materialization_parsed)
+                        or any(value is None for value in _trigger_parsed)
+                        or len(set(_materialization_parsed)) != 1
+                        or len(set(_trigger_parsed)) != 1
+                        or _materialization_parsed[0] != _previous_generation
+                        or _trigger_parsed[0] != _previous_generation
+                    ):
+                        return 0
+
+                    _row_meta = dict(
+                        next(
+                            (source for name, source in _sources if name == "meta"),
+                            {},
+                        )
+                    )
+                    if (
+                        str(row.get("signal_id") or "").strip() != _signal_id
+                        or str(row.get("execution_mode") or "").strip().lower()
+                        not in {"", _mode}
+                        or str(row.get("broker_order_id") or "").strip()
+                        or row.get("submitted_ts") is not None
+                        or str(_row_meta.get("broker_ready") or "").lower() == "true"
+                        or str(_row_meta.get("lifecycle_state") or "").upper()
+                        not in {"", "TRIGGER_READY", "RETRY_WAIT"}
+                    ):
+                        return 0
+                    if (
+                        _row_meta.get("recovery_trigger_dispatch_attempt_id")
+                        != _recovery_attempt
+                        or str(
+                            _row_meta.get("recovery_trigger_dispatch_state") or ""
+                        ).upper()
+                        != "CALLBACK_STARTED"
+                        or _strict_positive(
+                            _row_meta.get("recovery_trigger_dispatch_generation")
+                        )
+                        != _previous_generation
+                        or _strict_positive(
+                            _row_meta.get(
+                                "recovery_trigger_dispatch_trigger_generation"
+                            )
+                        )
+                        != _previous_generation
+                    ):
+                        return 0
+
+                    # Mirror the existing attempt-shape fence before changing
+                    # generation.  This is the same authority the normal CAS
+                    # below applies, evaluated while this row is locked.
+                    for _attempt_key in (
+                        "retry_attempt",
+                        "breach_attempt_count",
+                        "materialization_attempts",
+                    ):
+                        _raw_attempt = _row_meta.get(_attempt_key)
+                        if _prev_attempt is None or _prev_attempt == 0:
+                            if _raw_attempt not in (None, "", 0, "0"):
+                                return 0
+                        elif _strict_positive(_raw_attempt) != _prev_attempt:
+                            return 0
+
+                    _source_patches = {}
+                    for _name, _source in _sources:
+                        _source_patch = dict(_patch)
+                        if "generation" in _source:
+                            _source_patch["generation"] = _new_generation
+                        _source_patches[_name] = _source_patch
+
+                    _set_parts = ["meta=COALESCE(meta,'{}'::jsonb) || %s::jsonb"]
+                    _params = [json.dumps(_source_patches.get("meta", _patch), default=str)]
+                    if "metadata" in row:
+                        _set_parts.append(
+                            "metadata=COALESCE(metadata,'{}'::jsonb) || %s::jsonb"
+                        )
+                        _params.append(
+                            json.dumps(_source_patches.get("metadata", _patch), default=str)
+                        )
+                    if "materialization_generation" in row:
+                        _set_parts.append("materialization_generation=%s")
+                        _params.append(str(_new_generation))
+                    if "trigger_generation" in row:
+                        _set_parts.append("trigger_generation=%s")
+                        _params.append(str(_new_generation))
+                    _set_parts.append("updated_ts=NOW()")
+                    result = c.execute(
+                        "UPDATE orders SET " + ", ".join(_set_parts)
+                        + " WHERE local_order_id=%s AND client_id=%s "
+                        + "AND kind='ENTRY' AND UPPER(COALESCE(status,''))='PENDING_TRIGGER'",
+                        tuple(_params + [local_order_id, self.client_id]),
+                    )
+                    return int(getattr(result, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
                 _attempt_predicate = ""
                 _attempt_params: list = []
                 if _prev_attempt is None:
@@ -4535,6 +5075,7 @@ class APOrderStateMachine:
         qty: int,
         reserved_cost: float,
         selector_meta: dict,
+        recovery_dispatch_attempt_id: str | None = None,
     ) -> bool:
         """Atomically copy the complete materialized payload into durable state."""
         import json as _json_local
@@ -4543,6 +5084,12 @@ class APOrderStateMachine:
         _owner = str(owner or "").strip()
         _signal_id = str(signal_id or "").strip()
         _mode = str(execution_mode or "").strip().lower()
+        _recovery_attempt = str(recovery_dispatch_attempt_id or "").strip()
+        if recovery_dispatch_attempt_id is not None and (
+            not _recovery_attempt
+            or _recovery_attempt != str(recovery_dispatch_attempt_id)
+        ):
+            return False
         try:
             _generation = max(1, int(generation or 1))
             _limit = round(float(limit_price or 0), 2)
@@ -4580,6 +5127,7 @@ class APOrderStateMachine:
             "materialization_owner": _owner,
             "current_owner": _owner,
             "materialization_generation": _generation,
+            "trigger_generation": _generation,
             "materialization_completed_at": _now,
             "selector_completed_at": _now,
             "copyback_completed_at": _now,
@@ -4602,6 +5150,80 @@ class APOrderStateMachine:
 
         def _persist():
             with conn() as c:
+                if _recovery_attempt:
+                    # A recovered #580 callback may expose the generation
+                    # family through top-level columns and ``metadata`` as
+                    # well as ``meta``.  Keep every populated alias coherent
+                    # with the broker-ready transition in this transaction.
+                    cursor = c.execute(
+                        "SELECT * FROM orders "
+                        "WHERE local_order_id=%s AND client_id=%s "
+                        "AND kind='ENTRY' FOR UPDATE",
+                        (local_order_id, self.client_id),
+                    )
+                    fetchone = getattr(cursor, "fetchone", None)
+                    if not callable(fetchone):
+                        return 0
+                    row = fetchone()
+                    if not isinstance(row, dict):
+                        return 0
+                    row_meta = row.get("meta") or {}
+                    if isinstance(row_meta, str):
+                        try:
+                            row_meta = json.loads(row_meta)
+                        except Exception:
+                            return 0
+                    if not isinstance(row_meta, dict):
+                        return 0
+                    if (
+                        str(row.get("status") or "").upper() != "PENDING_TRIGGER"
+                        or str(row.get("broker_order_id") or "").strip()
+                        or row.get("submitted_ts") is not None
+                        or str(row.get("signal_id") or "") != _signal_id
+                        or str(row_meta.get("materialization_owner") or "").strip()
+                        != _owner
+                        or str(row_meta.get("materialization_generation") or "")
+                        != str(_generation)
+                        or str(row_meta.get("lifecycle_state") or "").upper()
+                        != "MATERIALIZING"
+                        or row_meta.get("recovery_trigger_dispatch_attempt_id")
+                        != _recovery_attempt
+                    ):
+                        return 0
+                    _set_parts = [
+                        "contract=%s",
+                        "limit_price=%s",
+                        "qty=%s",
+                        "reserved_cost=%s",
+                        "contract_selection_status='CONTRACT_SELECTED'",
+                        "meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb",
+                    ]
+                    _params = [
+                        _contract,
+                        _limit,
+                        _qty,
+                        _reserved,
+                        _meta_json,
+                    ]
+                    if "metadata" in row:
+                        _set_parts.append(
+                            "metadata=COALESCE(metadata, '{}'::jsonb) || %s::jsonb"
+                        )
+                        _params.append(_meta_json)
+                    if "materialization_generation" in row:
+                        _set_parts.append("materialization_generation=%s")
+                        _params.append(str(_generation))
+                    if "trigger_generation" in row:
+                        _set_parts.append("trigger_generation=%s")
+                        _params.append(str(_generation))
+                    _set_parts.append("updated_ts=NOW()")
+                    result = c.execute(
+                        "UPDATE orders SET " + ", ".join(_set_parts)
+                        + " WHERE local_order_id=%s AND client_id=%s "
+                        + "AND kind='ENTRY' AND UPPER(COALESCE(status,''))='PENDING_TRIGGER'",
+                        tuple(_params + [local_order_id, self.client_id]),
+                    )
+                    return int(getattr(result, "rowcount", getattr(c, "rowcount", 0)) or 0)
                 cur = c.execute(
                     """
                     UPDATE orders
