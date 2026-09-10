@@ -3078,42 +3078,92 @@ def process_pending_order(
                 return
 
             # Converge the just-applied durable delta into the position.
-            # position_manager reads the order row directly — that is
-            # why the OSM update happens first. A HOLD here is not fatal
-            # to terminalization; #579's reducer is idempotent and the
-            # ordinary terminal transition below still fires the
-            # cancellation-of-remainder side effect.
-            if pm is not None:
-                try:
-                    _exec_mode_for_converge = str(
-                        order.get("execution_mode")
-                        or runtime_execution_mode
-                        or (getattr(exit_engine, "execution_mode", "") if exit_engine else "")
-                        or ""
-                    ).strip().lower()
-                    _converge = pm.converge_position_from_durable_exit_order(
-                        exit_local_order_id=local_id,
-                        expected_execution_mode=_exec_mode_for_converge,
-                    )
-                    _converge_disp = str(getattr(_converge, "disposition", "") or "")
-                    emit_fill_event(
-                        order,
-                        decision="PARTIAL_FILL",
-                        reason_code="EXIT_TERMINAL_DELTA_CONVERGED",
-                        explanation=(
-                            f"Executed delta {_delta} converged before "
-                            f"{mapped} terminalization of remainder."
-                        ),
-                        result={**result, "status": "EXIT_PARTIAL_FILL", "filled_qty": new_filled},
-                        extra_context={**_payload_terminal_delta, "converge_disposition": _converge_disp},
-                    )
-                except Exception as exc:
-                    log.error(
-                        "[%s] Pre-terminal position convergence failed for %s: %s",
-                        client_id, local_id, exc,
-                    )
-            # Fall through to the ordinary terminal handling for the
-            # remainder cancellation, exactly once.
+            # position_manager reads the order row directly — that is why the
+            # OSM update happens first.
+            #
+            # PR #579: convergence failure is NOT non-fatal here.
+            # If the canonical position cannot consume the executed delta,
+            # terminalizing the remainder drops that delta permanently.
+            # HOLD until convergence is proven.
+            if pm is None:
+                reason = "EXIT_TERMINAL_PRE_CONVERGENCE_NO_POSITION_MANAGER"
+                log.critical("[%s] %s | %s", client_id, reason, _payload_terminal_delta)
+                audit(client_id, "CRITICAL", reason, _payload_terminal_delta)
+                emit_fill_event(
+                    order,
+                    decision="HOLD",
+                    reason_code=reason,
+                    explanation=(
+                        "No position manager available for pre-terminal convergence; "
+                        "cannot safely terminalize without losing the executed delta."
+                    ),
+                    result=result,
+                    extra_context=_payload_terminal_delta,
+                )
+                if osm:
+                    try:
+                        osm.increment_retry(local_id)
+                    except Exception:
+                        pass
+                return
+
+            try:
+                _exec_mode_for_converge = str(
+                    order.get("execution_mode")
+                    or runtime_execution_mode
+                    or (getattr(exit_engine, "execution_mode", "") if exit_engine else "")
+                    or ""
+                ).strip().lower()
+                _converge = pm.converge_position_from_durable_exit_order(
+                    exit_local_order_id=local_id,
+                    expected_execution_mode=_exec_mode_for_converge,
+                )
+                _converge_disp = str(getattr(_converge, "disposition", "") or "")
+            except Exception as exc:
+                _converge_disp = "DB_ERROR"
+                log.error(
+                    "[%s] Pre-terminal position convergence raised for %s: %s",
+                    client_id, local_id, exc,
+                )
+
+            if _converge_disp not in {"APPLIED_PARTIAL", "APPLIED_FULL", "ALREADY_APPLIED"}:
+                reason = "EXIT_TERMINAL_PRE_CONVERGENCE_HOLD"
+                _ctx = {**_payload_terminal_delta, "converge_disposition": _converge_disp}
+                log.critical("[%s] %s | %s", client_id, reason, _ctx)
+                audit(client_id, "CRITICAL", reason, _ctx)
+                emit_fill_event(
+                    order,
+                    decision="HOLD",
+                    reason_code=reason,
+                    explanation=(
+                        f"Canonical position convergence returned {_converge_disp!r} "
+                        f"for pre-terminal delta {_delta}; "
+                        "cannot terminalize the remainder until the executed "
+                        "delta is durably applied. Awaiting next poll or "
+                        "reconciler pass."
+                    ),
+                    result=result,
+                    extra_context=_ctx,
+                )
+                if osm:
+                    try:
+                        osm.increment_retry(local_id)
+                    except Exception:
+                        pass
+                return
+
+            emit_fill_event(
+                order,
+                decision="PARTIAL_FILL",
+                reason_code="EXIT_TERMINAL_DELTA_CONVERGED",
+                explanation=(
+                    f"Executed delta {_delta} converged before "
+                    f"{mapped} terminalization of remainder."
+                ),
+                result={**result, "status": "EXIT_PARTIAL_FILL", "filled_qty": new_filled},
+                extra_context={**_payload_terminal_delta, "converge_disposition": _converge_disp},
+            )
+            # Convergence proven — fall through to terminalize the remainder.
 
         emit_fill_event(
             order,
