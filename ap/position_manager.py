@@ -32,6 +32,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from ap.db import conn, run_with_retry
+from ap.manual_close_reconciliation import parse_broker_fill_timestamp
 from ap.utils import now_utc_iso
 
 log = logging.getLogger("ap.position_manager")
@@ -95,6 +96,7 @@ def _resolve_entry_cost_basis(
     client_id: str,
     execution_mode: str,
     occ_contract: str,
+    exit_filled_ts,
 ) -> Optional[Decimal]:
     """Read-only helper: resolve entry fill price from exactly one durable ENTRY order.
 
@@ -104,10 +106,12 @@ def _resolve_entry_cost_basis(
     Requirements for a valid candidate:
       * kind='ENTRY', status='FILLED'
       * client_id, position_id, execution_mode, and OCC contract must match exactly
+      * the selected ENTRY contract normalizes to the EXIT/position OCC
       * positive integer filled_qty > 0
       * positive finite fill_price > 0
-      * broker_order_id non-blank and not a placeholder
-      * exact timezone-aware filled_ts present (never fabricated)
+      * broker_order_id passes the shared placeholder validator
+      * ENTRY filled_ts passes the strict timezone-aware parser
+      * ENTRY filled_ts is no later than the exact EXIT filled_ts
 
     Returns:
       Decimal fill price on unique, fully-proven candidate.
@@ -116,7 +120,7 @@ def _resolve_entry_cost_basis(
     try:
         c.execute(
             """
-            SELECT fill_price, filled_qty, broker_order_id, filled_ts, execution_mode
+            SELECT contract, fill_price, filled_qty, broker_order_id, filled_ts, execution_mode
             FROM orders
             WHERE position_id = %s
               AND client_id   = %s
@@ -153,6 +157,22 @@ def _resolve_entry_cost_basis(
 
     row = dict(rows[0])
 
+    # Validate both OCC authorities after normalization.  The query must
+    # return the contract so a wrong or missing ENTRY contract cannot hide
+    # behind a cost-basis match on position_id/client_id alone.
+    expected_contract = _normalize_proof_contract(occ_contract)
+    entry_contract = _normalize_proof_contract(row.get("contract"))
+    if (
+        not _OCC_CONTRACT_RE.fullmatch(expected_contract)
+        or not _OCC_CONTRACT_RE.fullmatch(entry_contract)
+        or entry_contract != expected_contract
+    ):
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: ENTRY OCC mismatch pos=%s expected=%s got=%s",
+            client_id, position_id, expected_contract, entry_contract,
+        )
+        return None
+
     # Validate execution mode
     row_mode = str(row.get("execution_mode") or "").strip().lower()
     if row_mode not in _VALID_EXECUTION_MODES or row_mode != execution_mode:
@@ -162,33 +182,38 @@ def _resolve_entry_cost_basis(
         )
         return None
 
-    # Validate broker order identity (non-blank, not a placeholder)
-    broker_id = str(row.get("broker_order_id") or "").strip().upper()
-    if not broker_id or broker_id in ("", "N/A", "NONE", "NULL"):
+    # Validate broker identity through the shared fail-closed validator.
+    broker_id = row.get("broker_order_id")
+    if _is_placeholder_broker_id(broker_id):
         log.warning(
             "[%s] _resolve_entry_cost_basis: blank/placeholder broker_order_id pos=%s",
             client_id, position_id,
         )
         return None
 
-    # Validate filled_ts — must be an exact timezone-aware timestamp
-    filled_ts_raw = row.get("filled_ts")
-    if filled_ts_raw is None:
+    # Both timestamps must be explicit broker execution timestamps.  The
+    # shared parser rejects missing, malformed, naive, and otherwise
+    # non-authoritative values; no local fallback or fabrication is allowed.
+    entry_dt = parse_broker_fill_timestamp(row.get("filled_ts"))
+    exit_dt = parse_broker_fill_timestamp(exit_filled_ts)
+    if entry_dt is None:
         log.warning(
-            "[%s] _resolve_entry_cost_basis: missing filled_ts on ENTRY order pos=%s",
+            "[%s] _resolve_entry_cost_basis: invalid ENTRY filled_ts pos=%s",
             client_id, position_id,
         )
         return None
-    if isinstance(filled_ts_raw, datetime):
-        if filled_ts_raw.tzinfo is None or filled_ts_raw.utcoffset() is None:
-            log.warning(
-                "[%s] _resolve_entry_cost_basis: timezone-naive filled_ts pos=%s",
-                client_id, position_id,
-            )
-            return None
-    # (non-datetime raw values such as ISO strings are accepted if the DB driver
-    # returned them without conversion; the caller's CAS and chronology checks
-    # downstream will validate ordering.)
+    if exit_dt is None:
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: invalid EXIT filled_ts pos=%s",
+            client_id, position_id,
+        )
+        return None
+    if entry_dt > exit_dt:
+        log.warning(
+            "[%s] _resolve_entry_cost_basis: ENTRY filled_ts after EXIT pos=%s",
+            client_id, position_id,
+        )
+        return None
 
     # Validate fill economics
     try:
@@ -206,11 +231,8 @@ def _resolve_entry_cost_basis(
         )
         return None
 
-    try:
-        qty = int(row.get("filled_qty") or 0)
-    except (TypeError, ValueError):
-        return None
-    if qty <= 0:
+    qty = _strict_integral(row.get("filled_qty"), positive=True)
+    if qty is None:
         log.warning(
             "[%s] _resolve_entry_cost_basis: zero/negative filled_qty=%r pos=%s",
             client_id, row.get("filled_qty"), position_id,
@@ -295,6 +317,8 @@ def _projection_meta(raw_meta) -> tuple[Optional[dict], str]:
 
 
 def _is_placeholder_broker_id(value) -> bool:
+    if isinstance(value, bool):
+        return True
     text = str(value or "").strip()
     return not text or text.lower() in _PLACEHOLDER_BROKER_IDS
 
@@ -940,6 +964,7 @@ class APPositionManager:
         position_id: str,
         execution_mode: str,
         occ_contract: str,
+        exit_filled_ts=None,
     ) -> Optional[Decimal]:
         """Resolve entry fill price from exactly one durable ENTRY order.
 
@@ -957,6 +982,7 @@ class APPositionManager:
             client_id=self.client_id,
             execution_mode=execution_mode,
             occ_contract=occ_contract,
+            exit_filled_ts=exit_filled_ts,
         )
 
     def converge_position_from_durable_exit_order(
@@ -1246,12 +1272,12 @@ class APPositionManager:
                     # Resolve cost basis from the ONE exact durable ENTRY order.
                     # Any ambiguity, malformation, or identity mismatch HOLDs —
                     # never fabricate entry economics.
-                    avg_fill = _resolve_entry_cost_basis(
+                    avg_fill = self._resolve_entry_cost_basis(
                         c,
                         position_id=position_id,
-                        client_id=self.client_id,
                         execution_mode=order_mode,
-                        occ_contract=order_contract,  # noqa: F841 (validated above)
+                        occ_contract=order_contract,
+                        exit_filled_ts=fill_dt,
                     )
                     if avg_fill is None or position_qty is None:
                         return _convergence_hold(
