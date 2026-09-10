@@ -200,6 +200,31 @@ def postgres_harness(monkeypatch):
                     broker_reconciled BOOLEAN DEFAULT FALSE
                 )
             """)
+            cur.execute("""
+                CREATE TEMP TABLE decision_events (
+                    id BIGSERIAL PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    candidate_id TEXT NOT NULL,
+                    trade_id TEXT,
+                    position_id TEXT,
+                    client_id TEXT NOT NULL,
+                    ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    stage TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    reason_code TEXT,
+                    explanation TEXT,
+                    symbol TEXT,
+                    contract TEXT,
+                    setup_type TEXT,
+                    timeframe TEXT,
+                    strategy_version TEXT,
+                    config_hash TEXT,
+                    git_commit TEXT,
+                    inputs_json JSONB,
+                    thresholds_json JSONB,
+                    context_json JSONB
+                )
+            """)
         connection.commit()
 
         monkeypatch.setattr(db_mod,  "conn",           harness.conn)
@@ -443,7 +468,7 @@ class TestSept9FailFirst:
         a HOLD disposition causes a return without OSM terminal transition.
         """
         h = postgres_harness
-        _seed_sept9_shape(h, position_avg_fill=ENTRY_PRICE, exit_status="EXIT_REQUESTED")
+        _seed_sept9_shape(h, position_avg_fill=ENTRY_PRICE, exit_status="EXIT_PARTIAL_FILL")
 
         import ap.fill_monitor as fm_mod
         import ap.order_state_machine as osm_mod
@@ -542,7 +567,7 @@ class TestSept9AfterFix:
         _seed_sept9_shape(
             h,
             position_avg_fill=None,      # broker-repair: entry price not on position row
-            exit_status="EXIT_REQUESTED",
+            exit_status="EXIT_PARTIAL_FILL",
         )
 
         ee = _no_exit_engine(monkeypatch)
