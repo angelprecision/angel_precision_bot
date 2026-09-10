@@ -164,6 +164,90 @@ def test_stale_ack_terminal_only_counts_corrected_when_osm_accepts(monkeypatch):
     assert "stale_ack_exit_osm_terminal_held" in s["errors"]
 
 
+@pytest.mark.parametrize("broker_status", ["canceled", "cancelled", "rejected", "expired"])
+def test_terminal_exit_fill_without_timestamp_holds_before_terminalization(
+    broker_status,
+):
+    o = FakeOSM(); r = rec(o); s = summary()
+    evidence = fill(status=broker_status); evidence.pop("last_fill_date")
+    row = order(position_id=None)
+
+    r._advance_order_to_terminal(row, broker_status, s, broker_raw=evidence)
+
+    assert o.calls == []
+    assert s["orders_corrected"] == 0
+    assert s["orders_alerted"] == 1
+    assert "EXIT_FILL_TIMESTAMP_MISSING_OR_INVALID" in r.alerts[-1]
+
+
+@pytest.mark.parametrize("broker_status", ["canceled", "cancelled", "rejected", "expired"])
+def test_terminal_exit_fill_converges_before_terminalization(broker_status):
+    o = FakeOSM(); r = rec(o); s = summary()
+    row = order(position_id=None, qty=5)
+    evidence = fill(status=broker_status, filled_qty=2)
+
+    r._advance_order_to_terminal(row, broker_status, s, broker_raw=evidence)
+
+    assert [status for _, status, _ in o.calls] == [
+        "EXIT_PARTIAL_FILL",
+        {
+            "canceled": "CANCELED",
+            "cancelled": "CANCELED",
+            "rejected": "REJECTED",
+            "expired": "EXPIRED",
+        }[broker_status],
+    ]
+    partial_kwargs = o.calls[0][2]
+    assert partial_kwargs["filled_qty"] == 2
+    assert partial_kwargs["fill_price"] == 1.19
+    assert partial_kwargs["broker_order_id"] == "145345180"
+    assert partial_kwargs["filled_ts"]
+    assert s["orders_corrected"] == 1
+
+
+def test_terminal_exit_fill_holds_when_preconvergence_osm_refuses():
+    o = FakeOSM(result=False); r = rec(o); s = summary()
+    evidence = fill(status="canceled", filled_qty=2)
+
+    r._advance_order_to_terminal(
+        order(position_id=None, qty=5), "canceled", s, broker_raw=evidence
+    )
+
+    assert [status for _, status, _ in o.calls] == ["EXIT_PARTIAL_FILL"]
+    assert s["orders_corrected"] == 0
+    assert s["orders_alerted"] == 1
+    assert "exit_terminal_fill_osm_held" in s["errors"]
+
+
+def test_stale_ack_terminal_exit_fill_without_timestamp_holds_before_osm(monkeypatch):
+    stale = order(submitted_ts=FILL_TS, updated_ts=FILL_TS, age_sec=30.0)
+    _install_stale_rows(monkeypatch, [stale])
+    raw = fill(status="canceled"); raw.pop("last_fill_date")
+    o = FakeOSM(); r = rec(o); s = summary()
+    r.broker = _BrokerOrder(raw)
+
+    r._handle_stale_acknowledged_exits(s)
+
+    assert o.calls == []
+    assert s["orders_corrected"] == 0
+    assert s["orders_alerted"] == 1
+    assert "EXIT_FILL_TIMESTAMP_MISSING_OR_INVALID" in r.alerts[-1]
+
+
+def test_stale_ack_terminal_exit_fill_converges_before_terminalization(monkeypatch):
+    stale = order(submitted_ts=FILL_TS, updated_ts=FILL_TS, age_sec=30.0)
+    _install_stale_rows(monkeypatch, [stale])
+    o = FakeOSM(); r = rec(o); s = summary()
+    r.broker = _BrokerOrder(fill(status="canceled", filled_qty=1))
+
+    r._handle_stale_acknowledged_exits(s)
+
+    assert [status for _, status, _ in o.calls] == ["EXIT_PARTIAL_FILL", "CANCELED"]
+    assert o.calls[0][2]["filled_ts"]
+    assert s["orders_corrected"] == 1
+    assert s["orders_alerted"] == 0
+
+
 def test_osm_exit_specific_state_enforces_timestamp_even_if_kind_missing(monkeypatch):
     o = APOrderStateMachine.__new__(APOrderStateMachine)
     o.client_id = "jason-test@example.com"

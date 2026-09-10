@@ -883,6 +883,187 @@ class APBrokerReconciler:
         summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
         summary.setdefault("errors", []).append("exit_fill_timestamp_missing_or_invalid")
 
+    def _converge_terminal_exit_fill_before_terminalization(
+        self,
+        order: dict,
+        broker_raw: dict | None,
+        broker_status: str,
+        summary: dict,
+        *,
+        source: str,
+        broker_order_id: str | None = None,
+    ) -> bool:
+        """Prove any EXIT execution before applying a broker terminal state.
+
+        A broker ``canceled``/``rejected``/``expired`` response can still carry
+        executed quantity. Terminalizing that row directly would discard the
+        executed EXIT delta, so the delta must first pass through OSM's partial
+        fill/convergence hook. Return False when terminalization must remain
+        held.
+        """
+        db_status = str(order.get("status") or "").strip().upper()
+        family = self._order_family_from_kind_and_status(order, db_status)
+        explicit_exit_status = db_status.startswith("EXIT_") or db_status == "PENDING_CANCEL"
+        if family != "EXIT" and not explicit_exit_status:
+            return True
+
+        # OSM's durable convergence hook requires an exact EXIT kind. A
+        # status-only EXIT classification detects the risk, but does not prove
+        # that a position mutation is authorized.
+        local_id = order.get("local_order_id") or order.get("id")
+        contract = order.get("contract") or order.get("symbol") or "?"
+        if str(order.get("kind") or "").strip().upper() != "EXIT":
+            self._alert(
+                f"EXIT_TERMINAL_FAMILY_UNPROVEN | {contract} | {local_id or '?'} | "
+                f"durable_status={db_status or '?'} broker_status={broker_status or '?'} "
+                f"source={source} action=HOLD position_mutated=false "
+                "order_terminalized=false"
+            )
+            summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
+            summary.setdefault("errors", []).append("exit_terminal_family_unproven")
+            return False
+
+        durable_filled_qty = self._db_order_filled_qty(order)
+        broker_filled_qty = self._extract_explicit_cumulative_fill_qty(
+            broker_raw or {}
+        )
+        durable_fill_price = self._extract_avg_fill_price(order)
+        durable_filled_ts = _extract_broker_fill_timestamp(order)
+
+        # A terminal response without positive fill evidence is safe only when
+        # any already-durable EXIT fill has its own exact chronology. Otherwise
+        # terminalization could strand a previously persisted positive fill. A
+        # durable positive fill is replayed through OSM as well, so a prior
+        # partial transition that persisted the order but missed convergence is
+        # repaired before the terminal state is accepted.
+        if broker_filled_qty is not None and broker_filled_qty < durable_filled_qty:
+            self._alert(
+                f"EXIT_TERMINAL_FILL_QTY_REGRESSION | {contract} | {local_id or '?'} | "
+                f"broker_filled_qty={broker_filled_qty} "
+                f"durable_filled_qty={durable_filled_qty} "
+                f"broker_status={broker_status or '?'} source={source} action=HOLD "
+                "position_mutated=false order_terminalized=false"
+            )
+            summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
+            summary.setdefault("errors", []).append("exit_terminal_fill_qty_regression")
+            return False
+
+        if broker_filled_qty is None or broker_filled_qty <= 0:
+            if durable_filled_qty <= 0:
+                return True
+            target_filled_qty = durable_filled_qty
+            target_fill_price = durable_fill_price
+            target_filled_ts = durable_filled_ts
+        elif broker_filled_qty == durable_filled_qty:
+            raw_fill_ts = _extract_broker_fill_timestamp(broker_raw or {})
+            raw_timestamp_present = any(
+                key in (broker_raw or {})
+                and (broker_raw or {}).get(key) not in (None, "")
+                for key in _BROKER_FILL_TIMESTAMP_KEYS
+            )
+            target_filled_qty = durable_filled_qty
+            target_fill_price = (
+                self._extract_avg_fill_price(broker_raw or {}) or durable_fill_price
+            )
+            target_filled_ts = (
+                raw_fill_ts if raw_timestamp_present else durable_filled_ts
+            )
+        else:
+            target_filled_qty = broker_filled_qty
+            target_fill_price = self._extract_avg_fill_price(broker_raw or {})
+            target_filled_ts = _extract_broker_fill_timestamp(broker_raw or {})
+
+        resolved_broker_order_id = (
+            broker_order_id
+            or self._broker_order_id_from_raw(broker_raw or {})
+            or str(order.get("broker_order_id") or "").strip()
+            or None
+        )
+
+        if target_filled_qty <= 0:
+            return True
+
+        if not resolved_broker_order_id:
+            self._alert(
+                f"EXIT_TERMINAL_FILL_IDENTITY_MISSING | {contract} | {local_id or '?'} | "
+                f"broker_status={broker_status or '?'} source={source} action=HOLD "
+                "position_mutated=false order_terminalized=false"
+            )
+            summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
+            summary.setdefault("errors", []).append("exit_terminal_fill_identity_missing")
+            return False
+
+        if target_fill_price is None:
+            self._alert(
+                f"BROKER_FILL_PRICE_NOT_NORMALIZED | {contract} | {local_id or '?'} | "
+                f"broker terminal status {broker_status or '?'} carried positive "
+                f"EXIT quantity but no explicit average fill price; source={source}; "
+                "action=HOLD position_mutated=false order_terminalized=false"
+            )
+            summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
+            summary.setdefault("errors", []).append("exit_terminal_fill_price_missing")
+            return False
+
+        if not target_filled_ts:
+            self._hold_exit_fill_timestamp_missing(
+                summary,
+                order=order,
+                evidence=broker_raw or {},
+                broker_status=broker_status,
+                source=source,
+                filled_qty=target_filled_qty,
+                fill_price=target_fill_price,
+                broker_order_id=resolved_broker_order_id,
+            )
+            return False
+
+        current_status = str(order.get("status") or "").strip().upper()
+        try:
+            if current_status == "EXIT_PARTIAL_FILL":
+                ok = self._apply_osm_fill_update(
+                    local_id,
+                    "EXIT_PARTIAL_FILL",
+                    filled_qty=target_filled_qty,
+                    fill_price=target_fill_price,
+                    broker_order_id=resolved_broker_order_id,
+                    filled_ts=target_filled_ts,
+                )
+            else:
+                # apply_fill_update() only accepts an already-partial row. A
+                # terminal response can arrive while the durable row is still
+                # ACKNOWLEDGED/SUBMITTED, so enter EXIT_PARTIAL_FILL through
+                # transition() to invoke the canonical convergence hook.
+                ok = bool(self.osm.transition(
+                    local_id,
+                    "EXIT_PARTIAL_FILL",
+                    filled_qty=target_filled_qty,
+                    fill_price=target_fill_price,
+                    broker_order_id=resolved_broker_order_id,
+                    filled_ts=target_filled_ts,
+                    last_error=f"{source}_pre_terminal_exit_fill",
+                ))
+        except Exception as exc:
+            log.error(
+                "[%s] terminal EXIT fill convergence failed | local=%s broker=%s "
+                "source=%s err=%s",
+                self.client_id, local_id, resolved_broker_order_id or "?", source, exc,
+            )
+            ok = False
+
+        if not ok:
+            contract = order.get("contract") or order.get("symbol") or "?"
+            self._alert(
+                f"EXIT_TERMINAL_FILL_OSM_HELD | {contract} | {local_id or '?'} | "
+                f"broker={resolved_broker_order_id or '?'} broker_status={broker_status or '?'} "
+                f"source={source}; executed EXIT delta not durably converged; "
+                "action=HOLD position_mutated=false order_terminalized=false"
+            )
+            summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
+            summary.setdefault("errors", []).append("exit_terminal_fill_osm_held")
+            return False
+
+        return True
+
     def _handle_stale_acknowledged_exits(self, summary: dict) -> None:
         """
         Find EXIT orders stuck in EXIT_SUBMITTED / EXIT_ACKNOWLEDGED with zero fill
@@ -1002,6 +1183,15 @@ class APBrokerReconciler:
                     continue
 
                 if broker_status in BROKER_TERMINAL:
+                    if not self._converge_terminal_exit_fill_before_terminalization(
+                        row,
+                        broker_raw,
+                        broker_status,
+                        summary,
+                        source="stale_acknowledged_exit_terminal",
+                        broker_order_id=broker_id,
+                    ):
+                        continue
                     mapped = BROKER_TO_OSM.get(broker_status, "CANCELED")
                     try:
                         ok = self.osm.transition(
@@ -2267,6 +2457,20 @@ class APBrokerReconciler:
                     order.get("kind"), db_status,
                 )
                 family = "ENTRY"   # conservative: don't revert, don't corrupt
+
+        if not self._converge_terminal_exit_fill_before_terminalization(
+            order,
+            broker_raw,
+            broker_status,
+            summary,
+            source="reconciler_terminal",
+            broker_order_id=(
+                self._broker_order_id_from_raw(broker_raw or {})
+                or str(order.get("broker_order_id") or "").strip()
+                or None
+            ),
+        ):
+            return
 
         # P1 (2026-07-02): persist the broker's rejection reason. The
         # 2026-06-25 SMCI incident left 355+ REJECTED rows whose only

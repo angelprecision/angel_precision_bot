@@ -145,6 +145,7 @@ env:
     tests/test_p0_terminal_proof_lock_postgres_concurrency.py
     tests/test_p0_queue_deferral_truth.py
     tests/test_p0_manual_rescue_restart_guard_bypass.py
+    tests/test_p0_reconciler_exit_fill_timestamp_contract.py
     tests/test_p0_exit_filled_position_convergence.py
     tests/test_p0_pr579_partial_then_cancel_convergence.py
     tests/test_p0_sept9_qqq_osm_failfirst.py
