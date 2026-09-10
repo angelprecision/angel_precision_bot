@@ -2,11 +2,11 @@
 
 ## STATUS
 
-**AMENDED IN PLACE — HARD HOLD. DO NOT MERGE OR DEPLOY.**
+**AMENDED IN PLACE — DRAFT / MERGE CANDIDATE. DO NOT MERGE OR DEPLOY.**
 
 Base: `d404df34e00522ba2cce995b6a0129ba39b83944`
 Current implementation/code head: `e5a4dfe43f4cf95f425312f42012025b41fc217f`
-PR state: **Draft / open / HARD HOLD**. The final branch head including this
+PR state: **Draft / open / MERGE CANDIDATE**. The final branch head including this
 documentation attestation is recorded in the PR body; this spec update is
 documentation-only and does not alter production code.
 Audited committed main: `d404df34e00522ba2cce995b6a0129ba39b83944`
@@ -27,6 +27,53 @@ Dependencies (§STATUS binding order):
   base and does not copy or modify #568 retry-owner code
 - PR #569 (fresh market truth / late watcher recovery): **open/draft** and
   remains a separate ownership boundary; it is not included in this amendment
+
+## CURRENT VERIFICATION ATTESTATION — 2026-09-10
+
+This section supersedes older audit snapshots below. The branch has been
+rebased in place onto the current committed GitHub `main` at
+`59eb1882dc84d6bb33475b4bdd0225486a2309fc`. The PR remains Draft/open and
+must not be merged, deployed, or closed during this audit.
+
+The scope is PR #580 only. PRs #596 and #569 are intentionally out of scope
+for this clearance pass: their code, ownership, and status are not changed or
+used as a gate.
+
+### Accepted recovery ownership contract
+
+The recovery dispatch marker uses a unique `recovery_trigger_dispatch_attempt_id`
+as the callback-attempt fence. The deterministic recovery owner identifies the
+lifecycle only; it is not a uniqueness key. The first blank claim for a
+generation wins, and `CLAIMED`, `CALLBACK_STARTED`, `CONSUMED`, `COMPLETED`,
+and `AMBIGUOUS` are non-reclaimable for that same generation. A process death
+after claim is a conservative recovery HOLD with replay suppressed; no
+same-generation lease or retry subsystem is introduced here.
+
+### `KEEP_WATCHER` / `RETRY_WAIT`
+
+For a recovered trigger-ready cursor, these dispositions consume the current
+durable cursor and make the watcher inert. The same cursor cannot callback on
+the next poll or after restart. Only a genuinely new durable trigger
+generation/cursor can create one new callback attempt.
+
+### Unproven trigger-ready rows
+
+Incomplete, malformed, conflicting, stale, or unavailable authority remains a
+HOLD and is never convenience-terminalized. The existing critical
+`RESTART_RECOVERY_TRIGGER_READY_HOLD` / identity-generation hold logging is
+the operator signal; these paths have zero selector, callback, broker,
+position, proof-trade, or queue authority. Reconciliation of the exact durable
+identity and generation is required before any retry.
+
+### Transactional incumbent observability
+
+Incumbent cancellation remains inside the existing PostgreSQL transaction with
+non-rollback-safe effects deferred. After commit, the existing transition
+event is replayed first and `_notify_opportunity_ledger(...)` second. Rollback
+replays neither. The transition sink is append-only and the opportunity ledger
+is monotonic, so duplicate post-commit delivery is harmless and cannot reach
+the broker. No new broker behavior, outbox, retry system, or state machine is
+introduced.
 
 ### Latest audit corrections — strict trigger authority and post-admission liveness
 
