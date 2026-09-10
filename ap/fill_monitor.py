@@ -3031,19 +3031,38 @@ def process_pending_order(
             fill_applied = False
             if osm:
                 try:
-                    fill_applied = bool(
-                        osm.apply_fill_update(
-                            local_order_id=local_id,
-                            cumulative_filled=new_filled,
-                            fill_price=result.get("avg_fill"),
-                            broker_order_id=broker_id,
-                            filled_ts=result.get("filled_ts"),
+                    current_status = str(order.get("status") or "").strip().upper()
+                    fill_kwargs = {
+                        "local_order_id": local_id,
+                        "cumulative_filled": new_filled,
+                        "fill_price": result.get("avg_fill"),
+                        "broker_order_id": broker_id,
+                        "filled_ts": result.get("filled_ts"),
+                    }
+                    if current_status in {"PARTIAL_FILL", "EXIT_PARTIAL_FILL"}:
+                        # Same-state updates are legal only after the durable
+                        # lifecycle is already partial.
+                        fill_applied = bool(osm.apply_fill_update(**fill_kwargs))
+                    else:
+                        # Recovery-shaped path: first durably enter the legal
+                        # EXIT_PARTIAL_FILL state, which also gives production
+                        # OSM its canonical convergence hook. Calling
+                        # apply_fill_update from EXIT_SUBMITTED/ACKNOWLEDGED
+                        # is refused by OSM and would strand the executed delta.
+                        fill_applied = bool(
+                            osm.transition(
+                                local_id,
+                                "EXIT_PARTIAL_FILL",
+                                filled_qty=new_filled,
+                                fill_price=result.get("avg_fill"),
+                                broker_order_id=broker_id,
+                                filled_ts=result.get("filled_ts"),
+                            )
                         )
-                    )
                 except Exception as exc:
                     log.error(
-                        "[%s] OSM apply_fill_update failed on pre-terminal "
-                        "convergence for %s: %s",
+                        "[%s] OSM pre-terminal partial transition/update failed "
+                        "for %s: %s",
                         client_id, local_id, exc,
                     )
             else:
