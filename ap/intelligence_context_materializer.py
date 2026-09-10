@@ -404,6 +404,75 @@ def resolve_public_breach_lifecycle(signal: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+
+ENTRY_TIMING_CANDIDATE_ENUMS = frozenset({
+    "READY_NOW_CANDIDATE",
+    "WAIT_PULLBACK_CANDIDATE",
+    "WAIT_FVG_RETEST_CANDIDATE",
+    "WAIT_OPPOSING_FVG_ACCEPTANCE_CANDIDATE",
+    "REBREACH_PREFERRED",
+    "SETUP_INVALID",
+})
+
+# Legacy readiness classifications retained for dual-emit / back-compat.
+LEGACY_ENTRY_READINESS_ENUMS = frozenset({
+    "READY_NOW",
+    "WAIT_CONFIRMATION",
+    "REBREACH_PREFERRED",
+    "INVALID",
+})
+
+
+def map_entry_timing_candidate(
+    classification: str,
+    *,
+    evidence: dict[str, Any] | None = None,
+) -> str:
+    """Map legacy readiness → amendment entry-timing candidate enum.
+
+    Dual-emitted alongside READY_NOW / WAIT_CONFIRMATION / INVALID. Never
+    affects eligibility / admission.
+    """
+    cls = str(classification or "").strip().upper()
+    ev = evidence if isinstance(evidence, dict) else {}
+    if cls == "READY_NOW":
+        return "READY_NOW_CANDIDATE"
+    if cls == "REBREACH_PREFERRED":
+        return "REBREACH_PREFERRED"
+    if cls == "INVALID":
+        return "SETUP_INVALID"
+
+    # WAIT_CONFIRMATION and unknowns → structure-aware wait candidate.
+    ms = ev.get("market_structure") if isinstance(ev.get("market_structure"), dict) else {}
+    rel = ms.get("relationship") if isinstance(ms.get("relationship"), dict) else {}
+    relationship = str(rel.get("relationship") or "").upper()
+    wick = ev.get("wick_vs_body_breach") if isinstance(ev.get("wick_vs_body_breach"), dict) else {}
+    style = str(wick.get("confirmation_style") or "").upper()
+    pullback = ev.get("pullback_candidate_features") if isinstance(ev.get("pullback_candidate_features"), dict) else {}
+
+    if relationship in {
+        "APPROACHING_OPPOSING_FVG",
+        "AT_OPPOSING_FRONT",
+        "INSIDE_OPPOSING_FVG",
+        "INSIDE_OPPOSING_ZONE",
+        "OPPOSING_WALL_REJECTED",
+    }:
+        return "WAIT_OPPOSING_FVG_ACCEPTANCE_CANDIDATE"
+    if relationship in {
+        "ALIGNED_RETEST_ZONE_BEHIND",
+        "INSIDE_ALIGNED_FVG",
+    } or (
+        isinstance(rel.get("aligned_retest_zone"), dict)
+        and relationship in {"CLEAR_PATH", ""}
+        and pullback.get("nearest_aligned_fvg_behind")
+    ):
+        return "WAIT_FVG_RETEST_CANDIDATE"
+    if style == "WICK_ONLY":
+        return "WAIT_PULLBACK_CANDIDATE"
+    # Default wait posture for first-breach / weak confirmation.
+    return "WAIT_PULLBACK_CANDIDATE"
+
+
 def classify_entry_readiness_observe_only(
     signal: dict[str, Any], *, evidence: dict[str, Any]
 ) -> dict[str, Any]:
@@ -415,26 +484,38 @@ def classify_entry_readiness_observe_only(
     five = evidence.get("five_minute_confirmation") if isinstance(evidence, dict) else {}
     five = five if isinstance(five, dict) else {}
     lineage = str((evidence or {}).get("breach_lineage") or "UNKNOWN").upper()
+    wick = evidence.get("wick_vs_body_breach") if isinstance(evidence, dict) else {}
+    wick = wick if isinstance(wick, dict) else {}
     reasons: list[str] = []
 
     geom = extract_trade_geometry(signal if isinstance(signal, dict) else {})
     if not geom.get("available"):
+        candidate = "SETUP_INVALID"
         return {
             "classification": "INVALID",
+            "entry_timing_candidate": candidate,
             "observe_only": True,
             "affected_eligibility": False,
             "diagnostics": {
                 "reasons": ["missing_geometry", *(geom.get("missing_data") or [])],
+                "entry_timing_candidate": candidate,
             },
         }
 
     target_reached = bool(remaining.get("target_reached") or remaining.get("target_already_reached"))
     remaining_r = remaining.get("remaining_r")
+    if remaining_r is None:
+        remaining_r = remaining.get("remaining_R")
     try:
         remaining_r_f = float(remaining_r) if remaining_r is not None else None
     except (TypeError, ValueError):
         remaining_r_f = None
     move_consumed = remaining.get("percent_move_consumed")
+    if move_consumed is None and remaining.get("move_consumed_pct") is not None:
+        try:
+            move_consumed = float(remaining.get("move_consumed_pct")) / 100.0
+        except (TypeError, ValueError):
+            move_consumed = None
     try:
         move_consumed_f = float(move_consumed) if move_consumed is not None else None
     except (TypeError, ValueError):
@@ -450,7 +531,10 @@ def classify_entry_readiness_observe_only(
         fifteen.get("status") in {"MISSING", "MISSING_OR_INVALID", "UNAVAILABLE"}
         or five.get("status") == "MISSING"
         or not fifteen.get("follow_through")
+        or wick.get("confirmation_style") == "WICK_ONLY"
     ):
+        if wick.get("confirmation_style") == "WICK_ONLY":
+            reasons.append("wick_only_breach_on_first_touch")
         reasons.append("weak_or_missing_continuation_on_first_breach")
         classification = "WAIT_CONFIRMATION"
     elif lineage == "REBREACH_AFTER_RESET" and fifteen.get("follow_through"):
@@ -463,8 +547,10 @@ def classify_entry_readiness_observe_only(
         reasons.append("default_wait_confirmation")
         classification = "WAIT_CONFIRMATION"
 
+    entry_timing_candidate = map_entry_timing_candidate(classification, evidence=evidence)
     return {
         "classification": classification,
+        "entry_timing_candidate": entry_timing_candidate,
         "observe_only": True,
         "affected_eligibility": False,
         "diagnostics": {
@@ -475,8 +561,12 @@ def classify_entry_readiness_observe_only(
             "remaining_r": remaining_r_f,
             "percent_move_consumed": move_consumed_f,
             "target_reached": target_reached,
+            "wick_vs_body": wick.get("confirmation_style"),
+            "entry_timing_candidate": entry_timing_candidate,
+            "legacy_classification": classification,
         },
     }
+
 
 
 
@@ -777,14 +867,21 @@ def _remaining_opportunity(signal: dict[str, Any]) -> dict[str, Any]:
     remaining = direction * (target - current)
     risk = direction * (trigger - stop)
     current_to_stop = direction * (current - stop)
+    move_consumed_pct = round((1.0 - remaining / total) * 100.0, 4) if total > 0 else None
+    remaining_R = round(remaining / risk, 4) if risk > 0 else None
+    target_already_reached = remaining <= 0
     result.update({
         "trigger_to_target": total,
         "current_to_target": remaining,
         "current_to_stop": current_to_stop,
-        "move_consumed_pct": round((1.0 - remaining / total) * 100.0, 4)
-        if total > 0 else None,
-        "remaining_R": round(remaining / risk, 4) if risk > 0 else None,
-        "target_already_reached": remaining <= 0,
+        "move_consumed_pct": move_consumed_pct,
+        # Fraction alias consumed by readiness / pullback features (0-1).
+        "percent_move_consumed": round(move_consumed_pct / 100.0, 6)
+        if move_consumed_pct is not None else None,
+        "remaining_R": remaining_R,
+        "remaining_r": remaining_R,
+        "target_already_reached": target_already_reached,
+        "target_reached": target_already_reached,
         "stop_geometry_invalid": risk <= 0 or current_to_stop <= 0,
     })
     if total <= 0 or risk <= 0 or current_to_stop <= 0:
@@ -865,6 +962,11 @@ def _build_breach_evidence(
     fifteen_source = str(provenance.get("fifteen_minute") or "frozen_signal_15m")
     pattern_identity = resolve_canonical_strategy_pattern(signal)
     lineage = resolve_breach_lineage(signal)
+    data_as_of = (
+        signal.get("trigger_crossed_at")
+        or signal.get("data_as_of")
+        or (observation or {}).get("observed_at")
+    )
     evidence = {
         "breach_timing": _breach_timing(signal),
         "raw_pattern": pattern_identity.get("raw_pattern"),
@@ -902,24 +1004,91 @@ def _build_breach_evidence(
         },
     }
     # Observe-only market_structure freeze (4H/1H FVG geometry + relationship).
-    # Prefer caller-supplied data_as_of via signal trigger_crossed_at.
     market_structure = _freeze_breach_market_structure_observe_only(
         signal,
         data_sources=data_sources,
         provenance=provenance,
-        data_as_of=(
-            signal.get("trigger_crossed_at")
-            or signal.get("data_as_of")
-            or (observation or {}).get("observed_at")
-        ),
+        data_as_of=data_as_of,
     )
     evidence["market_structure"] = market_structure
     if isinstance(market_structure.get("volume_imbalance"), dict):
         evidence["volume_imbalance"] = market_structure["volume_imbalance"]
+
+    # Wick-only vs body-confirmed breach (prefer 5m OHLC, else 15m, else signal candle).
+    try:
+        from ap.intelligence_breach_market_structure import (
+            assess_breach_htf_freshness,
+            classify_wick_vs_body_breach,
+            freeze_pullback_candidate_features,
+        )
+    except Exception as exc:  # never break materialization
+        evidence["wick_vs_body_breach"] = {
+            "status": "ERROR",
+            "confirmation_style": "UNKNOWN",
+            "error": f"{type(exc).__name__}:{exc}",
+            "observe_only": True,
+            "affected_eligibility": False,
+        }
+        evidence["htf_freshness"] = {
+            "4h": {"status": "ERROR"},
+            "1h": {"status": "ERROR"},
+            "observe_only": True,
+            "affected_eligibility": False,
+        }
+        evidence["pullback_candidate_features"] = {
+            "schema_version": "pullback_candidate_features_v1",
+            "observe_only": True,
+            "affected_eligibility": False,
+            "status": "ERROR",
+            "error": f"{type(exc).__name__}:{exc}",
+            "records_future_pullback_outcomes": False,
+        }
+    else:
+        breach_candle = (
+            signal.get("breach_candle")
+            if isinstance(signal.get("breach_candle"), dict)
+            else None
+        )
+        wick_source = "signal_breach_candle"
+        wick_rows = None
+        wick_bucket = 5
+        if breach_candle is None:
+            if five:
+                wick_rows = five
+                wick_bucket = 5
+                wick_source = "frozen_signal_5min"
+            elif fifteen:
+                wick_rows = fifteen
+                wick_bucket = 15
+                wick_source = fifteen_source
+        evidence["wick_vs_body_breach"] = classify_wick_vs_body_breach(
+            side=side,
+            trigger=signal.get("trigger_price") or signal.get("trigger"),
+            candles=wick_rows,
+            breach_candle=breach_candle,
+            data_as_of=data_as_of,
+            bucket_minutes=wick_bucket,
+            source=wick_source,
+        )
+        htf_freshness = assess_breach_htf_freshness(candles, data_as_of=data_as_of)
+        evidence["htf_freshness"] = htf_freshness
+        if isinstance(market_structure, dict) and market_structure.get("status") != "ERROR":
+            market_structure = dict(market_structure)
+            market_structure["htf_freshness"] = htf_freshness
+            evidence["market_structure"] = market_structure
+        evidence["pullback_candidate_features"] = freeze_pullback_candidate_features(
+            signal=signal,
+            evidence=evidence,
+            wick_vs_body=evidence.get("wick_vs_body_breach"),
+            market_structure=evidence.get("market_structure"),
+            htf_freshness=htf_freshness,
+        )
+
     evidence["entry_readiness_observe_only"] = classify_entry_readiness_observe_only(
         signal, evidence=evidence
     )
     return evidence
+
 
 
 def build_intelligence_context_payload(
@@ -992,6 +1161,34 @@ def build_intelligence_context_payload(
         return "AVAILABLE" if available else "MISSING"
 
     fvg_tf = ((fvg_context.get("diagnostics") or {}).get("timeframes") or {})
+    # HTF freshness: explicit STALE when completed bars exist but are too old vs as_of.
+    breach_as_of_for_freshness = (
+        _breach_timing(sig).get("timestamp")
+        if phase == "BREACH" and _breach_timing(sig).get("timestamp_status") == "AVAILABLE"
+        else point_in_time.get("collected_at") or sig.get("data_as_of")
+    )
+    htf_freshness_for_components = None
+    try:
+        from ap.intelligence_breach_market_structure import assess_breach_htf_freshness
+        htf_freshness_for_components = assess_breach_htf_freshness(
+            (data_sources.get("candles") or {}),
+            data_as_of=breach_as_of_for_freshness,
+        )
+    except Exception:
+        htf_freshness_for_components = None
+
+    def _htf_component(available: bool, freshness: dict[str, Any] | None, *, error_prefix: str) -> str:
+        base = _component(available, error_prefix=error_prefix)
+        if base == "ERROR":
+            return "ERROR"
+        if isinstance(freshness, dict) and freshness.get("status") == "STALE":
+            return "STALE"
+        if isinstance(freshness, dict) and freshness.get("status") == "MISSING" and not available:
+            return "MISSING"
+        return base
+
+    four_fresh = (htf_freshness_for_components or {}).get("4h") if isinstance(htf_freshness_for_components, dict) else None
+    one_fresh = (htf_freshness_for_components or {}).get("1h") if isinstance(htf_freshness_for_components, dict) else None
     component_statuses = {
         "geometry": _component(bool(geometry.get("available"))),
         "underlying_quote": _component(
@@ -1001,9 +1198,21 @@ def build_intelligence_context_payload(
         "monthly": _component(bool(timeframe_context["monthly"].get("available")), error_prefix="daily_history"),
         "weekly": _component(bool(timeframe_context["weekly"].get("available")), error_prefix="daily_history"),
         "daily": _component(bool(timeframe_context["daily"].get("available")), error_prefix="daily_history"),
-        "four_hour": _component(bool(timeframe_context["4h"].get("available")), error_prefix="intraday_history"),
-        "one_hour_fvg": _component(bool((fvg_tf.get("1h") or {}).get("available")), error_prefix="intraday_history"),
-        "four_hour_fvg": _component(bool((fvg_tf.get("4h") or {}).get("available")), error_prefix="intraday_history"),
+        "four_hour": _htf_component(
+            bool(timeframe_context["4h"].get("available")),
+            four_fresh if isinstance(four_fresh, dict) else None,
+            error_prefix="intraday_history",
+        ),
+        "one_hour_fvg": _htf_component(
+            bool((fvg_tf.get("1h") or {}).get("available")),
+            one_fresh if isinstance(one_fresh, dict) else None,
+            error_prefix="intraday_history",
+        ),
+        "four_hour_fvg": _htf_component(
+            bool((fvg_tf.get("4h") or {}).get("available")),
+            four_fresh if isinstance(four_fresh, dict) else None,
+            error_prefix="intraday_history",
+        ),
         "market": _component((sector_context.get("diagnostics") or {}).get("market_direction") is not None, error_prefix="market_quote"),
         "sector": _component((sector_context.get("diagnostics") or {}).get("sector_direction") is not None, error_prefix="sector_quote"),
         "volume": _component((volume_context.get("diagnostics") or {}).get("relative_volume") is not None),
@@ -1092,6 +1301,16 @@ def build_intelligence_context_payload(
                 "observe_only": True,
                 "affected_eligibility": False,
             }
+            # Explicit dual-emit of amendment enum beside legacy classification.
+            if readiness.get("entry_timing_candidate"):
+                payload["entry_timing_candidate"] = readiness.get("entry_timing_candidate")
+        be = payload.get("breach_evidence") if isinstance(payload.get("breach_evidence"), dict) else {}
+        if isinstance(be.get("pullback_candidate_features"), dict):
+            payload["pullback_candidate_features"] = be["pullback_candidate_features"]
+        if isinstance(be.get("htf_freshness"), dict):
+            payload["htf_freshness"] = be["htf_freshness"]
+        if isinstance(htf_freshness_for_components, dict):
+            payload.setdefault("htf_freshness", htf_freshness_for_components)
     payload["input_hash"] = str(input_hash or _stable_hash(
         {
             "phase": phase,

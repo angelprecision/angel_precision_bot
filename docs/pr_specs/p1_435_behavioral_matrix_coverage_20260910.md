@@ -22,19 +22,19 @@ Related prior coverage retained under `/workspace/pr435/`:
 | # | Scenario | Status | Where |
 |---|----------|--------|-------|
 | 1 | Bullish continuation with no pullback | **COVERED** | `test_p0_435_behavioral_matrix` — CALL clean continuation → `READY_NOW` |
-| 2 | Bullish setup with active pullback | **DEFERRED** | Full `regime_pullback_v1.pullback_state` classifier not yet on tip; readiness only encodes extension/confirmation |
+| 2 | Bullish setup with active pullback | **PARTIAL** | `pullback_candidate_features` research freeze at breach (observe_only); full `regime_pullback_v1.pullback_state` still deferred |
 | 3 | Bearish symmetric pullback | **PARTIAL** | PUT symmetric clean continuation covered; explicit pullback-state enum deferred with #2 |
 | 4 | First FVG touch | **PARTIAL** | Market-structure freeze relationship enums exercised in `test_p0_435_market_structure_freeze` / matrix zone-hash; dedicated touch_count=1 lifecycle deferred |
 | 5 | Second touch after exact persisted first touch | **DEFERRED** | Requires persisted FVG touch lineage store + exact first_touch_ts authority |
 | 6 | Deep penetration then reclaim | **DEFERRED** | Needs `penetration_pct` / `reclaim_state` producer on tip |
 | 7 | Gap broken/invalidated | **PARTIAL** | `broken_reclaimed` lifecycle normalization exists in freeze; dedicated broken→invalidated behavioral case deferred |
-| 8 | Wick-only trigger breach | **DEFERRED** | Wick-vs-body breach feature not yet classified in readiness helper |
+| 8 | Wick-only trigger breach | **COVERED** | `classify_wick_vs_body_breach` + `test_p0_435_deferred_gaps_closed`; readiness waits on wick-only first breach |
 | 9 | Completed 5m reclaim | **PARTIAL** | 5m confirmation MISSING honesty + follow_through path covered; explicit reclaim-of-trigger posture deferred |
 | 10 | Completed 15m follow-through | **COVERED** | Matrix READY_NOW requires `fifteen.follow_through`; AAPL weak path proves opposing follow-through denial |
 | 11 | Late extension / little remaining target distance | **COVERED** | Heavy extension → `REBREACH_PREFERRED`; target reached / `remaining_r <= 0` → `INVALID` |
 | 12 | Opposing 4H wall directly in path | **COVERED** (prior) | `test_p0_435_market_structure_freeze.test_opposing_wall_ahead_for_call` |
 | 13 | Missing 5m → explicit `MISSING` | **COVERED** | `_directional_confirmation([])` + matrix missing-5m case; never fabricates follow_through |
-| 14 | Stale 4H/1H evidence → explicit `STALE` | **DEFERRED** | Component STALE path exists in payload builder; dedicated stale-as-of fixture not in this amendment pack |
+| 14 | Stale 4H/1H evidence → explicit `STALE` | **COVERED** | `assess_htf_candle_freshness` + breach_evidence/component wiring; fixture in `test_p0_435_deferred_gaps_closed` |
 | 15 | Future candle excluded | **COVERED** (prior) | PIT `completed_bars_as_of` in market-structure freeze tests / freeze helper |
 | 16 | Malformed/non-finite candle cannot improve classification | **PARTIAL** | `_finite_number` / confirmation skips bad rows; dedicated improve-classification regression deferred |
 | 17 | First-touch history missing → touch count `UNKNOWN` | **DEFERRED** | Touch-count UNKNOWN contract awaits FVG lifecycle persistence fields |
@@ -42,8 +42,8 @@ Related prior coverage retained under `/workspace/pr435/`:
 | 19 | Duplicate enqueue remains idempotent | **DEFERRED** | Store idempotency lives in `intelligence_snapshot_store` (memory/DB); not re-proven in this pack |
 | 20 | Classifier exception leaves execution path untouched | **PARTIAL** | Money-path handoff never raises on pool/submit failure; full classifier-exception fence at call site deferred |
 | 21 | Observe-only `WAIT_*` cannot delay selector/broker | **COVERED** | All readiness outputs assert `observe_only=True`, `affected_eligibility=False` |
-| 22 | Observe-only `REJECT_CANDIDATE` cannot terminalize | **PARTIAL** | Current tip emits readiness enums (`INVALID`/`WAIT_CONFIRMATION`/…), not `REJECT_CANDIDATE` posture yet; same non-authority flags proven |
-| 23 | Observe-only `ENTER_NOW_CANDIDATE` cannot unblock submit | **PARTIAL** | Tip uses `READY_NOW` (not `ENTER_NOW_CANDIDATE`); non-authority flags proven on READY_NOW |
+| 22 | Observe-only `REJECT_CANDIDATE` cannot terminalize | **PARTIAL** | Dual-emits `SETUP_INVALID` candidate beside `INVALID`; non-authority flags proven; full REJECT_CANDIDATE posture name still advisory |
+| 23 | Observe-only `ENTER_NOW_CANDIDATE` cannot unblock submit | **PARTIAL** | Dual-emits `READY_NOW_CANDIDATE` beside `READY_NOW`; non-authority flags proven |
 | 24 | Exact `client_id` / `execution_mode` / signal / local order unchanged | **COVERED** (prior) | `test_p0_435_canonical_identity` + lifecycle freeze strip |
 | 25 | Zero broker submit/cancel, zero position/proof mutation | **COVERED** | `test_p0_435_money_path_non_authority` — disabled / capacity exhausted / enqueue error shapes; no submit/cancel/eligibility mutation implied |
 
@@ -55,8 +55,8 @@ Related prior coverage retained under `/workspace/pr435/`:
 
 ## Counts
 
-- **COVERED**: 1, 10, 11, 12, 13, 15, 21, 24, 25 (+ extras)
-- **PARTIAL**: 3, 4, 7, 9, 16, 18, 20, 22, 23
-- **DEFERRED**: 2, 5, 6, 8, 14, 17, 19
+- **COVERED**: 1, 8, 10, 11, 12, 13, 14, 15, 21, 24, 25 (+ extras)
+- **PARTIAL**: 2, 3, 4, 7, 9, 16, 18, 20, 22, 23
+- **DEFERRED**: 5, 6, 17, 19
 
-Deferred items primarily wait on the versioned `regime_pullback_v1` producer, FVG touch-lineage persistence, and store/restart integration harnesses — not on money-path authority (which remains observe-only).
+Deferred items primarily wait on FVG touch-lineage persistence, full `regime_pullback_v1` state table, and store/restart integration harnesses — not on money-path authority (which remains observe-only). See `DEFERRED_GAPS_CLOSED.md`.

@@ -671,3 +671,399 @@ def attach_market_structure_to_breach_evidence(
     if "volume_imbalance" in payload:
         out["volume_imbalance"] = payload["volume_imbalance"]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Deferred-gap helpers (observe-only): wick/body, HTF freshness, pullback feats
+# ---------------------------------------------------------------------------
+
+BREACH_CONFIRMATION_STYLES = frozenset({
+    "BODY_CONFIRMED",
+    "WICK_ONLY",
+    "UNKNOWN",
+    "MISSING",
+})
+
+HTF_FRESHNESS_STATUSES = frozenset({"AVAILABLE", "STALE", "MISSING", "ERROR"})
+
+# Default: bar older than 1.5× its bucket length vs data_as_of → STALE.
+_DEFAULT_STALE_AGE_MULTIPLE = 1.5
+
+
+def _ohlc_from_candle(candle: Mapping[str, Any] | None) -> Optional[dict[str, float]]:
+    if not isinstance(candle, Mapping):
+        return None
+    open_p = _safe_float(candle.get("open"))
+    high_p = _safe_float(candle.get("high"))
+    low_p = _safe_float(candle.get("low"))
+    close_p = _safe_float(candle.get("close"))
+    if None in (open_p, high_p, low_p, close_p):
+        return None
+    return {"open": open_p, "high": high_p, "low": low_p, "close": close_p}
+
+
+def _select_breach_candle(
+    candles: Iterable[Mapping[str, Any]] | None,
+    *,
+    data_as_of: Any = None,
+    bucket_minutes: int = 5,
+) -> Optional[dict[str, Any]]:
+    """Pick the last completed candle at/before breach as_of for OHLC style."""
+    as_of = _parse_ts(data_as_of)
+    rows = completed_bars_as_of(candles, as_of=as_of, bucket_minutes=bucket_minutes)
+    if not rows:
+        # Fall back to last row with valid OHLC when timestamps are absent.
+        fallback: list[dict[str, Any]] = []
+        for row in candles or []:
+            if isinstance(row, Mapping) and _ohlc_from_candle(row) is not None:
+                fallback.append(dict(row))
+        if not fallback:
+            return None
+        return fallback[-1]
+    return rows[-1]
+
+
+def classify_wick_vs_body_breach(
+    *,
+    side: str,
+    trigger: Any,
+    candles: Iterable[Mapping[str, Any]] | None = None,
+    breach_candle: Mapping[str, Any] | None = None,
+    data_as_of: Any = None,
+    bucket_minutes: int = 5,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """Deterministic wick-only vs body-confirmed breach from OHLC at as_of.
+
+    CALL: body-confirmed when close > trigger; wick-only when high > trigger
+    but close <= trigger. PUT is symmetric on low/close.
+    """
+    side_u = str(side or "").strip().upper()
+    if side_u in {"BULL", "LONG", "BUY"}:
+        side_u = "CALL"
+    elif side_u in {"BEAR", "SHORT", "SELL"}:
+        side_u = "PUT"
+    trigger_f = _safe_float(trigger)
+    candle = dict(breach_candle) if isinstance(breach_candle, Mapping) else None
+    if candle is None:
+        candle = _select_breach_candle(
+            candles, data_as_of=data_as_of, bucket_minutes=bucket_minutes
+        )
+    ohlc = _ohlc_from_candle(candle)
+    if trigger_f is None or side_u not in {"CALL", "PUT"}:
+        return {
+            "status": "MISSING",
+            "confirmation_style": "MISSING",
+            "side": side_u or None,
+            "trigger": trigger_f,
+            "source": source,
+            "reason": "missing_side_or_trigger",
+            "observe_only": True,
+            "affected_eligibility": False,
+        }
+    if ohlc is None:
+        return {
+            "status": "MISSING",
+            "confirmation_style": "MISSING",
+            "side": side_u,
+            "trigger": trigger_f,
+            "ohlc": None,
+            "source": source,
+            "reason": "breach_candle_ohlc_unavailable",
+            "observe_only": True,
+            "affected_eligibility": False,
+        }
+
+    high_p = ohlc["high"]
+    low_p = ohlc["low"]
+    close_p = ohlc["close"]
+    style = "UNKNOWN"
+    reason = "no_trigger_pierce_on_candle"
+    if side_u == "CALL":
+        if close_p > trigger_f:
+            style = "BODY_CONFIRMED"
+            reason = "close_beyond_trigger"
+        elif high_p > trigger_f and close_p <= trigger_f:
+            style = "WICK_ONLY"
+            reason = "wick_pierced_trigger_close_did_not_hold"
+        elif high_p <= trigger_f:
+            style = "UNKNOWN"
+            reason = "candle_did_not_pierce_trigger"
+    else:  # PUT
+        if close_p < trigger_f:
+            style = "BODY_CONFIRMED"
+            reason = "close_beyond_trigger"
+        elif low_p < trigger_f and close_p >= trigger_f:
+            style = "WICK_ONLY"
+            reason = "wick_pierced_trigger_close_did_not_hold"
+        elif low_p >= trigger_f:
+            style = "UNKNOWN"
+            reason = "candle_did_not_pierce_trigger"
+
+    return {
+        "status": "AVAILABLE",
+        "confirmation_style": style,
+        "side": side_u,
+        "trigger": trigger_f,
+        "ohlc": {k: round(v, 6) for k, v in ohlc.items()},
+        "candle_time": (
+            candle.get("time") or candle.get("timestamp") or candle.get("start")
+            if isinstance(candle, Mapping)
+            else None
+        ),
+        "source": source or "breach_ohlc",
+        "reason": reason,
+        "observe_only": True,
+        "affected_eligibility": False,
+    }
+
+
+def assess_htf_candle_freshness(
+    rows: Iterable[Mapping[str, Any]] | None,
+    *,
+    data_as_of: Any,
+    bucket_minutes: int,
+    max_age_seconds: Optional[float] = None,
+    label: str = "htf",
+) -> dict[str, Any]:
+    """Mark HTF candle evidence AVAILABLE / STALE / MISSING vs data_as_of."""
+    as_of = _parse_ts(data_as_of)
+    max_age = (
+        float(max_age_seconds)
+        if max_age_seconds is not None
+        else float(bucket_minutes) * 60.0 * _DEFAULT_STALE_AGE_MULTIPLE
+    )
+    pit = completed_bars_as_of(rows, as_of=as_of, bucket_minutes=bucket_minutes)
+    if not pit:
+        # Candles present but none complete before as_of, or empty.
+        raw = [r for r in (rows or []) if isinstance(r, Mapping)]
+        if not raw:
+            return {
+                "status": "MISSING",
+                "label": label,
+                "bucket_minutes": bucket_minutes,
+                "max_age_seconds": max_age,
+                "age_seconds": None,
+                "last_bar_end": None,
+                "data_as_of": as_of.isoformat() if as_of else None,
+                "bar_count": 0,
+                "observe_only": True,
+            }
+        # Have rows but none PIT-complete: treat as MISSING for this as_of.
+        return {
+            "status": "MISSING",
+            "label": label,
+            "bucket_minutes": bucket_minutes,
+            "max_age_seconds": max_age,
+            "age_seconds": None,
+            "last_bar_end": None,
+            "data_as_of": as_of.isoformat() if as_of else None,
+            "bar_count": 0,
+            "raw_bar_count": len(raw),
+            "reason": "no_completed_bars_at_as_of",
+            "observe_only": True,
+        }
+
+    last = pit[-1]
+    start = _candle_time(last)
+    if start is None or as_of is None:
+        # Cannot prove freshness without timestamps → STALE rather than AVAILABLE.
+        return {
+            "status": "STALE",
+            "label": label,
+            "bucket_minutes": bucket_minutes,
+            "max_age_seconds": max_age,
+            "age_seconds": None,
+            "last_bar_end": None,
+            "data_as_of": as_of.isoformat() if as_of else None,
+            "bar_count": len(pit),
+            "reason": "missing_as_of_or_bar_timestamp",
+            "observe_only": True,
+        }
+
+    bar_end = _bucket_end(start, bucket_minutes=bucket_minutes)
+    age = max(0.0, (as_of - bar_end).total_seconds())
+    status = "STALE" if age > max_age else "AVAILABLE"
+    return {
+        "status": status,
+        "label": label,
+        "bucket_minutes": bucket_minutes,
+        "max_age_seconds": max_age,
+        "age_seconds": round(age, 3),
+        "last_bar_end": bar_end.isoformat(),
+        "data_as_of": as_of.isoformat(),
+        "bar_count": len(pit),
+        "observe_only": True,
+    }
+
+
+def assess_breach_htf_freshness(
+    candles: Mapping[str, Any] | None,
+    *,
+    data_as_of: Any,
+) -> dict[str, Any]:
+    """Joint 4H/1H freshness block for breach evidence / component statuses."""
+    c = candles if isinstance(candles, Mapping) else {}
+    four = assess_htf_candle_freshness(
+        c.get("4h") or c.get("4H") or [],
+        data_as_of=data_as_of,
+        bucket_minutes=240,
+        label="4h",
+    )
+    one = assess_htf_candle_freshness(
+        c.get("1h") or c.get("1H") or c.get("60m") or [],
+        data_as_of=data_as_of,
+        bucket_minutes=60,
+        label="1h",
+    )
+    return {
+        "4h": four,
+        "1h": one,
+        "observe_only": True,
+        "affected_eligibility": False,
+    }
+
+
+PULLBACK_CANDIDATE_SCHEMA = "pullback_candidate_features_v1"
+
+
+def freeze_pullback_candidate_features(
+    *,
+    signal: Mapping[str, Any] | None,
+    evidence: Mapping[str, Any] | None = None,
+    wick_vs_body: Mapping[str, Any] | None = None,
+    market_structure: Mapping[str, Any] | None = None,
+    htf_freshness: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Research-only freeze of pullback-candidate features at BREACH.
+
+    Records structure available at breach timestamp only. Never records future
+    pullback completion or outcomes. Always ``observe_only=true``.
+    """
+    sig = signal if isinstance(signal, Mapping) else {}
+    ev = evidence if isinstance(evidence, Mapping) else {}
+    remaining = ev.get("remaining_opportunity") if isinstance(ev.get("remaining_opportunity"), Mapping) else {}
+    fifteen = ev.get("fifteen_minute_confirmation") if isinstance(ev.get("fifteen_minute_confirmation"), Mapping) else {}
+    five = ev.get("five_minute_confirmation") if isinstance(ev.get("five_minute_confirmation"), Mapping) else {}
+    ms = market_structure if isinstance(market_structure, Mapping) else (
+        ev.get("market_structure") if isinstance(ev.get("market_structure"), Mapping) else {}
+    )
+    relationship = ms.get("relationship") if isinstance(ms.get("relationship"), Mapping) else {}
+    wick = wick_vs_body if isinstance(wick_vs_body, Mapping) else (
+        ev.get("wick_vs_body_breach") if isinstance(ev.get("wick_vs_body_breach"), Mapping) else {}
+    )
+    freshness = htf_freshness if isinstance(htf_freshness, Mapping) else (
+        ev.get("htf_freshness") if isinstance(ev.get("htf_freshness"), Mapping) else {}
+    )
+    vi = ev.get("volume_imbalance") if isinstance(ev.get("volume_imbalance"), Mapping) else {}
+    if not vi and isinstance(ms.get("volume_imbalance"), Mapping):
+        vi = ms["volume_imbalance"]
+
+    side = normalize_signal_side(sig.get("side") or sig.get("direction") or ev.get("side"))
+    trigger = _safe_float(sig.get("trigger_price") or sig.get("trigger"))
+    price = _safe_float(
+        sig.get("underlying_price")
+        or sig.get("current_price")
+        or sig.get("breach_price")
+    )
+    target = _safe_float(sig.get("target_price") or sig.get("target") or sig.get("pt1"))
+    stop = _safe_float(sig.get("stop_price") or sig.get("stop"))
+
+    # Extension dollars beyond trigger (direction-aware).
+    extension = None
+    if trigger is not None and price is not None and side in {"CALL", "PUT"}:
+        extension = round((price - trigger) if side == "CALL" else (trigger - price), 6)
+
+    move_pct = remaining.get("percent_move_consumed")
+    if move_pct is None and remaining.get("move_consumed_pct") is not None:
+        try:
+            move_pct = float(remaining["move_consumed_pct"]) / 100.0
+        except (TypeError, ValueError):
+            move_pct = None
+    else:
+        try:
+            move_pct = float(move_pct) if move_pct is not None else None
+        except (TypeError, ValueError):
+            move_pct = None
+
+    lineage = str(ev.get("breach_lineage") or sig.get("breach_lineage") or "UNKNOWN").upper()
+    first_vs_rebreach = "UNKNOWN"
+    if lineage in {"INITIAL_BREACH"}:
+        first_vs_rebreach = "FIRST_BREACH"
+    elif lineage in {
+        "REBREACH_AFTER_RESET",
+        "RECOVERED_BREACH",
+        "DIRECTION_REVERSAL_REBREACH",
+    }:
+        first_vs_rebreach = "REBREACH"
+
+    # VWAP / volume honesty: never invent; surface MISSING when absent.
+    vwap_status = "MISSING"
+    vwap_payload = ev.get("vwap_context") if isinstance(ev.get("vwap_context"), Mapping) else None
+    if vwap_payload is None and isinstance(sig.get("vwap_context"), Mapping):
+        vwap_payload = sig.get("vwap_context")
+    if isinstance(vwap_payload, Mapping):
+        diag = vwap_payload.get("diagnostics") if isinstance(vwap_payload.get("diagnostics"), Mapping) else {}
+        if diag.get("vwap") is not None or vwap_payload.get("vwap") is not None:
+            vwap_status = str(vwap_payload.get("status") or "AVAILABLE").upper()
+        else:
+            vwap_status = "MISSING"
+
+    volume_status = str(vi.get("status") or "MISSING").upper()
+    if volume_status not in {"AVAILABLE", "MISSING", "STALE", "ERROR"}:
+        volume_status = "MISSING"
+
+    aligned_behind = relationship.get("aligned_retest_zone")
+    opposing_ahead = relationship.get("opposing_wall")
+    runway = relationship.get("runway_to_opposing_wall")
+
+    return {
+        "schema_version": PULLBACK_CANDIDATE_SCHEMA,
+        "observe_only": True,
+        "affected_eligibility": False,
+        "records_future_pullback_outcomes": False,
+        "side": side,
+        "extension": extension,
+        "percent_move_consumed": move_pct,
+        "remaining_r": (
+            remaining.get("remaining_r")
+            if remaining.get("remaining_r") is not None
+            else remaining.get("remaining_R")
+        ),
+        "wick_vs_body": {
+            "confirmation_style": wick.get("confirmation_style") or "MISSING",
+            "status": wick.get("status") or "MISSING",
+            "reason": wick.get("reason"),
+        },
+        "fifteen_minute_state": {
+            "status": fifteen.get("status") or "MISSING",
+            "follow_through": fifteen.get("follow_through"),
+            "directional_closes": fifteen.get("directional_closes"),
+            "bar_count": fifteen.get("bar_count"),
+        },
+        "five_minute_state": {
+            "status": five.get("status") or "MISSING",
+            "follow_through": five.get("follow_through"),
+            "directional_closes": five.get("directional_closes"),
+            "bar_count": five.get("bar_count"),
+            "missing_reason": five.get("missing_reason"),
+        },
+        "nearest_aligned_fvg_behind": aligned_behind,
+        "opposing_ahead": opposing_ahead,
+        "runway_to_opposing_wall": runway,
+        "relationship": relationship.get("relationship"),
+        "vwap_status": vwap_status,
+        "volume_status": volume_status,
+        "first_vs_rebreach": first_vs_rebreach,
+        "breach_lineage": lineage,
+        "htf_freshness": {
+            "4h": (freshness.get("4h") or {}).get("status") if isinstance(freshness.get("4h"), Mapping) else freshness.get("4h"),
+            "1h": (freshness.get("1h") or {}).get("status") if isinstance(freshness.get("1h"), Mapping) else freshness.get("1h"),
+        },
+        "geometry": {
+            "trigger": trigger,
+            "price": price,
+            "target": target,
+            "stop": stop,
+        },
+    }
