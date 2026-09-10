@@ -1,0 +1,158 @@
+name: PR605 guard and stale-ACK test amendment
+
+on:
+  push:
+    branches:
+      - fix/p0-exit-fill-timestamp-contract-20260910
+    paths:
+      - .github/workflows/_p0_605_amend_guard_tests.yml
+
+permissions:
+  contents: write
+
+jobs:
+  amend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/p0-exit-fill-timestamp-contract-20260910
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Apply exact amendment
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('ap/order_state_machine.py')
+          text = p.read_text()
+          old = '''        if (
+              kind.upper() == "EXIT"
+              and new_status in (OrderStatus.EXIT_PARTIAL_FILL, OrderStatus.EXIT_FILLED)
+              and effective_filled > 0
+          ):
+          '''
+          new = '''        if (
+              new_status in (OrderStatus.EXIT_PARTIAL_FILL, OrderStatus.EXIT_FILLED)
+              and effective_filled > 0
+          ):
+          '''
+          if old not in text:
+              old = old.replace('              ', '            ')
+              new = new.replace('              ', '            ')
+          assert text.count(old) == 1, f'expected one EXIT timestamp guard, found {text.count(old)}'
+          p.write_text(text.replace(old, new, 1))
+          PY
+
+          cat >> tests/test_p0_reconciler_exit_fill_timestamp_contract.py <<'PYTEST'
+
+
+          class _RowsConn:
+              def __init__(self, rows):
+                  self.rows = rows
+              def __enter__(self):
+                  return self
+              def __exit__(self, exc_type, exc, tb):
+                  return False
+              def execute(self, *args, **kwargs):
+                  return self
+              def fetchall(self):
+                  return self.rows
+
+
+          class _BrokerOrder:
+              def __init__(self, raw):
+                  self.raw = raw
+              def get_order(self, broker_order_id):
+                  return dict(self.raw)
+
+
+          def _install_stale_rows(monkeypatch, rows):
+              import ap.db as db
+              monkeypatch.setattr(db, "conn", lambda: _RowsConn(rows))
+              monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
+
+
+          def test_stale_ack_exit_fill_propagates_exact_timestamp(monkeypatch):
+              stale = order(submitted_ts=FILL_TS, updated_ts=FILL_TS, age_sec=30.0)
+              _install_stale_rows(monkeypatch, [stale])
+              o = FakeOSM(); r = rec(o); s = summary()
+              r.broker = _BrokerOrder(fill())
+              r._handle_stale_acknowledged_exits(s)
+              assert len(o.calls) == 1
+              _, status, k = o.calls[0]
+              assert status == "EXIT_FILLED"
+              assert k["broker_order_id"] == "145345180"
+              assert datetime.fromisoformat(k["filled_ts"]).utcoffset() is not None
+              assert s["orders_corrected"] == 1
+              assert s["orders_alerted"] == 0
+
+
+          def test_stale_ack_exit_fill_without_timestamp_holds_before_osm(monkeypatch):
+              stale = order(submitted_ts=FILL_TS, updated_ts=FILL_TS, age_sec=30.0)
+              _install_stale_rows(monkeypatch, [stale])
+              raw = fill(); raw.pop("last_fill_date")
+              o = FakeOSM(); r = rec(o); s = summary()
+              r.broker = _BrokerOrder(raw)
+              r._handle_stale_acknowledged_exits(s)
+              assert o.calls == []
+              assert s["orders_corrected"] == 0
+              assert s["orders_alerted"] == 1
+              assert "EXIT_FILL_TIMESTAMP_MISSING_OR_INVALID" in r.alerts[-1]
+
+
+          def test_osm_exit_specific_state_enforces_timestamp_even_if_kind_missing(monkeypatch):
+              o = APOrderStateMachine.__new__(APOrderStateMachine)
+              o.client_id = "jason-test@example.com"
+              o._get_order = lambda _: order(kind=None, status="EXIT_ACKNOWLEDGED")
+              events = []
+              o._emit_transition_event = lambda **k: events.append(k)
+              o._record_error = lambda *a, **k: None
+              monkeypatch.setattr(osm_mod, "run_with_retry", lambda fn: pytest.fail("DB write reached before timestamp guard"))
+              ok = o.transition(
+                  "exit-local-1",
+                  OrderStatus.EXIT_FILLED,
+                  broker_order_id="145345180",
+                  filled_qty=1,
+                  fill_price=1.19,
+                  filled_ts=None,
+              )
+              assert ok is False
+              assert events[-1]["decision"] == "HOLD"
+              assert events[-1]["reason_code"] == "EXIT_FILL_TIMESTAMP_MISSING_OR_INVALID"
+          PYTEST
+
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('tests/test_p0_reconciler_exit_fill_timestamp_contract.py')
+          text = p.read_text()
+          # YAML block indentation can only add spaces at the file boundary if this
+          # workflow is edited incorrectly. These sentinels make that fail closed.
+          assert text.count('def test_stale_ack_exit_fill_propagates_exact_timestamp') == 1
+          assert text.count('def test_stale_ack_exit_fill_without_timestamp_holds_before_osm') == 1
+          assert text.count('def test_osm_exit_specific_state_enforces_timestamp_even_if_kind_missing') == 1
+          p.write_text(text)
+          PY
+      - name: Compile
+        run: python -m py_compile ap/order_state_machine.py ap_reconciler.py tests/test_p0_reconciler_exit_fill_timestamp_contract.py
+      - name: Install focused dependencies
+        run: pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas
+      - name: Run focused tests
+        env:
+          DATABASE_URL: postgresql://test:test@127.0.0.1:5432/test
+        run: pytest -q tests/test_p0_reconciler_exit_fill_timestamp_contract.py
+      - name: Commit amendment only
+        shell: bash
+        run: |
+          git diff --check
+          git rm .github/workflows/_p0_605_amend_guard_tests.yml
+          git add ap/order_state_machine.py tests/test_p0_reconciler_exit_fill_timestamp_contract.py
+          git diff --cached --check
+          git diff --cached --name-only
+          git config user.name "angelprecision"
+          git config user.email "251777092+angelprecision@users.noreply.github.com"
+          git commit -m "P0 harden EXIT fill timestamp guard and stale-ACK tests"
+          git push origin HEAD:fix/p0-exit-fill-timestamp-contract-20260910
