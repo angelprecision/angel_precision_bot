@@ -133,6 +133,7 @@ def postgres_harness(monkeypatch):
     import ap.position_manager as pm_mod
     import ap.order_state_machine as osm_mod
     import ap.observability as obs_mod
+    import ap.fill_monitor as fm_mod
 
     harness = _PGHarness(connection, extras.RealDictCursor, _ConnWrapper)
     try:
@@ -236,6 +237,8 @@ def postgres_harness(monkeypatch):
         monkeypatch.setattr(osm_mod, "run_with_retry", lambda fn, **kw: fn())
         monkeypatch.setattr(obs_mod, "conn",           harness.conn)
         monkeypatch.setattr(obs_mod, "run_with_retry", lambda fn, **kw: fn())
+        monkeypatch.setattr(fm_mod,  "conn",           harness.conn)
+        monkeypatch.setattr(fm_mod,  "run_with_retry", lambda fn, **kw: fn())
 
         # Earlier P0 tests reload/patch ap.order_state_machine.  The class
         # collected by this module can therefore retain a different globals
@@ -651,6 +654,67 @@ class TestSept9AfterFix:
         assert pos_after_replay["quantity_remaining"] == 0
         assert float(pos_after_replay["exit_price"])  == pytest.approx(FILL_PRICE)
         assert pos_after_replay["exit_ts"]            == FILL_TS
+
+    @pytest.mark.parametrize("initial_exit_status", ["EXIT_SUBMITTED", "EXIT_ACKNOWLEDGED"])
+    def test_fill_monitor_terminal_partial_then_cancel_uses_real_osm(
+        self, postgres_harness, monkeypatch, initial_exit_status
+    ):
+        """
+        Production-shaped fill_monitor proof: a terminal broker cancel with
+        exec_qty>0 must first transition EXIT_SUBMITTED/ACKNOWLEDGED to
+        EXIT_PARTIAL_FILL. The real PostgreSQL OSM hook then converges the
+        position before CANCELED is allowed.
+        """
+        h = postgres_harness
+        _seed_sept9_shape(
+            h,
+            position_avg_fill=ENTRY_PRICE,
+            exit_status=initial_exit_status,
+        )
+
+        import ap.fill_monitor as fm_mod
+
+        broker = MagicMock()
+        broker.get_order.return_value = {
+            "status": "CANCELED",
+            "exec_quantity": FILL_QTY,
+            "quantity": FILL_QTY,
+            "avg_fill_price": FILL_PRICE,
+            "last_fill_date": FILL_TS.isoformat(),
+            "filled_at": FILL_TS.isoformat(),
+            "reason": "broker_cancel_after_execution",
+        }
+        _no_exit_engine(monkeypatch)
+        osm = APOrderStateMachine(CLIENT_ID)
+        pm = APPositionManager(CLIENT_ID)
+
+        fm_mod.process_pending_order(
+            broker,
+            _order(h),
+            osm=osm,
+            pm=pm,
+        )
+
+        pos = _pos(h)
+        order = _order(h)
+        assert pos["status"] == "CLOSED"
+        assert pos["quantity_remaining"] == 0
+        assert float(pos["exit_price"]) == pytest.approx(FILL_PRICE)
+        assert pos["exit_ts"] == FILL_TS
+        assert order["status"] == "CANCELED"
+        assert order["filled_qty"] == FILL_QTY
+        assert order["filled_ts"] == FILL_TS
+
+        proof = h.fetchone(
+            "SELECT * FROM proof_trades WHERE position_id=%s",
+            (POSITION_UUID,),
+        )
+        assert proof is not None
+        assert float(proof["exit_fill_price"]) == pytest.approx(FILL_PRICE)
+
+        broker.cancel_order.assert_not_called()
+        broker.replace_order.assert_not_called()
+        broker.submit_order.assert_not_called()
 
     def test_sept9_restart_reconciler_converges_existing_exit_filled(
         self, postgres_harness, monkeypatch
