@@ -241,10 +241,15 @@ def test_3_broker_ready_advance_blocks_terminal_cas():
 # Test 4 — TERMINAL_ALREADY_DURABLE: terminalize not called twice
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_4_terminal_already_durable_not_written_twice():
+def test_4_terminal_already_durable_not_written_twice(monkeypatch):
     """When resume returns TERMINAL_ALREADY_DURABLE, recovery must NOT
     call terminalize_deferred_retry_if_unchanged or terminalize_deferred_breach.
     """
+    # This historical deferred-retry row must reach the post-callback
+    # terminal reread; keep only this case independent of the wall-clock ET
+    # cutoff now that the shared autouse fixture is intentionally absent.
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+
     from ap_execution_core import APExecutionCore
 
     # Simulate a post-callback reread that finds status=EXPIRED

@@ -59,6 +59,12 @@ from ap_execution_core import APExecutionCore
 from ap_recovery import APStartupRecovery
 
 
+@pytest.fixture(autouse=True)
+def _open_deferred_retry_cutoff_for_lifecycle_tests(monkeypatch):
+    """Keep restart-handoff lifecycle tests inside the retry window."""
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared identity constants
 # ─────────────────────────────────────────────────────────────────────────────
@@ -346,13 +352,42 @@ def _build_harness(monkeypatch, *, due_meta_overrides=None, quote_bid=98.0,
     def _osm_claim_deferred_materialization(order_id, *, owner, new_generation,
                                              lease_until, trigger_crossed_at,
                                              trigger_price, observed_underlying_price,
-                                             signal_id, execution_mode, retry_attempt):
+                                             signal_id, execution_mode, retry_attempt,
+                                             generation=None,
+                                             advance_retry_attempt=True,
+                                             advance_after_market_truth=False):
         if str(order_id) != LOCAL_ORDER_ID:
             return False
-        row_store["row"]["meta"] = _materializing_meta(
-            generation=new_generation, attempt=retry_attempt,
+        current = dict(row_store["row"].get("meta") or {})
+        if advance_after_market_truth:
+            if (
+                current.get("materialization_owner") != owner
+                or current.get("materialization_generation") != new_generation
+                or current.get("materialization_market_truth_pending") is not True
+            ):
+                return False
+            current.update({
+                "retry_attempt": retry_attempt,
+                "breach_attempt_count": retry_attempt,
+                "materialization_attempts": retry_attempt,
+                "materialization_market_truth_pending": False,
+            })
+            row_store["row"]["meta"] = current
+            return True
+        claimed_attempt = (
+            retry_attempt
+            if advance_retry_attempt
+            else int(current.get("retry_attempt") or 0)
         )
-        row_store["row"]["meta"]["materialization_owner"] = owner
+        row_store["row"]["meta"] = _materializing_meta(
+            generation=new_generation, attempt=claimed_attempt,
+        )
+        row_store["row"]["meta"].update({
+            "materialization_owner": owner,
+            "current_owner": owner,
+            "watcher_token": owner,
+            "materialization_market_truth_pending": not advance_retry_attempt,
+        })
         return True
 
     real_osm.get_order = _osm_get_order
