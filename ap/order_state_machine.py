@@ -1,1 +1,1 @@
-__LOAD_FROM_FILE__:/workspace/out_osm.py
+@/workspace/out_osm.py
