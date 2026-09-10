@@ -322,18 +322,23 @@ def test_real_postgres_query_enforces_ownership_and_is_idempotent(
     monkeypatch.setattr(db_mod, "conn", harness.conn)
     monkeypatch.setattr(db_mod, "run_with_retry", lambda fn: fn())
 
-    finalizer_calls: list[dict] = []
+    convergence_calls: list[dict] = []
+    malformed_orders = {"exit-null-price", "exit-zero-qty"}
 
-    def _finalize(**kwargs):
-        finalizer_calls.append(dict(kwargs))
-        harness.mark_position_complete(kwargs["position_id"], CLIENT)
-        return True
+    def _converge(**kwargs):
+        convergence_calls.append(dict(kwargs))
+        if kwargs["exit_local_order_id"] in malformed_orders:
+            return SimpleNamespace(disposition="HOLD_ECONOMICS")
+        harness.mark_position_complete("pos-positive", CLIENT)
+        return SimpleNamespace(disposition="APPLIED_FULL")
 
-    finalizer = MagicMock(side_effect=_finalize)
+    converger = MagicMock(side_effect=_converge)
     monkeypatch.setattr(
         pm_mod,
         "APPositionManager",
-        lambda client_id: SimpleNamespace(close_position_from_exit_fill=finalizer),
+        lambda client_id: SimpleNamespace(
+            converge_position_from_durable_exit_order=converger
+        ),
     )
 
     broker = MagicMock()
@@ -341,15 +346,25 @@ def test_real_postgres_query_enforces_ownership_and_is_idempotent(
     summary = _empty_summary(CLIENT)
     rec._heal_exit_filled_positions_from_orders(summary)
 
-    assert summary["errors"] == []
+    assert summary["errors"] == [
+        "reconciler_exit_fill_hold_economics",
+        "reconciler_exit_fill_hold_economics",
+    ]
     assert summary["positions_corrected"] == 1
-    assert [call["position_id"] for call in finalizer_calls] == ["pos-positive"]
-    assert finalizer_calls[0]["exit_price"] == pytest.approx(0.99)
-    assert finalizer_calls[0]["filled_qty"] == 3
+    assert {call["exit_local_order_id"] for call in convergence_calls} == {
+        "bot-exit-positive",
+        "exit-null-price",
+        "exit-zero-qty",
+    }
+    assert all(call["expected_execution_mode"] == "live" for call in convergence_calls)
 
     # The production row shape includes o.meta and the real wrapper returns it.
-    assert len(harness.returned_rows) == 1
-    selected_row = harness.returned_rows[0]
+    selected_rows = [
+        row for row in harness.returned_rows
+        if row["local_order_id"] == "bot-exit-positive"
+    ]
+    assert len(selected_rows) == 1
+    selected_row = selected_rows[0]
     assert selected_row["local_order_id"] == "bot-exit-positive"
     assert selected_row["position_id"] == "pos-positive"
     assert float(selected_row["fill_price"]) == pytest.approx(0.99)
@@ -360,25 +375,27 @@ def test_real_postgres_query_enforces_ownership_and_is_idempotent(
     assert selected_row["order_execution_mode"] == "live"
 
     query, params = harness.executions[0]
-    # Finalizer updates use the direct connection so the bound reconciler query
-    # remains easy to inspect.
     compact_query = " ".join(query.split())
     assert "o.meta" in compact_query
     assert "COALESCE(o.local_order_id, '') NOT LIKE %s" in compact_query
     assert "LOWER(TRIM(COALESCE(p.execution_mode, ''))) = %s" in compact_query
-    assert "NULLIF(TRIM(COALESCE(o.execution_mode, '')), '') IS NULL" in compact_query
+    assert "LOWER(TRIM(COALESCE(o.execution_mode, ''))) = %s" in compact_query
     assert params == (CLIENT, "external-exit:%", "live", "live")
 
     # No broker mutation surface is touched by this database-only repair.
     broker.submit_order.assert_not_called()
     broker.cancel_order.assert_not_called()
 
-    # A completed position no longer matches the SQL finalization-gap fence.
+    # The successfully projected row no longer matches discovery. Malformed
+    # durable fills remain discoverable and continue to alert without mutation.
     second_summary = _empty_summary(CLIENT)
     rec._heal_exit_filled_positions_from_orders(second_summary)
-    assert second_summary["errors"] == []
+    assert second_summary["errors"] == [
+        "reconciler_exit_fill_hold_economics",
+        "reconciler_exit_fill_hold_economics",
+    ]
     assert second_summary["positions_corrected"] == 0
-    assert len(finalizer_calls) == 1
+    assert len(convergence_calls) == 5
 
 
 @pytest.mark.parametrize(
@@ -386,10 +403,6 @@ def test_real_postgres_query_enforces_ownership_and_is_idempotent(
     [
         ("live", "live", "live", "live-explicit"),
         ("paper", "paper", "paper", "paper-explicit"),
-        ("live", "live", None, "live-null-order-mode"),
-        ("live", "live", "", "live-empty-order-mode"),
-        ("paper", "paper", None, "paper-null-order-mode"),
-        ("paper", "paper", "", "paper-empty-order-mode"),
     ],
 )
 def test_real_postgres_positive_execution_mode_matrix(
@@ -400,7 +413,7 @@ def test_real_postgres_positive_execution_mode_matrix(
     order_mode,
     case_id,
 ):
-    """Matching LIVE/PAPER ownership heals, including legacy blank EXIT order mode."""
+    """Matching LIVE/PAPER ownership is eligible for durable convergence."""
     harness = postgres_harness
     position_id = f"pos-{case_id}"
     local_order_id = f"exit-{case_id}"
@@ -417,18 +430,20 @@ def test_real_postgres_positive_execution_mode_matrix(
     monkeypatch.setattr(db_mod, "conn", harness.conn)
     monkeypatch.setattr(db_mod, "run_with_retry", lambda fn: fn())
 
-    finalizer_calls: list[dict] = []
+    convergence_calls: list[dict] = []
 
-    def _finalize(**kwargs):
-        finalizer_calls.append(dict(kwargs))
-        harness.mark_position_complete(kwargs["position_id"], CLIENT)
-        return True
+    def _converge(**kwargs):
+        convergence_calls.append(dict(kwargs))
+        harness.mark_position_complete(position_id, CLIENT)
+        return SimpleNamespace(disposition="APPLIED_FULL")
 
-    finalizer = MagicMock(side_effect=_finalize)
+    converger = MagicMock(side_effect=_converge)
     monkeypatch.setattr(
         pm_mod,
         "APPositionManager",
-        lambda client_id: SimpleNamespace(close_position_from_exit_fill=finalizer),
+        lambda client_id: SimpleNamespace(
+            converge_position_from_durable_exit_order=converger
+        ),
     )
 
     broker = MagicMock()
@@ -438,9 +453,8 @@ def test_real_postgres_positive_execution_mode_matrix(
 
     assert summary["errors"] == []
     assert summary["positions_corrected"] == 1
-    assert [call["position_id"] for call in finalizer_calls] == [position_id]
-    assert finalizer_calls[0]["exit_price"] == pytest.approx(0.99)
-    assert finalizer_calls[0]["filled_qty"] == 3
+    assert [call["exit_local_order_id"] for call in convergence_calls] == [local_order_id]
+    assert convergence_calls[0]["expected_execution_mode"] == reconciler_mode
 
     assert len(harness.returned_rows) == 1
     selected_row = harness.returned_rows[0]
@@ -451,7 +465,7 @@ def test_real_postgres_positive_execution_mode_matrix(
     query, params = harness.executions[0]
     compact_query = " ".join(query.split())
     assert "LOWER(TRIM(COALESCE(p.execution_mode, ''))) = %s" in compact_query
-    assert "NULLIF(TRIM(COALESCE(o.execution_mode, '')), '') IS NULL" in compact_query
+    assert "LOWER(TRIM(COALESCE(o.execution_mode, ''))) = %s" in compact_query
     assert params == (
         CLIENT,
         "external-exit:%",
@@ -461,6 +475,54 @@ def test_real_postgres_positive_execution_mode_matrix(
 
     broker.submit_order.assert_not_called()
     broker.cancel_order.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("reconciler_mode", "position_mode", "order_mode", "case_id"),
+    [
+        ("live", "live", None, "live-null-order-mode"),
+        ("live", "live", "", "live-empty-order-mode"),
+        ("paper", "paper", None, "paper-null-order-mode"),
+        ("paper", "paper", "", "paper-empty-order-mode"),
+    ],
+)
+def test_real_postgres_blank_exit_execution_mode_holds(
+    postgres_harness,
+    monkeypatch,
+    reconciler_mode,
+    position_mode,
+    order_mode,
+    case_id,
+):
+    """A blank EXIT mode is not enough authority for a money-state repair."""
+    harness = postgres_harness
+    position_id = f"pos-{case_id}"
+    local_order_id = f"exit-{case_id}"
+    harness.insert_position(position_id, CLIENT, execution_mode=position_mode)
+    harness.insert_order(local_order_id, position_id, execution_mode=order_mode)
+
+    import ap.db as db_mod
+    import ap.position_manager as pm_mod
+
+    monkeypatch.setattr(db_mod, "conn", harness.conn)
+    monkeypatch.setattr(db_mod, "run_with_retry", lambda fn: fn())
+    converger = MagicMock()
+    monkeypatch.setattr(
+        pm_mod,
+        "APPositionManager",
+        lambda client_id: SimpleNamespace(
+            converge_position_from_durable_exit_order=converger
+        ),
+    )
+
+    rec = _reconciler(broker=MagicMock(), execution_mode=reconciler_mode)
+    summary = _empty_summary(CLIENT)
+    rec._heal_exit_filled_positions_from_orders(summary)
+
+    assert summary["positions_corrected"] == 0
+    assert summary["errors"] == []
+    converger.assert_not_called()
+    assert harness.returned_rows == []
 
 
 def test_application_fence_rechecks_returned_metadata_and_preserves_bound_pattern(monkeypatch):
@@ -493,20 +555,22 @@ def test_application_fence_rechecks_returned_metadata_and_preserves_bound_patter
     def _conn():
         yield _Cursor()
 
-    finalizer = MagicMock()
+    converger = MagicMock()
     monkeypatch.setattr(db_mod, "conn", lambda: _conn())
     monkeypatch.setattr(db_mod, "run_with_retry", lambda fn: fn())
     monkeypatch.setattr(
         pm_mod,
         "APPositionManager",
-        lambda client_id: SimpleNamespace(close_position_from_exit_fill=finalizer),
+        lambda client_id: SimpleNamespace(
+            converge_position_from_durable_exit_order=converger
+        ),
     )
 
     rec = _reconciler()
     summary = _empty_summary(CLIENT)
     rec._heal_exit_filled_positions_from_orders(summary)
 
-    finalizer.assert_not_called()
+    converger.assert_not_called()
     assert summary["errors"] == []
     query, params = executions[0]
     assert "o.meta" in query
