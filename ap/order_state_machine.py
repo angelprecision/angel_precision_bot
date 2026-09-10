@@ -70,6 +70,22 @@ except ImportError:
 from ap.utils import now_utc_iso
 
 
+def _persisted_empty(value) -> bool:
+    """Treat only NULL/blank text as absent durable authority."""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _valid_dispatch_timestamp(value) -> bool:
+    """Require a non-empty timezone-aware durable dispatch timestamp."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    return parsed.tzinfo is not None
+
+
 def _normalize_broker_submitted_ts(value) -> str | None:
     """Normalize an explicitly broker-sourced acceptance timestamp.
 
@@ -2341,6 +2357,7 @@ class APOrderStateMachine:
         materialization_generation: int,
         trigger_generation: int,
         claim_owner: str,
+        dispatch_attempt_id: str | None = None,
         watcher_token: str | None = None,
         watcher_owner: str | None = None,
         trigger_cursor: str | None = None,
@@ -2370,6 +2387,17 @@ class APOrderStateMachine:
         ):
             return False
         if execution_mode not in {"live", "paper"} or side not in {"CALL", "PUT"}:
+            return False
+        if dispatch_attempt_id is None:
+            # Backward-compatible callers still receive a unique durable
+            # attempt identity.  The logical owner is never used as the
+            # uniqueness key.
+            dispatch_attempt_id = uuid.uuid4().hex
+        if (
+            not isinstance(dispatch_attempt_id, str)
+            or not dispatch_attempt_id
+            or dispatch_attempt_id != dispatch_attempt_id.strip()
+        ):
             return False
         for optional_authority in (watcher_token, watcher_owner, trigger_cursor):
             if optional_authority is not None and (
@@ -2570,28 +2598,98 @@ class APOrderStateMachine:
                 if existing_owner is not None and (
                     not isinstance(existing_owner, str)
                     or not existing_owner.strip()
-                    or existing_owner != claim_owner
                 ):
                     return False
                 existing_generation = metadata.get("recovery_trigger_dispatch_generation")
                 existing_trigger_generation = metadata.get(
                     "recovery_trigger_dispatch_trigger_generation"
                 )
-                if existing_generation is not None and (
-                    _strict_generation(existing_generation) != candidate_generation
-                ):
+                existing_attempt = metadata.get("recovery_trigger_dispatch_attempt_id")
+                existing_claimed_at = metadata.get(
+                    "recovery_trigger_dispatch_claimed_at"
+                )
+                existing_state = str(
+                    metadata.get("recovery_trigger_dispatch_state") or ""
+                ).strip().upper()
+                terminal_dispatch_states = {"CONSUMED", "COMPLETED", "AMBIGUOUS"}
+                if existing_attempt is not None:
+                    if (
+                        not isinstance(existing_owner, str)
+                        or not existing_owner.strip()
+                        or not isinstance(existing_attempt, str)
+                        or not existing_attempt.strip()
+                        or not _valid_dispatch_timestamp(existing_claimed_at)
+                        or existing_state not in {
+                            "CLAIMED", "CALLBACK_STARTED", *terminal_dispatch_states
+                        }
+                    ):
+                        return False
+                    prior_generation = _strict_generation(existing_generation)
+                    if prior_generation is None:
+                        return False
+                    prior_trigger_generation = _strict_generation(
+                        existing_trigger_generation
+                    )
+                    if (
+                        prior_trigger_generation is None
+                        or prior_generation != prior_trigger_generation
+                    ):
+                        return False
+                    # Claim-once for a trigger generation.  A completed,
+                    # consumed, or ambiguous old attempt may be replaced only
+                    # after the durable trigger generation advances.
+                    if (
+                        prior_trigger_generation == candidate_trigger_generation
+                        or existing_state not in terminal_dispatch_states
+                    ):
+                        return False
+                elif existing_owner is not None and existing_owner.strip():
+                    # Legacy deterministic-owner claims have no attempt token;
+                    # do not overwrite them because their callback cardinality
+                    # cannot be proven.
                     return False
-                if existing_trigger_generation is not None and (
-                    _strict_generation(existing_trigger_generation)
-                    != candidate_trigger_generation
+                elif any(
+                    value is not None
+                    for value in (
+                        existing_generation,
+                        existing_trigger_generation,
+                        existing_claimed_at,
+                        metadata.get("recovery_trigger_dispatch_state"),
+                    )
                 ):
+                    # A partial dispatch marker is not safe to reinterpret as
+                    # an unclaimed row.  Missing attempt identity/lease data
+                    # makes callback cardinality unknowable.
                     return False
+                if existing_generation is not None:
+                    prior_generation = _strict_generation(existing_generation)
+                    if prior_generation is None:
+                        return False
+                    if (
+                        not existing_attempt
+                        or existing_state not in terminal_dispatch_states
+                    ) and prior_generation != candidate_generation:
+                        return False
+                if existing_trigger_generation is not None:
+                    prior_trigger_generation = _strict_generation(
+                        existing_trigger_generation
+                    )
+                    if prior_trigger_generation is None:
+                        return False
+                    if (
+                        not existing_attempt
+                        or existing_state not in terminal_dispatch_states
+                    ) and prior_trigger_generation != candidate_trigger_generation:
+                        return False
                 patch = json.dumps(
                     {
                         "recovery_trigger_dispatch_owner": claim_owner,
+                        "recovery_trigger_dispatch_attempt_id": dispatch_attempt_id,
+                        "recovery_trigger_dispatch_state": "CLAIMED",
                         "recovery_trigger_dispatch_generation": candidate_generation,
                         "recovery_trigger_dispatch_trigger_generation": candidate_trigger_generation,
                         "recovery_trigger_dispatch_claimed_at": now_utc_iso(),
+                        "recovery_trigger_dispatch_finished_at": None,
                     }
                 )
                 _update_sql = (
@@ -2599,34 +2697,28 @@ class APOrderStateMachine:
                     "updated_ts=NOW() WHERE local_order_id=%s AND client_id=%s "
                     "AND kind='ENTRY' AND status='PENDING_TRIGGER' "
                     "AND LOWER(TRIM(COALESCE(execution_mode,'')))=%s "
-                    "AND COALESCE(meta->>'recovery_trigger_dispatch_owner','') IN ('', %s)"
+                    "AND ("
+                    "COALESCE(meta->>'recovery_trigger_dispatch_attempt_id','')='' "
+                    "OR ("
+                    "COALESCE(meta->>'recovery_trigger_dispatch_state','') IN "
+                    "('CONSUMED','COMPLETED','AMBIGUOUS') "
+                    "AND COALESCE(meta->>'recovery_trigger_dispatch_trigger_generation','')<>%s"
+                    ")"
+                    ")"
                 )
                 _update_params: list[object] = [
                     patch,
                     local_order_id,
                     client_id,
                     execution_mode,
-                    claim_owner,
+                    str(candidate_trigger_generation),
                 ]
-                # The Python proof above covers top-level durable columns as
-                # well as metadata aliases. Add JSONB predicates only for
-                # authorities actually owned by the database row; otherwise a
-                # valid top-level-only row would fail closed merely because
-                # this schema variant has no JSONB generation copy.
-                if any(
-                    "materialization_generation" in source
-                    for source in _row_metadata_sources
-                ):
-                    _update_sql += (
-                        " AND COALESCE(meta->>'materialization_generation','')=%s"
-                    )
-                    _update_params.append(str(candidate_generation))
-                if any(
-                    "trigger_generation" in source
-                    for source in _row_metadata_sources
-                ):
-                    _update_sql += " AND COALESCE(meta->>'trigger_generation','')=%s"
-                    _update_params.append(str(candidate_trigger_generation))
+                # The Python proof above covers every top-level and metadata
+                # generation authority while this exact row is locked.  Do
+                # not add a meta-only SQL predicate here: a valid row may
+                # store its generation in the top-level columns or the
+                # secondary ``metadata`` alias, and the row lock already
+                # serializes the proof with this claim update.
                 result = connection.execute(_update_sql, tuple(_update_params))
                 rowcount = getattr(result, "rowcount", getattr(connection, "rowcount", None))
                 return bool(rowcount and rowcount > 0)
@@ -2638,6 +2730,411 @@ class APOrderStateMachine:
                 exc,
             )
             return False
+
+    def _transition_recovery_trigger_dispatch(
+        self,
+        *,
+        local_order_id: str,
+        signal_id: str,
+        canonical_signal_id: str,
+        client_id: str,
+        execution_mode: str,
+        ticker: str,
+        side: str,
+        materialization_generation: int,
+        trigger_generation: int,
+        dispatch_attempt_id: str,
+        expected_state: str,
+        next_state: str,
+    ) -> bool:
+        """Atomically advance one claim-once callback state.
+
+        The claim token and trigger generation are both required.  This helper
+        is used before and after the callback so a reconstructed process can
+        distinguish CLAIMED/CALLBACK_STARTED/terminal states without relying on
+        process-local locks or watcher registries.
+        """
+        required = (
+            local_order_id,
+            signal_id,
+            canonical_signal_id,
+            client_id,
+            execution_mode,
+            ticker,
+            side,
+            dispatch_attempt_id,
+        )
+        if any(
+            not isinstance(value, str) or not value or value != value.strip()
+            for value in required
+        ):
+            return False
+        if execution_mode not in {"live", "paper"} or side not in {"CALL", "PUT"}:
+            return False
+
+        def _strict_generation(raw) -> int | None:
+            if isinstance(raw, bool):
+                return None
+            if isinstance(raw, int):
+                parsed = raw
+            elif isinstance(raw, str) and re.fullmatch(r"[0-9]+", raw):
+                parsed = int(raw)
+            else:
+                return None
+            return parsed if parsed > 0 else None
+
+        materialization = _strict_generation(materialization_generation)
+        trigger = _strict_generation(trigger_generation)
+        if materialization is None or trigger is None or materialization != trigger:
+            return False
+
+        def _metadata(row: dict) -> dict | None:
+            """Merge every durable metadata alias without choosing silently."""
+            merged: dict = {}
+            for key in ("meta", "metadata"):
+                if key not in row:
+                    continue
+                raw = row.get(key)
+                if raw is None:
+                    continue
+                if isinstance(raw, dict):
+                    parsed = dict(raw)
+                elif isinstance(raw, str) and raw.strip():
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:
+                        return None
+                    if not isinstance(parsed, dict):
+                        return None
+                else:
+                    return None
+                for name, value in parsed.items():
+                    if name in merged and merged[name] != value:
+                        return None
+                    merged[name] = value
+            return merged
+
+        def _coherent_string(row: dict, metadata: dict, aliases: tuple[str, ...]):
+            found = []
+            for container in (row, metadata):
+                for alias in aliases:
+                    if alias in container:
+                        raw = container.get(alias)
+                        if (
+                            not isinstance(raw, str)
+                            or not raw
+                            or raw != raw.strip()
+                        ):
+                            return None
+                        found.append(raw)
+            if not found or len(set(found)) != 1:
+                return None
+            return found[0]
+
+        try:
+            with conn() as connection:
+                cursor = connection.execute(
+                    "SELECT * FROM orders WHERE local_order_id=%s AND client_id=%s "
+                    "AND kind='ENTRY' FOR UPDATE",
+                    (local_order_id, client_id),
+                )
+                fetchone = getattr(cursor, "fetchone", None)
+                if not callable(fetchone):
+                    return False
+                row = fetchone()
+                if not isinstance(row, dict):
+                    return False
+                metadata = _metadata(row)
+                if metadata is None:
+                    return False
+                expected_fields = (
+                    (("local_order_id",), local_order_id),
+                    (("signal_id",), signal_id),
+                    (("canonical_signal_id",), canonical_signal_id),
+                    (("client_id", "client_email"), client_id),
+                    (("execution_mode", "mode"), execution_mode),
+                    (("ticker", "symbol"), ticker),
+                    (("side", "direction"), side),
+                )
+                for aliases, expected in expected_fields:
+                    if _coherent_string(row, metadata, aliases) != expected:
+                        return False
+                if (
+                    _strict_generation(row.get("materialization_generation", metadata.get("materialization_generation")))
+                    != materialization
+                    or _strict_generation(row.get("trigger_generation", metadata.get("trigger_generation")))
+                    != trigger
+                ):
+                    return False
+                if metadata.get("recovery_trigger_dispatch_attempt_id") != dispatch_attempt_id:
+                    return False
+                if str(metadata.get("recovery_trigger_dispatch_state") or "").strip().upper() != expected_state:
+                    return False
+                if not _valid_dispatch_timestamp(
+                    metadata.get("recovery_trigger_dispatch_claimed_at")
+                ):
+                    return False
+                if expected_state == "CLAIMED" and (
+                    str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER"
+                    or not _persisted_empty(row.get("broker_order_id"))
+                    or not _persisted_empty(row.get("submitted_ts"))
+                ):
+                    return False
+                patch = json.dumps(
+                    {
+                        "recovery_trigger_dispatch_state": next_state,
+                        "recovery_trigger_dispatch_finished_at": now_utc_iso(),
+                    }
+                )
+                result = connection.execute(
+                    "UPDATE orders SET meta=COALESCE(meta,'{}'::jsonb) || %s::jsonb, "
+                    "updated_ts=NOW() WHERE local_order_id=%s AND client_id=%s "
+                    "AND kind='ENTRY' AND meta->>'recovery_trigger_dispatch_attempt_id'=%s "
+                    "AND meta->>'recovery_trigger_dispatch_state'=%s "
+                    "AND meta->>'recovery_trigger_dispatch_generation'=%s "
+                    "AND meta->>'recovery_trigger_dispatch_trigger_generation'=%s",
+                    (
+                        patch,
+                        local_order_id,
+                        client_id,
+                        dispatch_attempt_id,
+                        expected_state,
+                        str(materialization),
+                        str(trigger),
+                    ),
+                )
+                rowcount = getattr(result, "rowcount", getattr(connection, "rowcount", None))
+                return bool(rowcount and rowcount > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] recovery trigger dispatch transition failed local_order_id=%s "
+                "state=%s->%s: %s",
+                self.client_id,
+                local_order_id,
+                expected_state,
+                next_state,
+                exc,
+            )
+            return False
+
+    def ensure_recovery_trigger_generation(
+        self,
+        *,
+        local_order_id: str,
+        signal_id: str,
+        canonical_signal_id: str,
+        client_id: str,
+        execution_mode: str,
+        ticker: str,
+        side: str,
+    ) -> tuple[bool, int | None, str]:
+        """Assign the first durable trigger generation for a legacy arm.
+
+        Ordinary pre-breach recovery rows historically had no trigger
+        generation because no trigger had been confirmed yet.  That is a
+        separate lifecycle class from recovered TRIGGER_READY rows: the first
+        confirmed breach may create generation ``1`` exactly once while the
+        selected row is locked.  Once either generation authority exists, an
+        incomplete, malformed, or conflicting pair is held; this method never
+        repairs an ambiguous existing authority.
+        """
+        required = (
+            local_order_id,
+            signal_id,
+            canonical_signal_id,
+            client_id,
+            execution_mode,
+            ticker,
+            side,
+        )
+        if any(
+            not isinstance(value, str) or not value or value != value.strip()
+            for value in required
+        ):
+            return False, None, "recovery_generation_identity_invalid"
+        if execution_mode not in {"live", "paper"} or side not in {"CALL", "PUT"}:
+            return False, None, "recovery_generation_identity_invalid"
+
+        def _strict_generation(raw) -> int | None:
+            if isinstance(raw, bool):
+                return None
+            if isinstance(raw, int):
+                parsed = raw
+            elif isinstance(raw, str) and re.fullmatch(r"[0-9]+", raw):
+                parsed = int(raw)
+            else:
+                return None
+            return parsed if parsed > 0 else None
+
+        def _metadata_sources(row: dict) -> list[dict] | None:
+            sources: list[dict] = []
+            for key in ("meta", "metadata"):
+                if key not in row:
+                    continue
+                raw = row.get(key)
+                if raw is None:
+                    continue
+                if isinstance(raw, dict):
+                    sources.append(dict(raw))
+                    continue
+                if not isinstance(raw, str) or not raw.strip():
+                    return None
+                try:
+                    parsed = json.loads(raw)
+                except Exception:
+                    return None
+                if not isinstance(parsed, dict):
+                    return None
+                sources.append(dict(parsed))
+            return sources
+
+        def _coherent_string(row: dict, sources: list[dict], aliases: tuple[str, ...]):
+            values = []
+            for container in (row, *sources):
+                for alias in aliases:
+                    if alias not in container or container.get(alias) is None:
+                        continue
+                    raw = container.get(alias)
+                    if not isinstance(raw, str) or not raw or raw != raw.strip():
+                        return None
+                    values.append(raw)
+            if not values or len(set(values)) != 1:
+                return None
+            return values[0]
+
+        def _generation_values(
+            row: dict, sources: list[dict], aliases: tuple[str, ...]
+        ) -> tuple[list[int], bool]:
+            raw_values = []
+            for container in (row, *sources):
+                for alias in aliases:
+                    if alias not in container or container.get(alias) is None:
+                        continue
+                    raw_values.append(container.get(alias))
+            if not raw_values:
+                return [], True
+            parsed = [_strict_generation(value) for value in raw_values]
+            if any(value is None for value in parsed) or len(set(parsed)) != 1:
+                return [], False
+            return [parsed[0]], True
+
+        try:
+            with conn() as connection:
+                cursor = connection.execute(
+                    "SELECT * FROM orders WHERE local_order_id=%s AND client_id=%s "
+                    "AND kind='ENTRY' FOR UPDATE",
+                    (local_order_id, client_id),
+                )
+                fetchone = getattr(cursor, "fetchone", None)
+                if not callable(fetchone):
+                    return False, None, "recovery_generation_row_unavailable"
+                row = fetchone()
+                if not isinstance(row, dict):
+                    return False, None, "recovery_generation_row_unavailable"
+                if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+                    return False, None, "recovery_generation_row_not_pending_trigger"
+                if not _persisted_empty(row.get("broker_order_id")) or not _persisted_empty(
+                    row.get("submitted_ts")
+                ):
+                    return False, None, "recovery_generation_broker_handoff"
+                sources = _metadata_sources(row)
+                if sources is None:
+                    return False, None, "recovery_generation_metadata_malformed"
+                expected_fields = (
+                    (("local_order_id",), local_order_id),
+                    (("signal_id",), signal_id),
+                    (("canonical_signal_id",), canonical_signal_id),
+                    (("client_id", "client_email"), client_id),
+                    (("execution_mode", "mode"), execution_mode),
+                    (("ticker", "symbol"), ticker),
+                    (("side", "direction"), side),
+                )
+                for aliases, expected in expected_fields:
+                    if _coherent_string(row, sources, aliases) != expected:
+                        return False, None, "recovery_generation_identity_mismatch"
+
+                materialization, materialization_ok = _generation_values(
+                    row, sources, ("materialization_generation", "generation")
+                )
+                trigger, trigger_ok = _generation_values(
+                    row, sources, ("trigger_generation",)
+                )
+                if not materialization_ok or not trigger_ok:
+                    return False, None, "recovery_generation_authority_malformed"
+                if materialization or trigger:
+                    if not materialization or not trigger:
+                        return False, None, "recovery_generation_authority_incomplete"
+                    if materialization[0] != trigger[0]:
+                        return False, None, "recovery_generation_authority_conflict"
+                    return True, materialization[0], "recovery_generation_already_present"
+
+                generation = 1
+                patch = json.dumps(
+                    {
+                        "materialization_generation": generation,
+                        "trigger_generation": generation,
+                        "recovery_trigger_generation_assigned_at": now_utc_iso(),
+                        "recovery_trigger_generation_assignment": "legacy_pre_breach_confirmation",
+                    }
+                )
+                # Some deployments expose the generation authorities as
+                # top-level columns while the production schema stores them
+                # only in ``meta``.  If those columns are present in the
+                # locked row, assign them in the same transaction; otherwise
+                # the subsequent final claim would see a permanently
+                # inconsistent alias pair (top-level NULL, meta=1).
+                assignments: list[str] = []
+                assignment_params: list[object] = []
+                for column in ("materialization_generation", "trigger_generation"):
+                    if column in row:
+                        assignments.append(f"{column}=%s")
+                        assignment_params.append(generation)
+                assignments.append("meta=COALESCE(meta,'{}'::jsonb) || %s::jsonb")
+                assignment_params.append(patch)
+                assignments.append("updated_ts=NOW()")
+                result = connection.execute(
+                    "UPDATE orders SET " + ", ".join(assignments)
+                    + " WHERE local_order_id=%s AND client_id=%s "
+                    + "AND kind='ENTRY' AND status='PENDING_TRIGGER' "
+                    + "AND COALESCE(broker_order_id,'')='' AND submitted_ts IS NULL",
+                    tuple(assignment_params + [local_order_id, client_id]),
+                )
+                rowcount = getattr(result, "rowcount", getattr(connection, "rowcount", None))
+                if not rowcount or rowcount <= 0:
+                    return False, None, "recovery_generation_assignment_cas_miss"
+                return True, generation, "recovery_generation_assigned"
+        except Exception as exc:
+            log.warning(
+                "[%s] recovery trigger generation assignment failed local_order_id=%s: %s",
+                self.client_id,
+                local_order_id,
+                exc,
+            )
+            return False, None, f"recovery_generation_assignment_failed:{type(exc).__name__}"
+
+    def start_recovery_trigger_dispatch(self, **kwargs) -> bool:
+        """Durably mark a claimed recovery callback as started."""
+        return self._transition_recovery_trigger_dispatch(
+            **kwargs,
+            expected_state="CLAIMED",
+            next_state="CALLBACK_STARTED",
+        )
+
+    def finish_recovery_trigger_dispatch(self, *, outcome: str, **kwargs) -> bool:
+        """Consume a recovery trigger exactly once after callback return.
+
+        ``outcome`` is intentionally terminal for this trigger attempt.  A
+        KEEP_WATCHER response therefore consumes the current trigger cursor;
+        another callback requires a later durable trigger generation.
+        """
+        next_state = str(outcome or "").strip().upper()
+        if next_state not in {"CONSUMED", "COMPLETED", "AMBIGUOUS"}:
+            return False
+        return self._transition_recovery_trigger_dispatch(
+            **kwargs,
+            expected_state="CALLBACK_STARTED",
+            next_state=next_state,
+        )
 
     def retire_unsubmitted_exit_intent(self, local_order_id: str, *, last_error: str) -> bool:
         """Atomically retire one EXIT_REQUESTED row only if no submit evidence exists."""

@@ -36,6 +36,1000 @@ import pytest
 os.environ.setdefault("DATABASE_URL", "postgresql://mock/mock")
 
 
+class TestPR580PostgresRecoveryContract:
+    """Production-shaped PostgreSQL proof for the PR #580 final contract.
+
+    These tests deliberately use the real startup reseed caller, the real
+    watcher admission bridge, and the real OSM row-lock/CAS methods.  The
+    disposable schema is only test plumbing; correctness comes from the
+    PostgreSQL transaction and durable ``orders.meta`` state, never from a
+    process-local registry or lock.
+    """
+
+    @staticmethod
+    def _recovery_sig(**overrides):
+        import uuid
+
+        signal_id = str(overrides.pop("signal_id", uuid.uuid4()))
+        signal = {
+            "signal_id": signal_id,
+            "canonical_signal_id": overrides.pop(
+                "canonical_signal_id", signal_id
+            ),
+            "ticker": "AAPL",
+            "side": "CALL",
+            "score": 70.0,
+            "entry_price": 200.0,
+            "entry_trigger": 200.0,
+            "stop_price": 198.0,
+            "target_price": 205.0,
+            "plan_id": f"plan-{signal_id[:8]}",
+            "local_order_id": overrides.pop(
+                "local_order_id", f"lo-{signal_id[:8]}"
+            ),
+            "client_id": "jason@example.com",
+            "execution_mode": "live",
+            "watcher_token": "tok-test",
+            "materialization_generation": 1,
+            "trigger_generation": 1,
+            "contract_symbol": "DEFERRED:AAPL",
+            "pattern": "2-1-2",
+            "prior_day_high": 200.10,
+            "prior_day_low": 197.90,
+            "timeframe": "1h",
+            "strategy_type": "continuation",
+            "contract_deferred": True,
+            "trigger": {"entry": 200.0, "stop": 198.0, "pt1": 205.0},
+            "metadata": {
+                "canonical_signal_id": signal_id,
+                "client_id": "jason@example.com",
+                "execution_mode": "live",
+                "materialization_generation": 1,
+                "trigger_generation": 1,
+            },
+        }
+        signal.update(overrides)
+        return signal
+
+    @pytest.fixture
+    def pg(self, monkeypatch):
+        database_url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL", "")
+        if not database_url:
+            pytest.skip("disposable PostgreSQL URL not configured")
+
+        import uuid
+
+        import psycopg2
+        import psycopg2.extras
+
+        import ap.db as db_module
+        import ap.order_state_machine as osm_module
+
+        schema = f"pr580_contract_{uuid.uuid4().hex}"
+        admin = psycopg2.connect(database_url)
+        admin.autocommit = True
+        try:
+            with admin.cursor() as cursor:
+                cursor.execute(f'CREATE SCHEMA "{schema}"')
+                cursor.execute(
+                    f"""
+                    CREATE TABLE "{schema}".orders (
+                        local_order_id TEXT PRIMARY KEY,
+                        client_id TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        broker_order_id TEXT,
+                        submitted_ts TIMESTAMPTZ,
+                        filled_ts TIMESTAMPTZ,
+                        execution_mode TEXT NOT NULL,
+                        signal_id TEXT,
+                        canonical_signal_id TEXT,
+                        ticker TEXT,
+                        symbol TEXT,
+                        side TEXT,
+                        direction TEXT,
+                        plan_id TEXT,
+                        contract TEXT,
+                        qty INTEGER,
+                        score DOUBLE PRECISION,
+                        tier TEXT,
+                        pattern TEXT,
+                        timeframe TEXT,
+                        trigger_price DOUBLE PRECISION,
+                        stop_underlying DOUBLE PRECISION,
+                        target_underlying DOUBLE PRECISION,
+                        materialization_generation TEXT,
+                        trigger_generation TEXT,
+                        meta JSONB,
+                        metadata JSONB,
+                        created_ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    f"""
+                    CREATE TABLE "{schema}".trade_queue (
+                        id BIGSERIAL PRIMARY KEY,
+                        client_id TEXT NOT NULL,
+                        signal_id TEXT NOT NULL,
+                        status TEXT,
+                        last_error TEXT,
+                        payload JSONB,
+                        created_ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+
+            def _open_connection():
+                connection = psycopg2.connect(database_url)
+                cursor = connection.cursor(
+                    cursor_factory=psycopg2.extras.RealDictCursor
+                )
+                cursor.execute(f'SET search_path TO "{schema}"')
+                return connection, cursor
+
+            class _ConnectionWrapper:
+                def __init__(self, connection, cursor):
+                    self.connection = connection
+                    self.cursor = cursor
+
+                @property
+                def rowcount(self):
+                    return self.cursor.rowcount
+
+                def execute(self, sql, params=None):
+                    if params is None:
+                        self.cursor.execute(sql)
+                    else:
+                        self.cursor.execute(sql, params)
+                    return self
+
+                def fetchone(self):
+                    return self.cursor.fetchone()
+
+                def fetchall(self):
+                    return self.cursor.fetchall()
+
+            @contextmanager
+            def _pg_conn():
+                connection, cursor = _open_connection()
+                wrapper = _ConnectionWrapper(connection, cursor)
+                try:
+                    yield wrapper
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+                finally:
+                    cursor.close()
+                    connection.close()
+
+            def _exec(sql, params=()):
+                connection, cursor = _open_connection()
+                try:
+                    cursor.execute(sql, params)
+                    count = cursor.rowcount
+                    connection.commit()
+                    return count
+                except BaseException:
+                    connection.rollback()
+                    raise
+                finally:
+                    cursor.close()
+                    connection.close()
+
+            def _read(sql, params=(), *, many=False):
+                connection, cursor = _open_connection()
+                try:
+                    cursor.execute(sql, params)
+                    value = cursor.fetchall() if many else cursor.fetchone()
+                    connection.commit()
+                    if many:
+                        return [dict(row) for row in (value or [])]
+                    return dict(value) if value else None
+                finally:
+                    cursor.close()
+                    connection.close()
+
+            # The production modules import the connection factory through
+            # both ap.db and ap.order_state_machine.  Patch both references so
+            # every real row lock/CAS in this test uses the same schema.
+            monkeypatch.setattr(db_module, "conn", _pg_conn)
+            monkeypatch.setattr(osm_module, "conn", _pg_conn)
+
+            yield {
+                "schema": schema,
+                "exec": _exec,
+                "read": _read,
+            }
+        finally:
+            admin.close()
+            cleanup = psycopg2.connect(database_url)
+            cleanup.autocommit = True
+            try:
+                with cleanup.cursor() as cursor:
+                    cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+            finally:
+                cleanup.close()
+
+    def _ready_signal(self, *, generation=7, suffix=None):
+        import uuid
+
+        suffix = suffix or uuid.uuid4().hex
+        signal = self._recovery_sig(
+            signal_id=f"pg-ready-signal-{suffix}",
+            canonical_signal_id=f"pg-ready-canonical-{suffix}",
+            local_order_id=f"pg-ready-order-{suffix}",
+            client_id="jason@example.com",
+            execution_mode="live",
+        )
+        crossed_at = "2026-09-09T16:00:00+00:00"
+        provenance = {
+            "canonical_signal_id": signal["canonical_signal_id"],
+            "client_id": signal["client_id"],
+            "execution_mode": signal["execution_mode"],
+            "local_order_id": signal["local_order_id"],
+        }
+        signal["trigger_crossed_at"] = crossed_at
+        signal["materialization_generation"] = generation
+        signal["trigger_generation"] = generation
+        signal["metadata"] = {
+            **dict(signal.get("metadata") or {}),
+            "local_order_id": signal["local_order_id"],
+            "signal_id": signal["signal_id"],
+            "canonical_signal_id": signal["canonical_signal_id"],
+            "client_id": signal["client_id"],
+            "execution_mode": signal["execution_mode"],
+            "ticker": signal["ticker"],
+            "side": signal["side"],
+            "materialization_generation": generation,
+            "trigger_generation": generation,
+            "trigger_crossed_at": crossed_at,
+            "trigger_crossed_at_provenance": provenance,
+            "watcher_audit": {"reason_code": "trigger_ready"},
+            "trigger_price": signal["entry_price"],
+            "stop_underlying": signal["stop_price"],
+            "target_underlying": signal["target_price"],
+            "watcher_token": signal["watcher_token"],
+            "trigger_cursor": f"cursor-{generation}",
+            "broker_ready": False,
+            "lifecycle_state": "TRIGGER_READY",
+        }
+        return signal
+
+    @staticmethod
+    def _ready_row(signal):
+        metadata = copy.deepcopy(signal["metadata"])
+        return {
+            "status": "PENDING_TRIGGER",
+            "kind": "ENTRY",
+            "local_order_id": signal["local_order_id"],
+            "signal_id": signal["signal_id"],
+            "canonical_signal_id": signal["canonical_signal_id"],
+            "client_id": signal["client_id"],
+            "execution_mode": signal["execution_mode"],
+            "ticker": signal["ticker"],
+            "symbol": signal["ticker"],
+            "side": signal["side"],
+            "direction": signal["side"],
+            "plan_id": signal["plan_id"],
+            "contract": signal["contract_symbol"],
+            "qty": 1,
+            "score": signal["score"],
+            "tier": "A",
+            "pattern": signal["pattern"],
+            "timeframe": signal["timeframe"],
+            "trigger_price": signal["entry_price"],
+            "stop_underlying": signal["stop_price"],
+            "target_underlying": signal["target_price"],
+            "materialization_generation": str(
+                signal["materialization_generation"]
+            ),
+            "trigger_generation": str(signal["trigger_generation"]),
+            "broker_order_id": None,
+            "submitted_ts": None,
+            "filled_ts": None,
+            "meta": metadata,
+            "metadata": copy.deepcopy(metadata),
+        }
+
+    @staticmethod
+    def _insert_row(pg, row):
+        columns = [
+            "local_order_id", "client_id", "kind", "status",
+            "broker_order_id", "submitted_ts", "filled_ts",
+            "execution_mode", "signal_id", "canonical_signal_id",
+            "ticker", "symbol", "side", "direction", "plan_id",
+            "contract", "qty", "score", "tier", "pattern", "timeframe",
+            "trigger_price", "stop_underlying", "target_underlying",
+            "materialization_generation", "trigger_generation", "meta",
+            "metadata",
+        ]
+        json_columns = {"meta", "metadata"}
+        values = [
+            json.dumps(row.get(column)) if column in json_columns
+            else row.get(column)
+            for column in columns
+        ]
+        placeholders = ", ".join(
+            "%s::jsonb" if column in json_columns else "%s"
+            for column in columns
+        )
+        pg["exec"](
+            "INSERT INTO orders (" + ", ".join(columns) + ") VALUES ("
+            + placeholders + ")",
+            tuple(values),
+        )
+
+    @staticmethod
+    def _new_osm(signal):
+        import ap.order_state_machine as osm_module
+
+        osm = object.__new__(osm_module.APOrderStateMachine)
+        osm.client_id = signal["client_id"]
+        return osm
+
+    @staticmethod
+    def _runtime(signal, callback_result=None):
+        import ap_entry_watcher as ew
+
+        osm = TestPR580PostgresRecoveryContract._new_osm(signal)
+        broker = MagicMock(name="broker_boundary")
+        broker.get_quote.side_effect = AssertionError(
+            "durable trigger-ready recovery must not fetch a replacement quote"
+        )
+        watcher = ew.APEntryWatcher(
+            broker=broker,
+            order_state_machine=osm,
+            require_on_trigger=False,
+            mode="LIVE",
+        )
+        # The row already contains the authoritative trigger-ready audit.  The
+        # test keeps this diagnostic sink quiet so only the claim/confirmation
+        # writes under test touch PostgreSQL.
+        watcher._persist_watcher_audit = lambda *args, **kwargs: None
+        watcher.on_trigger = MagicMock(
+            return_value=callback_result or {"disposition": "KEEP_WATCHER"}
+        )
+        return osm, watcher, broker
+
+    @staticmethod
+    def _claim_kwargs(signal, *, owner, attempt):
+        metadata = signal["metadata"]
+        return {
+            "local_order_id": signal["local_order_id"],
+            "signal_id": signal["signal_id"],
+            "canonical_signal_id": signal["canonical_signal_id"],
+            "client_id": signal["client_id"],
+            "execution_mode": signal["execution_mode"],
+            "ticker": signal["ticker"],
+            "side": signal["side"],
+            "materialization_generation": signal["materialization_generation"],
+            "trigger_generation": signal["trigger_generation"],
+            "claim_owner": owner,
+            "dispatch_attempt_id": attempt,
+            "watcher_token": metadata["watcher_token"],
+            "trigger_cursor": metadata["trigger_cursor"],
+        }
+
+    @staticmethod
+    def _assert_no_broker_calls(broker):
+        assert broker.method_calls == [], broker.method_calls
+
+    @staticmethod
+    def _transition_kwargs(signal, *, owner, attempt):
+        values = TestPR580PostgresRecoveryContract._claim_kwargs(
+            signal, owner=owner, attempt=attempt
+        )
+        values.pop("claim_owner", None)
+        values.pop("watcher_token", None)
+        values.pop("trigger_cursor", None)
+        return values
+
+    def _run_startup_reseed(self, signal, watcher, osm, broker):
+        from ap_recovery import APStartupRecovery
+
+        recovery = APStartupRecovery(
+            client_id=signal["client_id"],
+            broker=broker,
+            osm=osm,
+            pm=MagicMock(name="position_manager"),
+            master_control=types.SimpleNamespace(mode="LIVE"),
+            entry_watcher=watcher,
+        )
+        result = {"errors": []}
+        recovery._reseed_watchers(result)
+        return result
+
+    @staticmethod
+    def _clear_ledger():
+        import ap_lifecycle as lifecycle
+
+        with lifecycle.LEDGER._entry_lock:
+            lifecycle.LEDGER._current_state.clear()
+
+    def test_actual_startup_restart_resumes_trigger_ready_and_consumes_keep_cursor(
+        self, pg,
+    ):
+        """The real startup caller resumes the exact durable trigger once."""
+        import ap_lifecycle as lifecycle
+
+        self._clear_ledger()
+        signal = self._ready_signal()
+        self._insert_row(pg, self._ready_row(signal))
+
+        osm, watcher, broker = self._runtime(signal)
+        result = self._run_startup_reseed(signal, watcher, osm, broker)
+
+        assert result["pending_trigger_watchers_rearmed"] == 1
+        assert len(watcher._pending) == 1
+        registered = watcher._pending[0]
+        assert registered.signal["local_order_id"] == signal["local_order_id"]
+        assert registered.signal_id == signal["signal_id"]
+        assert registered.side == "CALL"
+        assert registered.ticker == "AAPL"
+        assert registered.entry_trigger == signal["entry_price"]
+        assert registered.stop_level == signal["stop_price"]
+        assert registered.target_price == signal["target_price"]
+        assert registered.signal["materialization_generation"] == 7
+        assert registered.signal["trigger_generation"] == 7
+        assert registered.state == "TRIGGERED"
+        assert lifecycle.LEDGER.current_state(signal["signal_id"]) == (
+            lifecycle.SignalState.TRIGGER_READY
+        )
+
+        # The recovered watcher has a durable trigger-ready cursor, so this
+        # poll does not read a quote or reinterpret the setup.
+        watcher._poll_active_signals(False)
+        watcher.on_trigger.assert_called_once_with(registered)
+        durable = pg["read"](
+            "SELECT * FROM orders WHERE local_order_id=%s",
+            (signal["local_order_id"],),
+        )
+        assert durable["meta"]["recovery_trigger_dispatch_state"] == "CONSUMED"
+        assert durable["meta"]["recovery_trigger_dispatch_generation"] == 7
+        assert durable["meta"]["recovery_trigger_dispatch_trigger_generation"] == 7
+        assert durable["meta"]["recovery_trigger_dispatch_attempt_id"]
+        self._assert_no_broker_calls(broker)
+
+        # A fresh process-shaped object graph sees the consumed cursor and does
+        # not reconstruct a second callback-capable watcher.
+        self._clear_ledger()
+        osm2, watcher2, broker2 = self._runtime(signal)
+        result2 = self._run_startup_reseed(signal, watcher2, osm2, broker2)
+        assert result2["pending_trigger_watchers_rearmed"] == 0
+        assert watcher2._pending == []
+        watcher2._poll_active_signals(False)
+        watcher2.on_trigger.assert_not_called()
+        self._assert_no_broker_calls(broker2)
+
+        # A genuinely new durable cursor/generation is a new attempt.  It is
+        # allowed exactly once, while the old consumed cursor remains blocked.
+        signal_next = copy.deepcopy(signal)
+        signal_next["materialization_generation"] = 8
+        signal_next["trigger_generation"] = 8
+        signal_next["metadata"] = copy.deepcopy(signal["metadata"])
+        signal_next["metadata"].update(
+            {
+                "materialization_generation": 8,
+                "trigger_generation": 8,
+                "trigger_cursor": "cursor-8",
+                "trigger_crossed_at": "2026-09-09T16:01:00+00:00",
+            }
+        )
+        pg["exec"](
+            "UPDATE orders SET materialization_generation=%s, "
+            "trigger_generation=%s, meta=meta || %s::jsonb, "
+            "metadata=metadata || %s::jsonb WHERE local_order_id=%s",
+            (
+                "8",
+                "8",
+                json.dumps(
+                    {
+                        "materialization_generation": 8,
+                        "trigger_generation": 8,
+                        "trigger_cursor": "cursor-8",
+                        "trigger_crossed_at": "2026-09-09T16:01:00+00:00",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "materialization_generation": 8,
+                        "trigger_generation": 8,
+                        "trigger_cursor": "cursor-8",
+                        "trigger_crossed_at": "2026-09-09T16:01:00+00:00",
+                    }
+                ),
+                signal["local_order_id"],
+            ),
+        )
+        self._clear_ledger()
+        osm3, watcher3, broker3 = self._runtime(signal_next)
+        result3 = self._run_startup_reseed(signal_next, watcher3, osm3, broker3)
+        assert result3["pending_trigger_watchers_rearmed"] == 1
+        watcher3._poll_active_signals(False)
+        watcher3.on_trigger.assert_called_once()
+        self._assert_no_broker_calls(broker3)
+
+    def test_actual_startup_restart_merges_empty_meta_with_metadata_authority(
+        self, pg,
+    ):
+        """A valid secondary metadata alias remains dispatchable after restart."""
+        self._clear_ledger()
+        signal = self._ready_signal()
+        row = self._ready_row(signal)
+        row["meta"] = {}
+        self._insert_row(pg, row)
+
+        osm, watcher, broker = self._runtime(signal)
+        result = self._run_startup_reseed(signal, watcher, osm, broker)
+        assert result["pending_trigger_watchers_rearmed"] == 1
+        watcher._poll_active_signals(False)
+        watcher.on_trigger.assert_called_once()
+        durable = pg["read"](
+            "SELECT meta FROM orders WHERE local_order_id=%s",
+            (signal["local_order_id"],),
+        )
+        assert durable["meta"]["recovery_trigger_dispatch_state"] == "CONSUMED"
+        self._assert_no_broker_calls(broker)
+
+    def test_actual_startup_restart_completes_callback_once(self, pg):
+        """A normal callback completion consumes the exact recovered cursor."""
+        self._clear_ledger()
+        signal = self._ready_signal()
+        signal["contract_symbol"] = "AAPL-TEST-CONTRACT"
+        signal["contract_deferred"] = False
+        self._insert_row(pg, self._ready_row(signal))
+
+        osm, watcher, broker = self._runtime(
+            signal,
+            callback_result={"disposition": "SUBMITTED"},
+        )
+        result = self._run_startup_reseed(signal, watcher, osm, broker)
+        assert result["pending_trigger_watchers_rearmed"] == 1
+        registered = watcher._pending[0]
+
+        watcher._poll_active_signals(False)
+        watcher.on_trigger.assert_called_once_with(registered)
+        assert watcher._pending == []
+        durable = pg["read"](
+            "SELECT meta FROM orders WHERE local_order_id=%s",
+            (signal["local_order_id"],),
+        )
+        assert durable["meta"]["recovery_trigger_dispatch_state"] == "COMPLETED"
+        assert durable["meta"]["recovery_trigger_dispatch_finished_at"]
+        self._assert_no_broker_calls(broker)
+
+    def _run_postgres_claim_race(self, pg, signal, owners):
+        import uuid
+
+        barrier = threading.Barrier(2)
+        results = [None, None]
+        attempts = [uuid.uuid4().hex, uuid.uuid4().hex]
+        callbacks = []
+        callback_lock = threading.Lock()
+        errors = []
+
+        def _worker(index):
+            try:
+                barrier.wait(timeout=5)
+                osm = self._new_osm(signal)
+                claimed = osm.claim_recovery_trigger_dispatch(
+                    **self._claim_kwargs(
+                        signal,
+                        owner=owners[index],
+                        attempt=attempts[index],
+                    )
+                )
+                results[index] = bool(claimed)
+                if claimed:
+                    assert osm.start_recovery_trigger_dispatch(
+                        **self._transition_kwargs(
+                            signal,
+                            owner=owners[index],
+                            attempt=attempts[index],
+                        )
+                    ) is True
+                    # This is the process-shaped callback boundary.  The
+                    # loser never reaches this block, so it has no callback
+                    # or downstream/broker opportunity at all.
+                    with callback_lock:
+                        callbacks.append(index)
+                    assert osm.finish_recovery_trigger_dispatch(
+                        outcome="COMPLETED",
+                        **self._transition_kwargs(
+                            signal,
+                            owner=owners[index],
+                            attempt=attempts[index],
+                        )
+                    ) is True
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=_worker, args=(index,), daemon=True)
+            for index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        assert not any(thread.is_alive() for thread in threads)
+        assert not errors, errors
+        assert results.count(True) == 1
+        assert len(callbacks) == 1
+        durable = pg["read"](
+            "SELECT meta FROM orders WHERE local_order_id=%s",
+            (signal["local_order_id"],),
+        )
+        assert durable["meta"]["recovery_trigger_dispatch_attempt_id"] == attempts[
+            callbacks[0]
+        ]
+        assert durable["meta"]["recovery_trigger_dispatch_owner"] == owners[
+            callbacks[0]
+        ]
+        assert durable["meta"]["recovery_trigger_dispatch_state"] == "COMPLETED"
+        return results, callbacks
+
+    def test_postgres_same_logical_owner_different_attempts_one_claim_one_callback(
+        self, pg,
+    ):
+        """A deterministic recovery owner cannot claim the cursor twice."""
+        signal = self._ready_signal()
+        self._insert_row(pg, self._ready_row(signal))
+        broker = MagicMock(name="same_owner_broker")
+        results, callbacks = self._run_postgres_claim_race(
+            pg,
+            signal,
+            [
+                f"recovery:{signal['local_order_id']}:{signal['signal_id']}",
+                f"recovery:{signal['local_order_id']}:{signal['signal_id']}",
+            ],
+        )
+        assert results.count(True) == 1
+        assert len(callbacks) == 1
+        self._assert_no_broker_calls(broker)
+        assert pg["read"](
+            "SELECT count(*) AS count FROM orders WHERE local_order_id=%s",
+            (signal["local_order_id"],),
+        )["count"] == 1
+
+    def test_postgres_different_logical_owners_one_claim_one_callback(self, pg):
+        """The existing different-owner race remains one-winner."""
+        signal = self._ready_signal()
+        self._insert_row(pg, self._ready_row(signal))
+        broker = MagicMock(name="different_owner_broker")
+        results, callbacks = self._run_postgres_claim_race(
+            pg,
+            signal,
+            ["recovery-process-a", "recovery-process-b"],
+        )
+        assert results.count(True) == 1
+        assert len(callbacks) == 1
+        self._assert_no_broker_calls(broker)
+
+    @pytest.mark.parametrize(
+        "boundary",
+        ["before_claim", "after_claim", "during_callback", "after_callback"],
+    )
+    def test_postgres_restart_crash_boundaries_are_durable_and_non_replaying(
+        self, pg, boundary,
+    ):
+        """A fresh process cannot blindly replay a claimed trigger cursor."""
+        import uuid
+
+        signal = self._ready_signal()
+        self._insert_row(pg, self._ready_row(signal))
+        broker = MagicMock(name=f"crash_{boundary}_broker")
+        owner = f"recovery:{signal['local_order_id']}:{signal['signal_id']}"
+        callback_count = 0
+
+        if boundary == "before_claim":
+            # Process 1 dies after durable TRIGGER_READY but before entering
+            # the final claim.  A fresh process-shaped OSM must be the one
+            # that claims, starts, and completes the callback exactly once.
+            self._new_osm(signal)
+            restart = self._new_osm(signal)
+            attempt = uuid.uuid4().hex
+            assert restart.claim_recovery_trigger_dispatch(
+                **self._claim_kwargs(
+                    signal, owner=owner, attempt=attempt
+                )
+            ) is True
+            assert restart.start_recovery_trigger_dispatch(
+                **self._transition_kwargs(signal, owner=owner, attempt=attempt)
+            ) is True
+            callback_count += 1
+            assert restart.finish_recovery_trigger_dispatch(
+                outcome="COMPLETED",
+                **self._transition_kwargs(signal, owner=owner, attempt=attempt),
+            ) is True
+            expected_state = "COMPLETED"
+        else:
+            process = self._new_osm(signal)
+            attempt = uuid.uuid4().hex
+            assert process.claim_recovery_trigger_dispatch(
+                **self._claim_kwargs(signal, owner=owner, attempt=attempt)
+            ) is True
+            if boundary == "after_claim":
+                expected_state = "CLAIMED"
+            else:
+                assert process.start_recovery_trigger_dispatch(
+                    **self._transition_kwargs(signal, owner=owner, attempt=attempt)
+                ) is True
+                if boundary == "during_callback":
+                    callback_count += 1
+                    # Process death occurs after the durable start fence and
+                    # before the callback can report an outcome.  The durable
+                    # CALLBACK_STARTED state is intentionally non-reclaimable
+                    # under claim-once semantics; a fresh process must hold,
+                    # never blindly invoke the callback again.
+                    expected_state = "CALLBACK_STARTED"
+                else:
+                    callback_count += 1
+                    assert process.finish_recovery_trigger_dispatch(
+                        outcome="COMPLETED",
+                        **self._transition_kwargs(
+                            signal, owner=owner, attempt=attempt
+                        ),
+                    ) is True
+                    expected_state = "COMPLETED"
+            restart = self._new_osm(signal)
+            assert restart.claim_recovery_trigger_dispatch(
+                **self._claim_kwargs(
+                    signal, owner=owner, attempt=uuid.uuid4().hex
+                )
+            ) is False
+
+        durable = pg["read"](
+            "SELECT meta FROM orders WHERE local_order_id=%s",
+            (signal["local_order_id"],),
+        )
+        assert durable["meta"]["recovery_trigger_dispatch_state"] == expected_state
+        assert callback_count in {0, 1}
+        assert callback_count == (0 if boundary == "after_claim" else 1)
+        self._assert_no_broker_calls(broker)
+
+    @staticmethod
+    def _mutate_generation_case(row, case):
+        if case == "exact":
+            return
+        if case == "missing_materialization":
+            row["materialization_generation"] = None
+            row["meta"].pop("materialization_generation", None)
+            row["metadata"].pop("materialization_generation", None)
+            return
+        if case == "missing_trigger":
+            row["trigger_generation"] = None
+            row["meta"].pop("trigger_generation", None)
+            row["metadata"].pop("trigger_generation", None)
+            return
+        if case == "meta_metadata_conflict":
+            row["meta"]["materialization_generation"] = 7
+            row["metadata"]["materialization_generation"] = 8
+            row["materialization_generation"] = "7"
+            return
+        if case == "top_level_metadata_conflict":
+            row["meta"]["materialization_generation"] = 7
+            row["metadata"]["materialization_generation"] = 7
+            row["materialization_generation"] = "8"
+            return
+        if case in {"zero", "negative", "malformed"}:
+            value = {"zero": "0", "negative": "-1", "malformed": "nope"}[case]
+            for container in (row, row["meta"], row["metadata"]):
+                container["materialization_generation"] = value
+                container["trigger_generation"] = value
+            return
+        raise AssertionError(f"unknown generation case {case}")
+
+    @pytest.mark.parametrize(
+        "case, expected_admission",
+        [
+            ("exact", True),
+            ("missing_materialization", False),
+            ("missing_trigger", False),
+            ("zero", False),
+            ("negative", False),
+            ("malformed", False),
+            ("meta_metadata_conflict", False),
+            ("top_level_metadata_conflict", False),
+        ],
+    )
+    def test_postgres_generation_matrix_is_enforced_before_admission(
+        self, pg, case, expected_admission,
+    ):
+        """No malformed/ambiguous generation reaches watcher admission."""
+        self._clear_ledger()
+        signal = self._ready_signal()
+        row = self._ready_row(signal)
+        self._mutate_generation_case(row, case)
+        self._insert_row(pg, row)
+
+        osm, watcher, broker = self._runtime(signal)
+        result = self._run_startup_reseed(signal, watcher, osm, broker)
+        assert result["pending_trigger_watchers_rearmed"] == (
+            1 if expected_admission else 0
+        )
+        assert len(watcher._pending) == (1 if expected_admission else 0)
+        durable = pg["read"](
+            "SELECT meta FROM orders WHERE local_order_id=%s",
+            (signal["local_order_id"],),
+        )
+        if not expected_admission:
+            assert "recovery_trigger_dispatch_attempt_id" not in durable["meta"]
+        self._assert_no_broker_calls(broker)
+
+    def test_postgres_legacy_generation_assignment_populates_all_present_aliases(
+        self, pg,
+    ):
+        """Pre-breach generation creation cannot leave a top-level alias NULL."""
+        signal = self._ready_signal()
+        row = self._ready_row(signal)
+        row["materialization_generation"] = None
+        row["trigger_generation"] = None
+        row["meta"].pop("materialization_generation", None)
+        row["meta"].pop("trigger_generation", None)
+        row["metadata"].pop("materialization_generation", None)
+        row["metadata"].pop("trigger_generation", None)
+        self._insert_row(pg, row)
+
+        osm = self._new_osm(signal)
+        assigned, generation, reason = osm.ensure_recovery_trigger_generation(
+            local_order_id=signal["local_order_id"],
+            signal_id=signal["signal_id"],
+            canonical_signal_id=signal["canonical_signal_id"],
+            client_id=signal["client_id"],
+            execution_mode=signal["execution_mode"],
+            ticker=signal["ticker"],
+            side=signal["side"],
+        )
+        assert (assigned, generation, reason) == (
+            True, 1, "recovery_generation_assigned"
+        )
+        durable = pg["read"](
+            "SELECT materialization_generation, trigger_generation, meta "
+            "FROM orders WHERE local_order_id=%s",
+            (signal["local_order_id"],),
+        )
+        assert durable["materialization_generation"] == "1"
+        assert durable["trigger_generation"] == "1"
+        assert durable["meta"]["materialization_generation"] == 1
+        assert durable["meta"]["trigger_generation"] == 1
+
+    def test_postgres_generation_advance_after_admission_blocks_old_watcher(
+        self, pg,
+    ):
+        """An admitted generation N cannot dispatch after durable N+1 wins."""
+        self._clear_ledger()
+        signal = self._ready_signal()
+        self._insert_row(pg, self._ready_row(signal))
+        osm, watcher, broker = self._runtime(signal)
+        result = self._run_startup_reseed(signal, watcher, osm, broker)
+        assert result["pending_trigger_watchers_rearmed"] == 1
+        assert len(watcher._pending) == 1
+
+        pg["exec"](
+            "UPDATE orders SET materialization_generation=%s, "
+            "trigger_generation=%s, meta=meta || %s::jsonb, "
+            "metadata=metadata || %s::jsonb WHERE local_order_id=%s",
+            (
+                "8",
+                "8",
+                json.dumps(
+                    {
+                        "materialization_generation": 8,
+                        "trigger_generation": 8,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "materialization_generation": 8,
+                        "trigger_generation": 8,
+                    }
+                ),
+                signal["local_order_id"],
+            ),
+        )
+        watcher._poll_active_signals(False)
+        watcher.on_trigger.assert_not_called()
+        durable = pg["read"](
+            "SELECT meta FROM orders WHERE local_order_id=%s",
+            (signal["local_order_id"],),
+        )
+        assert "recovery_trigger_dispatch_attempt_id" not in durable["meta"]
+        assert watcher._pending[0]._ownership_quarantine is True
+        self._assert_no_broker_calls(broker)
+
+    def test_postgres_keep_watcher_same_cursor_suppressed_new_generation_allowed(
+        self, pg,
+    ):
+        """KEEP_WATCHER consumes one cursor; only a new generation can retry."""
+        import uuid
+
+        signal = self._ready_signal()
+        self._insert_row(pg, self._ready_row(signal))
+        owner = f"recovery:{signal['local_order_id']}:{signal['signal_id']}"
+        process = self._new_osm(signal)
+        attempt_one = uuid.uuid4().hex
+        assert process.claim_recovery_trigger_dispatch(
+            **self._claim_kwargs(signal, owner=owner, attempt=attempt_one)
+        ) is True
+        assert process.start_recovery_trigger_dispatch(
+            **self._transition_kwargs(signal, owner=owner, attempt=attempt_one)
+        ) is True
+        callback_count = 1  # KEEP_WATCHER callback completed for cursor-7.
+        assert process.finish_recovery_trigger_dispatch(
+            outcome="CONSUMED",
+            **self._transition_kwargs(signal, owner=owner, attempt=attempt_one),
+        ) is True
+
+        same_cursor = self._new_osm(signal)
+        assert same_cursor.claim_recovery_trigger_dispatch(
+            **self._claim_kwargs(
+                signal, owner=owner, attempt=uuid.uuid4().hex
+            )
+        ) is False
+        assert callback_count == 1
+
+        signal_next = copy.deepcopy(signal)
+        signal_next["materialization_generation"] = 8
+        signal_next["trigger_generation"] = 8
+        signal_next["metadata"] = copy.deepcopy(signal["metadata"])
+        signal_next["metadata"].update({
+            "materialization_generation": 8,
+            "trigger_generation": 8,
+            "trigger_cursor": "cursor-8",
+            "trigger_crossed_at": "2026-09-09T16:01:00+00:00",
+        })
+        next_meta = {
+            "materialization_generation": 8,
+            "trigger_generation": 8,
+            "trigger_cursor": "cursor-8",
+            "trigger_crossed_at": "2026-09-09T16:01:00+00:00",
+        }
+        pg["exec"](
+            "UPDATE orders SET materialization_generation=%s, "
+            "trigger_generation=%s, meta=meta || %s::jsonb, "
+            "metadata=metadata || %s::jsonb WHERE local_order_id=%s",
+            (
+                "8",
+                "8",
+                json.dumps(next_meta),
+                json.dumps(next_meta),
+                signal["local_order_id"],
+            ),
+        )
+        next_process = self._new_osm(signal_next)
+        attempt_two = uuid.uuid4().hex
+        assert next_process.claim_recovery_trigger_dispatch(
+            **self._claim_kwargs(
+                signal_next, owner=owner, attempt=attempt_two
+            )
+        ) is True
+        assert next_process.start_recovery_trigger_dispatch(
+            **self._transition_kwargs(
+                signal_next, owner=owner, attempt=attempt_two
+            )
+        ) is True
+        callback_count += 1
+        assert next_process.finish_recovery_trigger_dispatch(
+            outcome="COMPLETED",
+            **self._transition_kwargs(
+                signal_next, owner=owner, attempt=attempt_two
+            ),
+        ) is True
+        assert callback_count == 2
+        durable = pg["read"](
+            "SELECT meta FROM orders WHERE local_order_id=%s",
+            (signal["local_order_id"],),
+        )
+        assert durable["meta"]["recovery_trigger_dispatch_state"] == "COMPLETED"
+        assert durable["meta"]["recovery_trigger_dispatch_trigger_generation"] == 8
+
+
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Bug A tests — deferred contract must not bypass real underlying invalidation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2663,6 +3657,12 @@ class TestPR580AmendmentCorrections:
         osm = object.__new__(osm_mod.APOrderStateMachine)
         osm.client_id = sig["client_id"]
         osm.get_order = lambda _local_order_id: copy.deepcopy(store.row)
+        # This legacy unit uses a deliberately small claim-store double.  The
+        # production PostgreSQL crash-boundary tests cover the real
+        # CLAIMED->CALLBACK_STARTED transition; keep this test focused on the
+        # pre-existing claim seam.
+        osm.start_recovery_trigger_dispatch = lambda **_kwargs: True
+        osm.finish_recovery_trigger_dispatch = lambda **_kwargs: True
         watcher = ew.APEntryWatcher(
             broker=MagicMock(),
             order_state_machine=osm,
@@ -3001,11 +4001,11 @@ class TestPR580AmendmentCorrections:
             worker_errors = []
             original_restore = watcher._restore_recovered_watcher_lifecycle
 
-            def _restore_with_wait(candidate):
+            def _restore_with_wait(candidate, **kwargs):
                 lifecycle_entered.set()
                 assert worker_ready.wait(timeout=5), "database worker did not start"
                 assert not worker_done.is_set(), "row update was not serialized"
-                return original_restore(candidate)
+                return original_restore(candidate, **kwargs)
 
             def _advance_row():
                 connection = psycopg2.connect(database_url)

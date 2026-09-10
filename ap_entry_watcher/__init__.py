@@ -806,6 +806,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
     def watch(
         self, plan, local_order_id: str, *, recovery_rearm: bool = False,
         no_cancel_on_reject: bool = False, materialization_resume: bool = False,
+        recovered_trigger_ready: bool = False,
         registration_provenance_out: dict | None = None,
     ) -> bool:
         current_call = _CALL_RESULT.get()
@@ -816,6 +817,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 recovery_rearm=recovery_rearm,
                 no_cancel_on_reject=no_cancel_on_reject,
                 materialization_resume=materialization_resume,
+                recovered_trigger_ready=recovered_trigger_ready,
                 registration_provenance_out=registration_provenance_out,
             )
         token = _CALL_RESULT.set(_CallResult(id(self)))
@@ -826,6 +828,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 recovery_rearm=recovery_rearm,
                 no_cancel_on_reject=no_cancel_on_reject,
                 materialization_resume=materialization_resume,
+                recovered_trigger_ready=recovered_trigger_ready,
                 registration_provenance_out=registration_provenance_out,
             )
         finally:
@@ -834,6 +837,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
     def _watch_impl(
         self, plan, local_order_id: str, *, recovery_rearm: bool = False,
         no_cancel_on_reject: bool = False, materialization_resume: bool = False,
+        recovered_trigger_ready: bool = False,
         registration_provenance_out: dict | None = None,
     ) -> bool:
         if registration_provenance_out is not None:
@@ -866,17 +870,24 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             normalized_plan = plan
         except Exception:
             normalized_plan = _SideNormalizedPlan(plan, side)
-        return super().watch(
-            normalized_plan, local_order_id,
-            recovery_rearm=recovery_rearm,
-            no_cancel_on_reject=no_cancel_on_reject,
-            materialization_resume=materialization_resume,
-            registration_provenance_out=registration_provenance_out,
-        )
+        watch_kwargs = {
+            "recovery_rearm": recovery_rearm,
+            "no_cancel_on_reject": no_cancel_on_reject,
+            "materialization_resume": materialization_resume,
+            "registration_provenance_out": registration_provenance_out,
+        }
+        # Preserve the legacy call shape for ordinary callers.  The new flag
+        # is meaningful only for the exact durable TRIGGER_READY recovery
+        # path, and older test/runtime shims must not receive an unsolicited
+        # ``False`` keyword.
+        if recovered_trigger_ready:
+            watch_kwargs["recovered_trigger_ready"] = True
+        return super().watch(normalized_plan, local_order_id, **watch_kwargs)
 
     def watch_with_result(
         self, plan, local_order_id: str, *, recovery_rearm: bool = False,
         no_cancel_on_reject: bool = False, materialization_resume: bool = False,
+        recovered_trigger_ready: bool = False,
     ) -> WatchArmResult:
         call = _CallResult(id(self))
         token = _CALL_RESULT.set(call)
@@ -885,6 +896,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 plan, local_order_id, recovery_rearm=recovery_rearm,
                 no_cancel_on_reject=no_cancel_on_reject,
                 materialization_resume=materialization_resume,
+                recovered_trigger_ready=recovered_trigger_ready,
             ))
             has_after = bool(self.has_order(local_order_id))
             meta = call.conflict_meta
