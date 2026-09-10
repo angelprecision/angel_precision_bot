@@ -28,8 +28,15 @@ import os
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
+from ap.broker_submit_identity import canonical_broker_submit_key
 from ap.logger import get_logger
+from ap.manual_close_reconciliation import (
+    ORDERS_AVAILABLE_COMPLETE,
+    ORDERS_AVAILABLE_EMPTY,
+    fetch_all_current_session_orders,
+)
 from ap_entry_watcher import (
     RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
     recovery_trigger_evidence_identity_is_proven,
@@ -42,7 +49,12 @@ from ap.pending_trigger_classifier import (
 )
 from ap.selector_retry_policy import (
     DeferredMaterializationConfigConflict,
+    deferred_retry_count_exhaustion_applies,
+    is_retryable_selector_reason,
+    is_validity_bound_deferred_retry_reason,
     resolve_deferred_materialization_max_attempts,
+    resolve_deferred_retry_deadline,
+    resolve_deferred_retry_reason,
 )
 
 log = get_logger("ap.pending_trigger_restart_recovery")
@@ -159,6 +171,7 @@ class PendingTriggerRestartRecovery:
         self.caller_source  = str(caller_source or "unknown").strip() or "unknown"
         self._row_retry_subtypes: dict[str, str] = {}
         self._row_failure_reasons: dict[str, str] = {}
+        self._broker_order_tags_snapshot: Optional[tuple[str, set[str]]] = None
 
         # PR #421 final amendment — watcher provenance. Set fresh at the
         # start of every _recover_one() call and read by the caller
@@ -374,6 +387,16 @@ class PendingTriggerRestartRecovery:
             # classifier priority changes later.
             if is_active_materialization_in_flight(row):
                 return _observe_materialization_owner()
+
+        if cls == PTC.STUCK_TRIGGER_READY:
+            # A crashed phase-one retry is not an abandoned trigger. It has a
+            # distinct exact-owner, same-attempt recovery contract and must be
+            # resolved before ordinary quote/terminal handling.
+            _phase_one_recovery = self._recover_stale_market_truth_pending(
+                row, local_oid
+            )
+            if _phase_one_recovery is not None:
+                return _phase_one_recovery
 
         # Live quote check.
         live_quote_abt: Optional[bool] = None
@@ -882,6 +905,281 @@ class PendingTriggerRestartRecovery:
         log.info("RESTART_RECOVERY_RESTART_REARM_RETRY_OWNED local=%s proof=%s", local_oid, proof)
         return _RowOutcome.RETRY_OWNED
 
+    def _load_authoritative_broker_order_tags(self) -> tuple[str, set[str]]:
+        """Return a complete current-session Tradier tag snapshot or UNKNOWN.
+
+        Reuse the canonical current-session order authority. Only its
+        COMPLETE or EMPTY states can prove that the exact submit tag is
+        absent; malformed, unavailable, and incomplete states remain UNKNOWN.
+        """
+        if self._broker_order_tags_snapshot is not None:
+            return self._broker_order_tags_snapshot
+
+        try:
+            orders_state, orders = fetch_all_current_session_orders(self.broker)
+            if orders_state not in {
+                ORDERS_AVAILABLE_COMPLETE,
+                ORDERS_AVAILABLE_EMPTY,
+            }:
+                raise ValueError(
+                    f"BROKER_ORDERS_TRUTH_{str(orders_state or 'UNKNOWN').upper()}"
+                )
+            if not isinstance(orders, list) or any(
+                not isinstance(order, dict) for order in orders
+            ):
+                raise ValueError("BROKER_ORDERS_RESULT_MALFORMED")
+            tags = {
+                str(order.get("tag") or "").strip()
+                for order in orders
+                if str(order.get("tag") or "").strip()
+            }
+            self._broker_order_tags_snapshot = (orders_state, tags)
+            return self._broker_order_tags_snapshot
+        except Exception as exc:
+            log.critical(
+                "RESTART_PHASE_ONE_BROKER_TAG_LOOKUP_UNKNOWN client=%s mode=%s "
+                "error=%s",
+                self.client_id,
+                self.execution_mode,
+                exc,
+            )
+            self._broker_order_tags_snapshot = ("UNKNOWN", set())
+            return self._broker_order_tags_snapshot
+
+    def _inside_retry_entry_window(self, row: dict) -> bool:
+        meta = _extract_meta(row)
+        trigger_dt = _parse_iso(
+            meta.get("trigger_crossed_at") or meta.get("triggered_at")
+        )
+        if trigger_dt is None:
+            return False
+        eastern = ZoneInfo("America/New_York")
+        now_utc = datetime.now(timezone.utc)
+        now_et = now_utc.astimezone(eastern)
+        if trigger_dt.astimezone(eastern).date() != now_et.date():
+            return False
+
+        deadline, deadline_error = resolve_deferred_retry_deadline(
+            meta,
+            now=now_utc,
+        )
+        if deadline_error or deadline is None or now_utc >= deadline:
+            return False
+        return True
+
+    def _retry_entry_deadline(self, row: dict) -> "datetime | None":
+        """Return the effective retry deadline, failing closed on bad metadata.
+
+        Used by the phase-one bounded-backoff clip (PR #568 amendment §2) to
+        refuse writing a ``next_retry_at`` that would land past the entry
+        cutoff. Combines the durable absolute deadline (if any) with the
+        BREACH_SELECTOR_RETRY_CUTOFF_ET wall-clock ceiling through the shared
+        authority resolver so callers only need one comparison. A malformed
+        non-empty durable alias or cutoff raises ``ValueError``; callers must
+        leave the row unresolved rather than schedule from ambiguous truth.
+        """
+        meta = _extract_meta(row)
+        deadline, deadline_error = resolve_deferred_retry_deadline(meta)
+        if deadline_error:
+            raise ValueError(deadline_error)
+        return deadline
+
+    def _recover_stale_market_truth_pending(
+        self, row: dict, local_oid: str
+    ) -> Optional[str]:
+        """Recover an expired phase-one claim at the same selector attempt."""
+        if self.execution_mode not in {"live", "paper"} or self.is_past_eod:
+            return None
+        meta = _extract_meta(row)
+        if not (
+            meta.get("materialization_market_truth_pending") is True
+            and str(meta.get("lifecycle_state") or "").strip().upper()
+            == "MATERIALIZING"
+            and str(meta.get("materialization_status") or "").strip().upper()
+            == "RUNNING"
+            and meta.get("materialization_in_flight") is True
+        ):
+            return None
+
+        signal_id = str(row.get("signal_id") or "").strip()
+        owner = str(meta.get("materialization_owner") or "").strip()
+        if (
+            not signal_id
+            or not owner
+            or str(meta.get("current_owner") or "").strip() != owner
+            or str(meta.get("watcher_token") or "").strip() != owner
+        ):
+            return _RowOutcome.UNRESOLVED
+        lease = _parse_iso(meta.get("materialization_lease_until"))
+        if lease is None or lease >= datetime.now(timezone.utc):
+            return _RowOutcome.UNRESOLVED
+
+        raw_counts = (
+            meta.get("retry_attempt"),
+            meta.get("breach_attempt_count"),
+            meta.get("materialization_attempts"),
+        )
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in raw_counts):
+            return _RowOutcome.UNRESOLVED
+        attempt = raw_counts[0]
+        if attempt < 1 or raw_counts != (attempt, attempt, attempt):
+            return _RowOutcome.UNRESOLVED
+        generation = meta.get("materialization_generation")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+            return _RowOutcome.UNRESOLVED
+
+        selector_failure = meta.get("materialization_selector_failure")
+        if not isinstance(selector_failure, dict):
+            selector_failure = meta.get("selector_failure")
+        if not isinstance(selector_failure, dict):
+            return _RowOutcome.UNRESOLVED
+        reason, reason_error = resolve_deferred_retry_reason(
+            meta,
+            selector_failure=selector_failure,
+        )
+        if reason_error:
+            log.warning(
+                "RESTART_PHASE_ONE_RETRY_REASON_AUTHORITY_CONFLICT "
+                "local=%s error=%s -- leaving row unresolved.",
+                local_oid,
+                reason_error,
+            )
+            return _RowOutcome.UNRESOLVED
+        reason = reason or ""
+        if not reason:
+            return None
+
+        # A phase-one claim records the selector attempt that was already
+        # earned.  Count-bounded RETRYABLE_DATA reasons may recover that claim
+        # only when another selector attempt remains; otherwise the existing
+        # STUCK_TRIGGER_READY terminal path is the count-exhausted authority.
+        # Validity-bound reasons and proven retryable aggregate reasons retain
+        # their existing cutoff/deadline authority instead of this numeric
+        # ceiling.
+        _validity_bound = is_validity_bound_deferred_retry_reason(reason)
+        _count_exhaustion_applies = deferred_retry_count_exhaustion_applies(
+            reason, selector_failure=selector_failure
+        )
+        max_attempts: Optional[int] = None
+        if not _validity_bound and _count_exhaustion_applies:
+            if not is_retryable_selector_reason(reason):
+                return None
+
+        if any(str(meta.get(field) or "").strip() for field in (
+            "submit_intent_at",
+            "broker_submit_key",
+            "broker_submit_payload_hash",
+            "recovery_submit_owner",
+            "recovery_submit_lease_until",
+        )) or meta.get("recovery_submit_fenced") is True:
+            return _RowOutcome.UNRESOLVED
+        if not self._inside_retry_entry_window(row):
+            return None
+
+        broker_status, broker_tags = self._load_authoritative_broker_order_tags()
+        exact_tag = canonical_broker_submit_key(local_oid)
+        if broker_status not in {
+            ORDERS_AVAILABLE_COMPLETE,
+            ORDERS_AVAILABLE_EMPTY,
+        } or exact_tag in broker_tags:
+            self._mark_failure(
+                local_oid,
+                "phase_one_broker_order_found"
+                if exact_tag in broker_tags
+                else "phase_one_broker_truth_unknown",
+            )
+            return _RowOutcome.UNRESOLVED
+
+        if max_attempts is None:
+            try:
+                max_attempts = resolve_deferred_materialization_max_attempts()
+            except DeferredMaterializationConfigConflict:
+                return _RowOutcome.UNRESOLVED
+        if not _validity_bound and _count_exhaustion_applies:
+            if attempt >= max_attempts:
+                return None
+        max_attempts = max(max_attempts, attempt)
+        # PR #568 amendment §2: bounded stepped backoff, not a fixed 8s.
+        # Recovery inherits the same per-attempt cadence so a crashed +
+        # restored phase-one claim cannot become a tight provider loop.
+        from ap.selector_retry_policy import (
+            compute_retry_backoff_seconds as _compute_backoff,
+        )
+        _base_delay = _env_int("BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8)
+        delay = max(
+            int(_base_delay),
+            _compute_backoff(
+                attempt,
+                reason,
+                cfg={"validity_bound_retry_backoff_step1_seconds": _base_delay},
+            ),
+        )
+        _candidate_next_dt = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        # PR #568 amendment §2: never schedule past the absolute entry
+        # deadline. _inside_retry_entry_window(row) above already blocked
+        # the "already past" case; this blocks the "backoff would step
+        # past" case introduced by the ladder. Leave the row UNRESOLVED
+        # so the ordinary lifecycle (deadline / EOD cutoff) terminates it
+        # on the next poll instead of writing a doomed retry.
+        try:
+            _deadline_dt = self._retry_entry_deadline(row)
+        except ValueError as _deadline_exc:
+            log.warning(
+                "RESTART_PHASE_ONE_RETRY_DEADLINE_AUTHORITY_INVALID "
+                "local=%s error=%s -- leaving row unresolved.",
+                local_oid,
+                _deadline_exc,
+            )
+            return _RowOutcome.UNRESOLVED
+        if _deadline_dt is not None and _candidate_next_dt >= _deadline_dt:
+            return _RowOutcome.UNRESOLVED
+        next_retry_at = _candidate_next_dt.isoformat()
+        recover = getattr(
+            self.osm, "recover_stale_market_truth_pending_retry", None
+        )
+        if not callable(recover):
+            return _RowOutcome.UNRESOLVED
+        try:
+            recovered = bool(recover(
+                local_oid,
+                expected_owner=owner,
+                generation=generation,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                signal_id=signal_id,
+                execution_mode=self.execution_mode,
+                reason_code=reason,
+                next_retry_at=next_retry_at,
+                selector_failure=selector_failure,
+            ))
+        except Exception:
+            recovered = False
+        if not recovered:
+            return _RowOutcome.UNRESOLVED
+
+        proof = self._verify_materialization_retry_ownership(
+            local_oid,
+            row,
+            expected_next_at=next_retry_at,
+            expected_attempts=attempt,
+            expected_generation=generation,
+            expected_reason=reason,
+            expected_market_truth_pending=True,
+            expected_ownerless=True,
+        )
+        if proof is None:
+            return _RowOutcome.UNRESOLVED
+        self._mark_retry_subtype(local_oid, _RETRY_MATERIALIZATION)
+        log.warning(
+            "RESTART_PHASE_ONE_RETRY_RECOVERED local=%s generation=%s "
+            "attempt=%s reason=%s broker_submission=ABSENT selector_calls=0",
+            local_oid,
+            generation,
+            attempt,
+            reason,
+        )
+        return _RowOutcome.RETRY_OWNED
+
     # ── Canonical retry ownership (#323 fields) ────────────────────────────────
 
     def _enter_canonical_retry(self, local_oid: str, row: dict, *, reason: str) -> str:
@@ -915,7 +1213,16 @@ class PendingTriggerRestartRecovery:
 
         _meta     = _extract_meta(row)
         _attempts = int(_meta.get(_MAT_ATTEMPTS_FIELD) or 0) + 1
-        if _attempts > _max:
+        _selector_failure = _meta.get("materialization_selector_failure")
+        if not isinstance(_selector_failure, dict):
+            _selector_failure = {}
+        if (
+            _attempts > _max
+            and deferred_retry_count_exhaustion_applies(
+                reason,
+                selector_failure=_selector_failure,
+            )
+        ):
             log.warning(
                 "RESTART_RECOVERY_CANONICAL_RETRY_EXHAUSTED local=%s attempts=%d max=%d — terminalizing",
                 local_oid, _attempts, _max,
@@ -1081,6 +1388,10 @@ class PendingTriggerRestartRecovery:
         *,
         expected_next_at: str = "",
         expected_attempts: int = 0,
+        expected_generation: int = 0,
+        expected_reason: str = "",
+        expected_market_truth_pending: Optional[bool] = None,
+        expected_ownerless: bool = False,
     ) -> "dict | None":
         """
         Fix 1: prove canonical #323 retry ownership using the real stamp_retry_pending fields.
@@ -1132,7 +1443,18 @@ class PendingTriggerRestartRecovery:
         mat_status   = str(meta.get(_MAT_STATUS_FIELD) or "").strip().upper()
         broker_ready = meta.get(_MAT_BROKER_READY)
         next_at      = str(meta.get(_MAT_NEXT_RETRY_AT) or "").strip()
-        reason       = str(meta.get(_MAT_REASON_FIELD) or "").strip()
+        _selector_failure = meta.get("materialization_selector_failure")
+        if not isinstance(_selector_failure, dict):
+            _selector_failure = meta.get("selector_failure")
+        if not isinstance(_selector_failure, dict):
+            _selector_failure = {}
+        reason, reason_error = resolve_deferred_retry_reason(
+            meta,
+            selector_failure=_selector_failure,
+        )
+        if reason_error:
+            return None
+        reason = reason or ""
         last_fail    = str(meta.get(_MAT_LAST_FAILURE_FIELD) or "").strip()
         try:
             attempts = int(meta.get(_MAT_ATTEMPTS_FIELD))
@@ -1152,7 +1474,15 @@ class PendingTriggerRestartRecovery:
             return None
         if broker_ready is not False:
             return None
-        if attempts < 1 or attempts > _max:
+        if attempts < 1:
+            return None
+        if (
+            attempts > _max
+            and deferred_retry_count_exhaustion_applies(
+                reason,
+                selector_failure=_selector_failure,
+            )
+        ):
             return None
         if not next_at or not reason:
             return None
@@ -1162,6 +1492,34 @@ class PendingTriggerRestartRecovery:
         if expected_next_at and next_at != expected_next_at:
             return None
         if expected_attempts and attempts != expected_attempts:
+            return None
+        if expected_generation:
+            generation = meta.get("materialization_generation")
+            if (
+                isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation != expected_generation
+            ):
+                return None
+        if expected_reason and reason != expected_reason:
+            return None
+        if (
+            expected_market_truth_pending is not None
+            and meta.get("materialization_market_truth_pending")
+            is not expected_market_truth_pending
+        ):
+            return None
+        if expected_ownerless and any(
+            str(meta.get(field) or "").strip()
+            for field in (
+                "materialization_owner",
+                "materialization_lease_until",
+                "current_owner",
+                "watcher_token",
+                "retry_owner",
+                "recovery_owner",
+            )
+        ):
             return None
         return {
             "local_order_id":                local_oid,

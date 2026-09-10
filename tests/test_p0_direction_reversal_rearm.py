@@ -26,11 +26,19 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call
 
+import pytest
+
 os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/db")
 
 import ap.order_state_machine as osm_mod
 from ap.order_state_machine import APOrderStateMachine
 from ap_execution_core import _reset_direction_reversal_runtime_state
+
+
+@pytest.fixture(autouse=True)
+def _open_deferred_retry_cutoff_for_lifecycle_tests(monkeypatch):
+    """Keep direction-reversal lifecycle tests inside the retry window."""
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
 
 
 def test_runtime_reset_archives_trigger_and_clears_attempt_state_uninterrupted_watcher():
@@ -459,7 +467,7 @@ def test_seam_full_direction_reversal_recovery_chain(monkeypatch):
     EXEC_MODE      = "paper"
     GENERATION     = 3          # durable generation before this retry
     PRIOR_ATTEMPT  = 1          # durable attempt before this retry fires
-    EXPECTED_ATT   = 2          # the attempt resume_deferred claims
+    EXPECTED_ATT   = 2          # next attempt, earned only after market truth
     NEW_GEN        = GENERATION + 1   # generation after claim = 4
     TRIGGER_PRICE  = 100.0
     TRIGGER_TS     = "2026-08-06T14:00:00+00:00"
@@ -514,9 +522,10 @@ def test_seam_full_direction_reversal_recovery_chain(monkeypatch):
     # (ownership verify, pre-claim verify, cursor read — calls #2-4) ────────
     materializing_row = _make_materializing_row(
         LOCAL_ORDER_ID, SIGNAL_ID, PLAN_ID, CLIENT_ID,
-        EXEC_MODE, NEW_GEN, EXPECTED_ATT, OWNER,
+        EXEC_MODE, NEW_GEN, PRIOR_ATTEMPT, OWNER,
         TRIGGER_PRICE, TRIGGER_TS, provenance,
     )
+    materializing_row["meta"]["materialization_market_truth_pending"] = True
 
     # ── Fake row: post-rearm truly blank pre-breach state, returned by PTR
     # re-read. current_owner and materialization_status stay blank until a

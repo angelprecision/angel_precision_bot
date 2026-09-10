@@ -487,7 +487,7 @@ def test_truthful_final_reason_precedence(evidence, expected):
     assert resolve_selector_recovery_final_reason(evidence) == expected
 
 
-def test_five_total_attempts_not_five_retries():
+def test_five_attempts_does_not_exhaust_proven_transient_data():
     fourth = _classify_deferred_breach_retry_decision(
         "DIRECT_QUOTE_ZERO_BID_ASK",
         queue_local_order_id="order",
@@ -505,7 +505,7 @@ def test_five_total_attempts_not_five_retries():
         retry_enabled=True,
     )
     assert fourth["action"] == "retry_schedule"
-    assert fifth["action"] == "retry_exhausted"
+    assert fifth["action"] == "retry_schedule"
 
 
 def test_one_broker_intent_fence_remains_authoritative():

@@ -64,6 +64,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 from typing import NamedTuple
+from zoneinfo import ZoneInfo
 
 
 class SelectorRetryPolicy(NamedTuple):
@@ -99,49 +100,49 @@ _POLICY_TABLE: dict[str, SelectorRetryPolicy] = {
     "NO_CHAIN_DATA": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="NO_CHAIN_DATA",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "CHAIN_PROVIDER_ERROR": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="CHAIN_PROVIDER_ERROR",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "CHAIN_PROVIDER_EMPTY_EXPIRATIONS": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="CHAIN_PROVIDER_EMPTY_EXPIRATIONS",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "CHAIN_PROVIDER_EMPTY_OPTIONS": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="CHAIN_PROVIDER_EMPTY_OPTIONS",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "CHAIN_PARSE_EMPTY": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="CHAIN_PARSE_EMPTY",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "CHAIN_EMPTY": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="CHAIN_EMPTY",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "CHAIN_FETCH_FAILED": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="CHAIN_FETCH_FAILED",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
@@ -155,7 +156,7 @@ _POLICY_TABLE: dict[str, SelectorRetryPolicy] = {
     "DIRECT_QUOTE_UNAVAILABLE": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="DIRECT_QUOTE_UNAVAILABLE",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
@@ -169,29 +170,36 @@ _POLICY_TABLE: dict[str, SelectorRetryPolicy] = {
     "CHAIN_ROW_ZERO_BID_ASK": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="CHAIN_ROW_ZERO_BID_ASK",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "DIRECT_QUOTE_ZERO_BID_ASK": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="DIRECT_QUOTE_ZERO_BID_ASK",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "QUOTE_FETCH_FAILED": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="QUOTE_FETCH_FAILED",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "QUOTE_ZERO_BID_ASK": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="QUOTE_ZERO_BID_ASK",
+        queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
+    ),
+    "CURRENT_PRICE_FETCH_FAILED": SelectorRetryPolicy(
+        classification=RETRYABLE_DATA,
+        selector_rerun_allowed=True, retain_existing_contract=False,
+        retry_delay_applies=True, max_attempts_applies=False,
+        final_reason_code="CURRENT_PRICE_FETCH_FAILED",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "SELECTOR_REQUEST_BUDGET_EXHAUSTED": SelectorRetryPolicy(
@@ -204,21 +212,21 @@ _POLICY_TABLE: dict[str, SelectorRetryPolicy] = {
     "MARKET_DATA_THROTTLE_UNAVAILABLE": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="MARKET_DATA_THROTTLE_UNAVAILABLE",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "PROVIDER_RATE_LIMITED": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="PROVIDER_RATE_LIMITED",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
     "PROVIDER_TIMEOUT": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,
-        retry_delay_applies=True, max_attempts_applies=True,
+        retry_delay_applies=True, max_attempts_applies=False,
         final_reason_code="PROVIDER_TIMEOUT",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
@@ -595,6 +603,223 @@ def is_retryable_selector_reason(reason_code: "str | None") -> bool:
     return get_policy(reason_code).classification == RETRYABLE_DATA
 
 
+def is_validity_bound_deferred_retry_reason(reason_code: "str | None") -> bool:
+    """True only for proven transient-data reasons that retry until cutoff."""
+    policy = get_policy(str(reason_code or "").strip().upper())
+    return (
+        policy.classification == RETRYABLE_DATA
+        and policy.selector_rerun_allowed
+        and policy.retry_delay_applies
+        and not policy.max_attempts_applies
+    )
+
+
+# ── Bounded backoff for validity-bound retries (PR #568 amendment) ────────────
+#
+# Validity-bound retries stay lifecycle-owned until session/cutoff authority
+# expires. That must not translate into hammering an unavailable/rate-limited
+# provider every fixed ``BREACH_SELECTOR_RETRY_DELAY_SECONDS`` window. This
+# helper is the single source of truth for the effective per-attempt delay.
+#
+# Design constraints (PR #568 amendment §2):
+#   * Retry count is NOT terminal authority.  This helper decides only *when*
+#     the next retry may run.
+#   * PROVIDER_RATE_LIMITED must not spin at high frequency — it starts at the
+#     second step of the ladder to give the provider immediate breathing room.
+#   * No second retry system, no new queue, no new scheduler.
+#   * Terminal quality/policy/invariant/UNKNOWN outcomes never reach this
+#     function in the retry path; if they do (defensive), we still return the
+#     configured base delay rather than escalate.
+#   * The caller must still cap the resulting ``next_retry_at`` against the
+#     absolute entry cutoff — bounded backoff is not permission to schedule
+#     past it.
+#
+# Stepped ladder (attempt → seconds), overridable via env for tuning:
+#     1 → base            (default 8)
+#     2 → step2           (default 15)
+#     3 → step3           (default 30)
+#     4+ → cap            (default 60)
+#
+# PROVIDER_RATE_LIMITED begins at step2 (never step1) for attempt 1 so the very
+# first retry is already at least 15s out.
+
+_BACKOFF_LADDER_ENV_KEYS: tuple = (
+    ("VALIDITY_BOUND_RETRY_BACKOFF_STEP1_SECONDS", 8),
+    ("VALIDITY_BOUND_RETRY_BACKOFF_STEP2_SECONDS", 15),
+    ("VALIDITY_BOUND_RETRY_BACKOFF_STEP3_SECONDS", 30),
+    ("VALIDITY_BOUND_RETRY_BACKOFF_CAP_SECONDS", 60),
+)
+
+
+def _positive_int_from_env(name: str, default: int) -> int:
+    try:
+        raw = os.getenv(name)
+        if raw is None or not str(raw).strip():
+            return int(default)
+        value = int(str(raw).strip())
+        return value if value > 0 else int(default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _resolve_backoff_ladder(cfg: "dict | None" = None) -> tuple:
+    """Return (step1, step2, step3, cap) as positive monotonic seconds."""
+    if not isinstance(cfg, dict):
+        cfg = {}
+    ladder = []
+    for env_name, default in _BACKOFF_LADDER_ENV_KEYS:
+        cfg_key = env_name.lower()
+        raw = cfg.get(cfg_key) if cfg_key in cfg else None
+        if raw is None:
+            ladder.append(_positive_int_from_env(env_name, default))
+            continue
+        try:
+            value = int(raw)
+            ladder.append(value if value > 0 else int(default))
+        except (TypeError, ValueError):
+            ladder.append(int(default))
+    # Enforce monotonic non-decreasing so misconfiguration never inverts.
+    monotone: list = []
+    prior = 0
+    for value in ladder:
+        chosen = max(value, prior)
+        monotone.append(chosen)
+        prior = chosen
+    return tuple(monotone)
+
+
+def compute_retry_backoff_seconds(
+    attempt: "int | None",
+    reason_code: "str | None" = "",
+    *,
+    cfg: "dict | None" = None,
+) -> int:
+    """Return the bounded delay in seconds before the next validity-bound retry.
+
+    ``attempt`` is the 1-indexed attempt number the caller is about to schedule
+    (i.e. the attempt whose selector call has just failed).  Non-positive or
+    non-integral values are coerced to 1, which yields the base step.
+
+    ``reason_code`` allows per-reason cadence adjustment.  PROVIDER_RATE_LIMITED
+    is the only reason today that starts one step out from the base — every
+    other validity-bound reason follows the plain stepped ladder.
+
+    The ladder is monotonically non-decreasing and capped, so no matter how
+    many times this is called the delay never grows unbounded and never
+    inverts.  Callers must still clip ``now + delay`` against the entry
+    cutoff before writing ``next_retry_at``.
+    """
+    step1, step2, step3, cap = _resolve_backoff_ladder(cfg)
+    ladder = (step1, step2, step3, cap)
+
+    try:
+        attempt_int = int(attempt) if attempt is not None else 1
+    except (TypeError, ValueError):
+        attempt_int = 1
+    if attempt_int < 1:
+        attempt_int = 1
+
+    reason = str(reason_code or "").strip().upper()
+    # PROVIDER_RATE_LIMITED must never spin at step1: bump one rung.
+    if reason == "PROVIDER_RATE_LIMITED":
+        attempt_int += 1
+
+    idx = min(attempt_int, len(ladder)) - 1
+    return int(ladder[idx])
+
+
+def deferred_retry_count_exhaustion_applies(
+    reason_code: "str | None",
+    *,
+    selector_failure: dict | None = None,
+    ladder_retryable: bool = False,
+) -> bool:
+    """Return whether the retry count may be a terminal authority.
+
+    Known transient data failures are bounded by the existing validity, cutoff,
+    ownership, and broker fences. Unknown or terminal outcomes remain
+    fail-closed. A DTE aggregation reason is retryable only with an explicit
+    all-data-miss ladder proof.
+    """
+    _reason = str(reason_code or "").strip().upper()
+    _policy = get_policy(_reason)
+
+    # ``ladder_retryable`` allows another selector pass, but the aggregate DTE
+    # label alone is not enough to remove the attempt ceiling. Only the full
+    # per-expiration proof below can grant validity-bound authority.
+
+    # Canonical reason classification comes before any diagnostic metadata.
+    # Unknown and terminal reasons remain count-terminal even when stale or
+    # nested market-truth evidence says HOLD.
+    if _policy.classification != RETRYABLE_DATA and _reason != "NO_VALID_PLAYBOOK_DTE_CONTRACT":
+        return True
+
+    failure = selector_failure if isinstance(selector_failure, dict) else {}
+    if _reason == "SELECTOR_REQUEST_BUDGET_EXHAUSTED":
+        # The request-budget label is bounded by default. It becomes
+        # validity-bound only when the selector's canonical reduction proves
+        # the budget was consumed by a concrete transient data miss. A lone
+        # budget label (or stale HOLD metadata) is not enough authority.
+        canonical_reason = str(
+            failure.get("canonical_selector_reason") or ""
+        ).strip().upper()
+        operational_reason = str(
+            failure.get("operational_reason") or ""
+        ).strip().upper()
+        observed_reason = str(
+            failure.get("last_observed_selector_reason") or ""
+        ).strip().upper()
+        if (
+            canonical_reason == _reason
+            and operational_reason == _reason
+            and observed_reason != _reason
+            and is_validity_bound_deferred_retry_reason(observed_reason)
+        ):
+            return False
+    if _reason == "NO_VALID_PLAYBOOK_DTE_CONTRACT":
+        audits = [
+            failure.get("last_dte_ladder_audit"),
+            failure.get("dte_ladder_audit"),
+            failure.get("last_breach_selector_audit"),
+        ]
+        for audit in audits:
+            if not isinstance(audit, dict):
+                continue
+            nested = audit.get("last_dte_ladder_audit")
+            if isinstance(nested, dict):
+                audit = nested
+            buckets = audit.get("buckets_attempted")
+            if not isinstance(buckets, list) or not buckets:
+                continue
+            proven = True
+            saw_failure = False
+            for bucket in buckets:
+                expirations = bucket.get("expirations_probed") if isinstance(bucket, dict) else None
+                if not isinstance(expirations, list) or not expirations:
+                    proven = False
+                    break
+                for expiration in expirations:
+                    sub_failure = expiration.get("failure") if isinstance(expiration, dict) else None
+                    sub_reason = str(
+                        sub_failure.get("reason_code") or ""
+                    ).strip().upper() if isinstance(sub_failure, dict) else ""
+                    if not is_validity_bound_deferred_retry_reason(sub_reason):
+                        proven = False
+                        break
+                    saw_failure = True
+                if not proven:
+                    break
+            if proven and saw_failure:
+                return False
+
+    # NO_VALID_PLAYBOOK_DTE_CONTRACT is terminal unless its ladder proof above
+    # established an all-data-miss retry. Other non-retryable classifications
+    # were returned before inspecting HOLD metadata.
+    if _policy.classification != RETRYABLE_DATA:
+        return True
+    return not is_validity_bound_deferred_retry_reason(_reason)
+
+
 # ── Sub-classification: OPERATIONAL_REQUEST_BUDGET vs candidate-quality ───────
 #
 # P0 AMENDMENT (fix/deferred-retry-due-execution-p0 §5)
@@ -781,6 +1006,143 @@ def resolve_deferred_materialization_max_attempts() -> int:
     if deferred_value is not None:
         return deferred_value
     return _DEFERRED_MATERIALIZATION_MAX_ATTEMPTS_DEFAULT
+
+
+_DEFERRED_RETRY_DEADLINE_FIELDS = (
+    "absolute_entry_deadline",
+    "retry_deadline",
+    "deferred_retry_deadline",
+)
+_DEFERRED_RETRY_REASON_FIELDS = (
+    "retry_reason",
+    "materialization_reason",
+    "deferred_retry_reason_code",
+)
+_DEFERRED_RETRY_CUTOFF_ENV = "BREACH_SELECTOR_RETRY_CUTOFF_ET"
+_DEFERRED_RETRY_CUTOFF_DEFAULT_HHMM = 1530
+_DEFERRED_RETRY_TIMEZONE = ZoneInfo("America/New_York")
+
+
+def _parse_deferred_retry_timestamp(raw) -> datetime | None:
+    """Parse one durable retry timestamp without manufacturing a value."""
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        text = str(raw).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        value = datetime.fromisoformat(text)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if value.tzinfo is None:
+        # Preserve the existing durable-row compatibility rule. The value is
+        # still required to be parseable; no current time is substituted.
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def resolve_deferred_retry_deadline(
+    meta: dict | None,
+    *,
+    now: datetime | None = None,
+) -> tuple[datetime | None, str | None]:
+    """Return the effective deferred-entry retry deadline.
+
+    Every non-empty durable deadline alias is an authority input. All aliases
+    must parse, and the earliest valid durable deadline wins. The configured
+    ET cutoff is included in the same minimum so runtime retry consumption and
+    restart recovery cannot disagree about the last legal retry time.
+
+    Returns ``(deadline, None)`` on valid input and
+    ``(None, error_code)`` when a non-empty durable timestamp or cutoff is
+    malformed. Callers must fail closed on the error form.
+    """
+    if not isinstance(meta, dict):
+        return None, "INVALID_RETRY_DEADLINE_METADATA"
+
+    current = now if now is not None else datetime.now(timezone.utc)
+    if not isinstance(current, datetime):
+        return None, "INVALID_RETRY_DEADLINE_NOW"
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+
+    candidates: list[datetime] = []
+    for field in _DEFERRED_RETRY_DEADLINE_FIELDS:
+        raw = meta.get(field)
+        if raw is None or not str(raw).strip():
+            continue
+        parsed = _parse_deferred_retry_timestamp(raw)
+        if parsed is None:
+            return None, f"INVALID_RETRY_DEADLINE:{field}"
+        candidates.append(parsed)
+
+    cutoff_raw = os.getenv(
+        _DEFERRED_RETRY_CUTOFF_ENV,
+        str(_DEFERRED_RETRY_CUTOFF_DEFAULT_HHMM),
+    )
+    if cutoff_raw is None or not str(cutoff_raw).strip():
+        cutoff = _DEFERRED_RETRY_CUTOFF_DEFAULT_HHMM
+    else:
+        try:
+            cutoff = int(str(cutoff_raw).strip())
+        except (TypeError, ValueError, OverflowError):
+            return None, "INVALID_RETRY_CUTOFF"
+    if cutoff < 0 or cutoff > 2359 or cutoff % 100 >= 60:
+        return None, "INVALID_RETRY_CUTOFF"
+
+    current_et = current.astimezone(_DEFERRED_RETRY_TIMEZONE)
+    cutoff_et = current_et.replace(
+        hour=cutoff // 100,
+        minute=cutoff % 100,
+        second=0,
+        microsecond=0,
+    )
+    candidates.append(cutoff_et.astimezone(timezone.utc))
+    return min(candidates), None
+
+
+def resolve_deferred_retry_reason(
+    meta: dict | None,
+    *,
+    selector_failure: dict | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve durable retry reason aliases without choosing a winner.
+
+    The retry lifecycle has several historical read surfaces. A corrupted row
+    may carry different non-empty reason values on those surfaces. Such a row
+    is not safe to classify by first-truthy precedence, so conflicting values
+    return an error and callers must leave it unresolved.
+    """
+    if not isinstance(meta, dict):
+        return None, "INVALID_RETRY_REASON_METADATA"
+
+    values: dict[str, list[str]] = {}
+
+    def _record(label: str, raw) -> None:
+        if raw is None or not str(raw).strip():
+            return
+        normalized = str(raw).strip().upper()
+        values.setdefault(normalized, []).append(label)
+
+    for field in _DEFERRED_RETRY_REASON_FIELDS:
+        _record(field, meta.get(field))
+    for container_name in ("materialization_selector_failure", "selector_failure"):
+        container = meta.get(container_name)
+        if isinstance(container, dict):
+            _record(f"{container_name}.reason_code", container.get("reason_code"))
+
+    if isinstance(selector_failure, dict):
+        _record("selector_failure.reason_code", selector_failure.get("reason_code"))
+
+    if not values:
+        return None, None
+    if len(values) > 1:
+        fields = ",".join(
+            label for labels in values.values() for label in labels
+        )
+        return None, f"CONFLICTING_RETRY_REASON_AUTHORITY:{fields}"
+    return next(iter(values)), None
 
 
 def _utc_iso(now=None) -> str:

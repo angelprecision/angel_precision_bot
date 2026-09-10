@@ -1325,10 +1325,12 @@ class _DispositionResult(NamedTuple):
     .disposition            — one of the _DISPOSITION_* constants
     .existing_local_order_id — set for REATTACH_WATCHER; the order to reuse
     .existing_order_row     — set for REATTACH_WATCHER; full order dict
+    .existing_opportunity_row — set when the ledger supplied legacy evidence
     """
     disposition: str
     existing_local_order_id: Optional[str] = None
     existing_order_row: Optional[dict] = None
+    existing_opportunity_row: Optional[dict] = None
 
 
 def _resolve_shared_setup_disposition(
@@ -1558,6 +1560,17 @@ def _resolve_shared_setup_disposition(
             source="active-entry-fence",
         )
         if _active_disp is not None:
+            if (
+                _active_disp.disposition == _DISPOSITION_REATTACH_WATCHER
+                and lookup.lookup_status == _LS_FOUND
+                and isinstance(lookup.row, dict)
+            ):
+                return _DispositionResult(
+                    _active_disp.disposition,
+                    _active_disp.existing_local_order_id,
+                    _active_disp.existing_order_row,
+                    lookup.row,
+                )
             return _active_disp
 
         log.warning(
@@ -1723,6 +1736,425 @@ def _record_watch_arm_failure_proof(
             local_order_id,
             exc,
         )
+
+
+def _record_retryable_row(
+    result: dict,
+    *,
+    job_id,
+    signal_id,
+    source: str,
+) -> None:
+    """Keep the durable retry count bound to the exact source rows."""
+    result["retryable_deferred"] = int(result.get("retryable_deferred", 0) or 0) + 1
+    retryable_rows = result.setdefault("retryable_rows", [])
+    if not isinstance(retryable_rows, list):
+        retryable_rows = []
+        result["retryable_rows"] = retryable_rows
+    retryable_rows.append(
+        {
+            "job_id": "" if job_id is None else str(job_id).strip(),
+            "signal_id": "" if signal_id is None else str(signal_id).strip(),
+            "source": str(source or "").strip().lower(),
+        }
+    )
+
+
+def _overnight_source_provenance(*, source: str, job_id, signal_id) -> dict | None:
+    """Return the exact source-row identity that must follow an overnight order."""
+    _source = str(source or "").strip().lower()
+    _job_id = "" if job_id is None else str(job_id).strip()
+    _signal_id = "" if signal_id is None else str(signal_id).strip()
+    if _source not in {"trade_queue", "ap_signals"} or not _job_id or not _signal_id:
+        return None
+    return {
+        "overnight_source_table": _source,
+        "overnight_source_job_id": _job_id,
+        "overnight_source_signal_id": _signal_id,
+    }
+
+
+def _overnight_source_provenance_matches(
+    metadata: dict,
+    provenance: dict | None,
+) -> bool:
+    """Prove an existing order already carries the exact source-row identity."""
+    if not isinstance(metadata, dict) or not isinstance(provenance, dict):
+        return False
+    _keys = (
+        "overnight_source_table",
+        "overnight_source_job_id",
+        "overnight_source_signal_id",
+    )
+    return all(
+        str(metadata.get(key) or "").strip()
+        == str(provenance.get(key) or "").strip()
+        and bool(str(metadata.get(key) or "").strip())
+        for key in _keys
+    )
+
+
+_OVERNIGHT_SOURCE_PROVENANCE_KEYS = (
+    "overnight_source_table",
+    "overnight_source_job_id",
+    "overnight_source_signal_id",
+)
+_LEGACY_OVERNIGHT_SOURCE_KEYS = (
+    "source_table",
+    "source_job_id",
+    "original_signal_id",
+)
+
+
+def _order_metadata(order_row: dict) -> dict | None:
+    """Return a copied, typed orders.meta payload for ownership checks."""
+    if not isinstance(order_row, dict):
+        return None
+    if "meta" in order_row:
+        raw_meta = order_row.get("meta")
+    elif "metadata" in order_row:
+        # A few durable adapters expose the JSONB column as ``metadata``.
+        raw_meta = order_row.get("metadata")
+    else:
+        raw_meta = {}
+    if isinstance(raw_meta, str):
+        try:
+            import json as _json
+            raw_meta = _json.loads(raw_meta)
+        except Exception:
+            return None
+    if not isinstance(raw_meta, dict):
+        return None
+    return dict(raw_meta)
+
+
+def _overnight_order_identity_matches(
+    order_row: dict,
+    *,
+    client_id: str,
+    execution_mode: str,
+    signal_id: str,
+    canonical_signal_id: str,
+) -> bool:
+    """Require the durable order row to match the current source identity."""
+    if not isinstance(order_row, dict):
+        return False
+    return (
+        str(order_row.get("client_id") or "").strip() == str(client_id or "").strip()
+        and str(order_row.get("execution_mode") or "").strip().lower()
+        == str(execution_mode or "").strip().lower()
+        and str(order_row.get("signal_id") or "").strip()
+        == str(signal_id or "").strip()
+        and str(order_row.get("canonical_signal_id") or "").strip()
+        == str(canonical_signal_id or "").strip()
+        and str(order_row.get("kind") or "").strip().upper() == "ENTRY"
+        and str(order_row.get("status") or "").strip().upper() == "PENDING_TRIGGER"
+    )
+
+
+def _strict_meta_true(value) -> bool:
+    """Accept only a real JSON true (or its exact serialized spelling)."""
+    return value is True or (
+        isinstance(value, str) and value.strip().lower() == "true"
+    )
+
+
+def _legacy_overnight_source_evidence(
+    order_row: dict,
+    metadata: dict,
+    *,
+    opportunity_row: dict | None = None,
+    local_order_id: str = "",
+    client_id: str,
+    execution_mode: str,
+    signal_id: str,
+    canonical_signal_id: str,
+    provenance: dict,
+    session_key: str,
+) -> tuple[bool, str, dict, tuple[str, ...]]:
+    """Validate old source metadata before a one-time provenance upgrade.
+
+    The current reeval source row supplies the current session and the exact
+    source triple.  The legacy order or its exact opportunity-ledger row must
+    independently bind itself to that source through the pre-#595 fields.
+    Missing or contradictory evidence is never upgraded; the caller keeps the
+    order untouched and retries later.  The returned predicates are the exact
+    values/absences the CAS must see on the order row.
+    """
+    if not _overnight_order_identity_matches(
+        order_row,
+        client_id=client_id,
+        execution_mode=execution_mode,
+        signal_id=signal_id,
+        canonical_signal_id=canonical_signal_id,
+    ):
+        return False, "legacy_order_identity_mismatch", {}, ()
+    if not isinstance(metadata, dict) or not isinstance(provenance, dict):
+        return False, "legacy_order_metadata_invalid", {}, ()
+
+    # A partial or malformed new triple is not a legacy row.  It may have been
+    # written by a concurrent/current process and must not be completed by a
+    # different proof path.
+    if any(key in metadata for key in _OVERNIGHT_SOURCE_PROVENANCE_KEYS):
+        return False, "source_provenance_partial_or_mismatched", {}, ()
+
+    expected_source = str(provenance.get("overnight_source_table") or "").strip().lower()
+    expected_job_id = str(provenance.get("overnight_source_job_id") or "").strip()
+    expected_source_signal_id = str(
+        provenance.get("overnight_source_signal_id") or ""
+    ).strip()
+    expected_mode = str(execution_mode or "").strip().lower()
+    expected_client = str(client_id or "").strip()
+    expected_signal_id = str(signal_id or "").strip()
+    expected_canonical = str(canonical_signal_id or "").strip()
+    expected_session = str(session_key or "").strip()
+    if not all(
+        (
+            expected_source,
+            expected_job_id,
+            expected_source_signal_id,
+            expected_mode,
+            expected_client,
+            expected_signal_id,
+            expected_canonical,
+            expected_session,
+        )
+    ):
+        return False, "legacy_upgrade_inputs_incomplete", {}, ()
+
+    _opportunity_meta = None
+    if opportunity_row is not None:
+        if not isinstance(opportunity_row, dict):
+            return False, "legacy_opportunity_row_invalid", {}, ()
+        if (
+            str(opportunity_row.get("client_id") or "").strip() != expected_client
+            or str(opportunity_row.get("canonical_signal_id") or "").strip()
+            != expected_canonical
+            or str(opportunity_row.get("order_local_id") or "").strip()
+            != str(local_order_id or "").strip()
+        ):
+            return False, "legacy_opportunity_identity_mismatch", {}, ()
+        _opportunity_meta = _order_metadata(opportunity_row)
+        if _opportunity_meta is None:
+            return False, "legacy_opportunity_metadata_invalid", {}, ()
+        _opportunity_new_keys = [
+            key for key in _OVERNIGHT_SOURCE_PROVENANCE_KEYS
+            if key in _opportunity_meta
+        ]
+        if _opportunity_new_keys and (
+            len(_opportunity_new_keys) != len(_OVERNIGHT_SOURCE_PROVENANCE_KEYS)
+            or not _overnight_source_provenance_matches(
+                _opportunity_meta, provenance
+            )
+        ):
+            return False, "opportunity_source_provenance_partial_or_mismatched", {}, ()
+
+    expected_meta: dict = {}
+    expected_meta_absent: list[str] = list(_OVERNIGHT_SOURCE_PROVENANCE_KEYS)
+    _source_evidence_count = 0
+    _session_evidence_count = 0
+
+    def _require_text(
+        source_metadata: dict,
+        key: str,
+        expected: str,
+        *,
+        lower: bool = False,
+    ) -> bool:
+        if key not in source_metadata:
+            return False
+        actual = str(source_metadata.get(key) or "").strip()
+        if lower:
+            actual = actual.lower()
+        return bool(actual) and actual == expected
+
+    def _check_legacy_authority(authority_name: str, authority_meta: dict) -> tuple[bool, str]:
+        nonlocal _source_evidence_count, _session_evidence_count
+
+        if not isinstance(authority_meta, dict):
+            return False, f"{authority_name}_metadata_invalid"
+
+        _new_keys = [
+            key for key in _OVERNIGHT_SOURCE_PROVENANCE_KEYS
+            if key in authority_meta
+        ]
+        if _new_keys and not _overnight_source_provenance_matches(
+            authority_meta, provenance
+        ):
+            return False, f"{authority_name}_source_provenance_mismatched"
+
+        _legacy_keys = [
+            key for key in _LEGACY_OVERNIGHT_SOURCE_KEYS
+            if key in authority_meta
+        ]
+        if _legacy_keys:
+            if len(_legacy_keys) != len(_LEGACY_OVERNIGHT_SOURCE_KEYS):
+                return False, f"{authority_name}_source_identity_partial"
+            if not _require_text(authority_meta, "source_table", expected_source, lower=True):
+                return False, f"{authority_name}_source_table_missing_or_mismatched"
+            if not _require_text(authority_meta, "source_job_id", expected_job_id):
+                return False, f"{authority_name}_source_job_id_missing_or_mismatched"
+            if not _require_text(authority_meta, "original_signal_id", expected_source_signal_id):
+                return False, f"{authority_name}_source_signal_id_missing_or_mismatched"
+            _source_evidence_count += 1
+
+        # Optional legacy aliases are checked when present so contradictory
+        # metadata cannot be hidden behind a matching required triple.
+        for key, expected, lower in (
+            ("source", expected_source, True),
+            ("source_signal_id", expected_source_signal_id, False),
+        ):
+            if key in authority_meta:
+                if not _require_text(authority_meta, key, expected, lower=lower):
+                    return False, f"{authority_name}_{key}_missing_or_mismatched"
+
+        # If an authority mirrors row identity in metadata, it must corroborate
+        # the exact row-level client/mode/signal/canonical identity.
+        for key, expected, lower in (
+            ("client_id", expected_client, False),
+            ("execution_mode", expected_mode, True),
+            ("signal_id", expected_signal_id, False),
+            ("canonical_signal_id", expected_canonical, False),
+        ):
+            if key in authority_meta and not _require_text(
+                authority_meta, key, expected, lower=lower
+            ):
+                return False, f"{authority_name}_{key}_missing_or_mismatched"
+
+        if "overnight" in authority_meta and not _strict_meta_true(
+            authority_meta.get("overnight")
+        ):
+            return False, f"{authority_name}_overnight_marker_mismatched"
+
+        if "overnight_reeval_session_key" in authority_meta:
+            if str(authority_meta.get("overnight_reeval_session_key") or "").strip() != expected_session:
+                return False, f"{authority_name}_reeval_session_mismatched"
+            _session_evidence_count += 1
+
+        return True, ""
+
+    for _authority_name, _authority_meta in (
+        [("legacy_order", metadata)]
+        + (
+            [("legacy_opportunity", _opportunity_meta)]
+            if _opportunity_meta is not None
+            else []
+        )
+    ):
+        _authority_ok, _authority_reason = _check_legacy_authority(
+            _authority_name, _authority_meta
+        )
+        if not _authority_ok:
+            return False, _authority_reason, {}, ()
+
+    # Build exact order-row predicates.  If legacy source/session fields were
+    # supplied by the opportunity ledger instead of orders.meta, require them
+    # to remain absent on the order throughout the CAS; the ledger row is
+    # still bound to this exact local_order_id above.
+    for _key in (
+        *_LEGACY_OVERNIGHT_SOURCE_KEYS,
+        "source",
+        "source_signal_id",
+        "client_id",
+        "execution_mode",
+        "signal_id",
+        "canonical_signal_id",
+        "overnight",
+        "overnight_reeval_session_key",
+    ):
+        if _key in metadata:
+            # Preserve the durable spelling for the CAS predicate.  The
+            # validator above compares identity fields after the same
+            # trim/case normalization used by the runtime; preserving the
+            # stored value lets a valid legacy row use ``PAPER`` or padded
+            # text without making the CAS miss for cosmetic differences.
+            expected_meta[_key] = metadata.get(_key)
+        else:
+            expected_meta_absent.append(_key)
+
+    if _source_evidence_count < 1:
+        return False, "legacy_source_identity_missing", {}, ()
+    if _session_evidence_count < 1:
+        return False, "legacy_current_session_missing", {}, ()
+
+    # Deduplicate only for stable SQL/test evidence; preserving strict key
+    # absence is important for a concurrent writer race.
+    return (
+        True,
+        "legacy_exact_source_identity",
+        expected_meta,
+        tuple(dict.fromkeys(expected_meta_absent)),
+    )
+
+
+def _persist_overnight_order_provenance(
+    order_state_machine,
+    *,
+    local_order_id: str,
+    client_id: str,
+    execution_mode: str,
+    signal_id: str,
+    canonical_signal_id: str,
+    provenance: dict,
+    expected_meta: dict,
+    expected_meta_absent: tuple[str, ...],
+) -> bool:
+    """CAS-add the new source triple to a proven legacy order."""
+    _update_order_meta = getattr(order_state_machine, "update_order_meta", None)
+    if not callable(_update_order_meta):
+        log.critical(
+            "OVERNIGHT_ORDER_PROVENANCE_UPDATE_UNAVAILABLE client=%s mode=%s "
+            "signal=%s local_order_id=%s",
+            client_id, execution_mode, signal_id, local_order_id,
+        )
+        return False
+    try:
+        return bool(
+            _update_order_meta(
+                local_order_id,
+                dict(provenance),
+                expected_status="PENDING_TRIGGER",
+                expected_execution_mode=str(execution_mode or "").strip().lower(),
+                expected_signal_id=str(signal_id or "").strip(),
+                expected_canonical_signal_id=str(canonical_signal_id or "").strip(),
+                expected_kind="ENTRY",
+                expected_meta=dict(expected_meta),
+                expected_meta_absent=tuple(expected_meta_absent),
+            )
+        )
+    except Exception as exc:
+        log.critical(
+            "OVERNIGHT_ORDER_PROVENANCE_UPDATE_FAILED client=%s mode=%s "
+            "signal=%s local_order_id=%s error=%s",
+            client_id, execution_mode, signal_id, local_order_id, exc,
+        )
+        return False
+
+
+def _reread_overnight_order(order_state_machine, local_order_id: str) -> dict | None:
+    """Read the order again after CAS; a successful UPDATE is not proof."""
+    _get_order = getattr(order_state_machine, "get_order", None)
+    if not callable(_get_order):
+        log.critical(
+            "OVERNIGHT_ORDER_PROVENANCE_READBACK_UNAVAILABLE local_order_id=%s",
+            local_order_id,
+        )
+        return None
+    try:
+        row = _get_order(local_order_id)
+    except Exception as exc:
+        log.critical(
+            "OVERNIGHT_ORDER_PROVENANCE_READBACK_FAILED local_order_id=%s error=%s",
+            local_order_id, exc,
+        )
+        return None
+    if isinstance(row, dict):
+        return dict(row)
+    try:
+        return dict(row) if row is not None else None
+    except Exception:
+        return None
+
 
 
 def _classify_overnight_reeval_result(result: dict) -> dict:
@@ -2019,6 +2451,22 @@ def run_overnight_reeval(
             import json; signal = json.loads(signal)
         signal_id = job.get("signal_id") or signal.get("signal_id", "")
         job_source = job.get("_source") or ("ap_signals" if str(job_id).startswith("sup:") else "trade_queue")
+        source_provenance = _overnight_source_provenance(
+            source=job_source,
+            job_id=job_id,
+            signal_id=signal_id,
+        )
+        if source_provenance is None:
+            log.critical(
+                "[%s] overnight_reeval: source-row identity incomplete source=%r "
+                "job_id=%r signal_id=%r — classifying retryable_deferred",
+                client_id, job_source, job_id, signal_id,
+            )
+            result["skipped"] = result.get("skipped", 0) + 1
+            _record_retryable_row(
+                result, job_id=job_id, signal_id=signal_id, source=job_source
+            )
+            continue
         ticker = signal.get("ticker") or signal.get("symbol", "?")
         side = _normalize_overnight_side(signal.get("side") or signal.get("direction"))
         if side not in {"CALL", "PUT"}:
@@ -2202,22 +2650,147 @@ def run_overnight_reeval(
                     _reattach_client = client_id
                     _reattach_mode   = _execution_mode
                     _reattach_side   = str(_existing_ord.get("direction") or side).upper()
-                    _reattach_signal_id = str(_existing_ord.get("signal_id") or signal_id)
+                    _reattach_signal_id = str(_existing_ord.get("signal_id") or "").strip()
                     _reattach_canonical = str(
                         _existing_ord.get("canonical_signal_id")
-                        or _resolve_canonical_signal_id(signal_id, signal)
+                        or ""
                     )
 
-                    # Parse existing order metadata (best-effort).
-                    _ord_meta = _existing_ord.get("meta") or {}
-                    if isinstance(_ord_meta, str):
-                        try:
-                            import json as _json
-                            _ord_meta = _json.loads(_ord_meta)
-                        except Exception:
-                            _ord_meta = {}
-                    if not isinstance(_ord_meta, dict):
-                        _ord_meta = {}
+                    # The active-order query is exact, but retain an explicit
+                    # row-level identity check before any metadata write.  A
+                    # malformed adapter row must never be upgraded by a
+                    # source-identity fallback.
+                    _expected_canonical = _resolve_canonical_signal_id(signal_id, signal)
+                    _ord_meta = _order_metadata(_existing_ord)
+                    if not _overnight_order_identity_matches(
+                        _existing_ord,
+                        client_id=client_id,
+                        execution_mode=_reattach_mode,
+                        signal_id=signal_id,
+                        canonical_signal_id=_expected_canonical,
+                    ):
+                        log.critical(
+                            "[%s] overnight_reeval: REATTACH_WATCHER durable order "
+                            "identity mismatch signal=%s local_order_id=%s — "
+                            "preserving order and classifying retryable",
+                            ticker, signal_id, _existing_oid,
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        _record_retryable_row(
+                            result, job_id=job_id, signal_id=signal_id, source=job_source
+                        )
+                        continue
+                    _reattach_canonical = _expected_canonical
+
+                    if _ord_meta is None:
+                        log.critical(
+                            "[%s] overnight_reeval: REATTACH_WATCHER order metadata "
+                            "invalid signal=%s local_order_id=%s — preserving order "
+                            "and classifying retryable",
+                            ticker, signal_id, _existing_oid,
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        _record_retryable_row(
+                            result, job_id=job_id, signal_id=signal_id, source=job_source
+                        )
+                        continue
+
+                    # New orders already carrying the exact triple take the
+                    # existing path.  A missing triple may be upgraded only
+                    # when old durable source/session evidence independently
+                    # proves this exact order belongs to this current row.
+                    if not _overnight_source_provenance_matches(
+                        _ord_meta, source_provenance
+                    ):
+                        (
+                            _legacy_upgrade_ok,
+                            _legacy_upgrade_reason,
+                            _legacy_expected_meta,
+                            _legacy_expected_meta_absent,
+                        ) = _legacy_overnight_source_evidence(
+                            _existing_ord,
+                            _ord_meta,
+                            opportunity_row=_disp_result.existing_opportunity_row,
+                            local_order_id=_existing_oid,
+                            client_id=client_id,
+                            execution_mode=_reattach_mode,
+                            signal_id=signal_id,
+                            canonical_signal_id=_reattach_canonical,
+                            provenance=source_provenance,
+                            session_key=session_key,
+                        )
+                        if not _legacy_upgrade_ok:
+                            log.critical(
+                                "[%s] overnight_reeval: REATTACH_WATCHER source "
+                                "provenance missing_or_mismatched signal=%s "
+                                "local_order_id=%s reason=%s expected=%s existing=%s "
+                                "— preserving order and classifying retryable",
+                                ticker, signal_id, _existing_oid,
+                                _legacy_upgrade_reason,
+                                source_provenance, _ord_meta,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            _record_retryable_row(
+                                result, job_id=job_id, signal_id=signal_id, source=job_source
+                            )
+                            continue
+
+                        if not _persist_overnight_order_provenance(
+                            order_state_machine,
+                            local_order_id=_existing_oid,
+                            client_id=client_id,
+                            execution_mode=_reattach_mode,
+                            signal_id=signal_id,
+                            canonical_signal_id=_reattach_canonical,
+                            provenance=source_provenance,
+                            expected_meta=_legacy_expected_meta,
+                            expected_meta_absent=_legacy_expected_meta_absent,
+                        ):
+                            log.critical(
+                                "[%s] overnight_reeval: REATTACH_WATCHER legacy source "
+                                "provenance CAS missed signal=%s local_order_id=%s "
+                                "— preserving order and classifying retryable",
+                                ticker, signal_id, _existing_oid,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            _record_retryable_row(
+                                result, job_id=job_id, signal_id=signal_id, source=job_source
+                            )
+                            continue
+
+                        # Do not treat UPDATE rowcount as proof.  Re-read the
+                        # durable row and require its complete new triple plus
+                        # the original order identity before calling watch().
+                        _upgraded_order = _reread_overnight_order(
+                            order_state_machine, _existing_oid
+                        )
+                        _upgraded_meta = _order_metadata(_upgraded_order or {})
+                        if (
+                            not _overnight_order_identity_matches(
+                                _upgraded_order or {},
+                                client_id=client_id,
+                                execution_mode=_reattach_mode,
+                                signal_id=signal_id,
+                                canonical_signal_id=_reattach_canonical,
+                            )
+                            or _upgraded_meta is None
+                            or not _overnight_source_provenance_matches(
+                                _upgraded_meta, source_provenance
+                            )
+                        ):
+                            log.critical(
+                                "[%s] overnight_reeval: REATTACH_WATCHER legacy source "
+                                "provenance readback failed signal=%s local_order_id=%s "
+                                "— preserving order and classifying retryable",
+                                ticker, signal_id, _existing_oid,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            _record_retryable_row(
+                                result, job_id=job_id, signal_id=signal_id, source=job_source
+                            )
+                            continue
+                        _existing_ord = _upgraded_order
+                        _ord_meta = _upgraded_meta
 
                     # Metadata merge: existing FIRST, canonical values LAST
                     # so proven session/mode/client/canonical always win over
@@ -2233,6 +2806,7 @@ def run_overnight_reeval(
                         "overnight_reeval_session_key":     session_key,
                         "signal_id":                        _reattach_signal_id,
                         "canonical_signal_id":              _reattach_canonical,
+                        **source_provenance,
                         # PR #388 Blocker 1: REATTACH is a proven PR#388
                         # seam and opts in to the late-attachment classifier.
                         "late_attachment_policy_eligible":  True,

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import uuid
 import os
+from copy import deepcopy
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
 from typing import Optional
@@ -85,6 +86,7 @@ class _MockOSM:
         self._cancel_raises  = cancel_raises
         self._get_order_status = get_order_status
         self._rows: dict = {}
+        self.phase_one_recovery_calls: list = []
 
     def seed(self, row: dict) -> dict:
         self._rows[row["local_order_id"]] = dict(row)
@@ -116,6 +118,45 @@ class _MockOSM:
             meta = {}
         meta.update(dict(patch))
         row["meta"] = meta
+        return True
+
+    def recover_stale_market_truth_pending_retry(self, oid: str, **kwargs) -> bool:
+        self.phase_one_recovery_calls.append((oid, kwargs))
+        row = self._rows.get(oid)
+        if not isinstance(row, dict):
+            return False
+        meta = row.get("meta")
+        if not isinstance(meta, dict):
+            return False
+        attempt = kwargs["attempt"]
+        failure = dict(kwargs["selector_failure"])
+        failure["materialization_market_truth_pending"] = True
+        meta.update({
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "materialization_in_flight": False,
+            "materialization_owner": "",
+            "materialization_lease_until": "",
+            "current_owner": "",
+            "watcher_token": "",
+            "retry_owner": "",
+            "recovery_owner": "",
+            "materialization_generation": kwargs["generation"],
+            "retry_attempt": attempt,
+            "breach_attempt_count": attempt,
+            "materialization_attempts": attempt,
+            "retry_max_attempts": kwargs["max_attempts"],
+            "retry_reason": kwargs["reason_code"],
+            "materialization_reason": kwargs["reason_code"],
+            "materialization_next_retry_at": kwargs["next_retry_at"],
+            "materialization_last_failure_at": datetime.now(
+                timezone.utc
+            ).isoformat(),
+            "materialization_outcome": "RETRY_LATER_DATA_UNAVAILABLE",
+            "materialization_selector_failure": failure,
+            "materialization_market_truth_pending": True,
+            "broker_ready": False,
+        })
         return True
 
 
@@ -1442,6 +1483,646 @@ class TestAmendment10Required:
         assert result is None, (
             f"No entry_watcher → must return None (unavailable), not False; got {result}"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PR #568 — expired phase-one market-truth claim recovery
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class _AuthoritativeOrdersBroker:
+    def __init__(self, pages=None, error=None, *, account_id="acct-live"):
+        self.cfg = SimpleNamespace(account_id=account_id)
+        self.pages = pages if pages is not None else {
+            1: {"orders": {"order": []}}
+        }
+        self.error = error
+        self.paths = []
+        self.submit_order = MagicMock()
+        self.cancel_order = MagicMock()
+
+    def _get(self, path):
+        self.paths.append(path)
+        if self.error:
+            raise self.error
+        page = int(path.split("page=")[1].split("&")[0])
+        return self.pages.get(page, {"orders": {"order": []}})
+
+
+def _phase_one_crash_row(
+    reason="DIRECT_QUOTE_ZERO_BID_ASK", execution_mode="live"
+):
+    from ap_canonical_signal import build_canonical_signal_id
+
+    now = datetime.now(timezone.utc)
+    mode = str(execution_mode or "").strip().lower()
+    if mode not in {"live", "paper"}:
+        raise ValueError(f"unsupported test execution mode: {execution_mode!r}")
+    oid = f"phase-one-{mode}-order"
+    signal_id = f"phase-one-{mode}-signal"
+    owner = f"recovery_retry:client@test.com:{oid}:8"
+    row = _row(
+        local_order_id=oid,
+        signal_id=signal_id,
+        client_id="client@test.com",
+        execution_mode=mode,
+        meta={
+            "watcher_audit": {"reason_code": "trigger_ready"},
+            "trigger_price": 450.0,
+            "trigger_crossed_at": (now - timedelta(minutes=2)).isoformat(),
+            "trigger_crossed_at_provenance": {
+                "canonical_signal_id": build_canonical_signal_id(signal_id),
+                "client_id": "client@test.com",
+                "execution_mode": mode,
+                "local_order_id": oid,
+            },
+            "absolute_entry_deadline": (now + timedelta(hours=2)).isoformat(),
+            "lifecycle_state": "MATERIALIZING",
+            "materialization_status": "RUNNING",
+            "materialization_in_flight": True,
+            "materialization_market_truth_pending": True,
+            "materialization_owner": owner,
+            "current_owner": owner,
+            "watcher_token": owner,
+            "materialization_lease_until": (
+                now - timedelta(seconds=30)
+            ).isoformat(),
+            "materialization_generation": 7,
+            "retry_attempt": 3,
+            "breach_attempt_count": 3,
+            "materialization_attempts": 3,
+            "retry_max_attempts": 5,
+            "retry_reason": reason,
+            "materialization_reason": reason,
+            "materialization_outcome": "RETRY_LATER_DATA_UNAVAILABLE",
+            "materialization_selector_failure": {"reason_code": reason},
+            "broker_ready": False,
+            "submit_intent_at": "",
+            "broker_submit_key": "",
+            "broker_submit_payload_hash": "",
+            "recovery_submit_owner": "",
+            "recovery_submit_lease_until": "",
+            "recovery_submit_fenced": False,
+        },
+    )
+    row["contract"] = "DEFERRED:SPY"
+    return row
+
+
+def _phase_one_recovery(row, broker, *, recovery_mode=None):
+    osm = _MockOSM()
+    osm.seed(row)
+    mode = str(
+        recovery_mode or row.get("execution_mode") or ""
+    ).strip().lower()
+    rec = PendingTriggerRestartRecovery(
+        client_id="client@test.com",
+        execution_mode=mode,
+        osm=osm,
+        broker=broker,
+        quote_check_fn=lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("phase-one recovery must not request a market quote")
+        ),
+    )
+    return rec, osm
+
+
+class TestPhaseOneCrashRecovery:
+    @pytest.mark.parametrize("execution_mode", ["live", "paper"])
+    def test_exact_absence_restores_retry_wait_at_same_attempt(
+        self, monkeypatch, execution_mode
+    ):
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        row = _phase_one_crash_row(execution_mode=execution_mode)
+        account_id = f"acct-{execution_mode}"
+        broker = _AuthoritativeOrdersBroker(account_id=account_id)
+        rec, osm = _phase_one_recovery(row, broker)
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.RETRY_OWNED
+        assert len(osm.phase_one_recovery_calls) == 1
+        assert osm.phase_one_recovery_calls[0][1]["execution_mode"] == execution_mode
+        assert broker.paths == [
+            f"/v1/accounts/{account_id}/orders?includeTags=true&page=1&limit=500"
+        ]
+        reread = osm.get_order(row["local_order_id"])
+        meta = reread["meta"]
+        assert meta["materialization_generation"] == 7
+        assert [meta[key] for key in (
+            "retry_attempt", "breach_attempt_count", "materialization_attempts"
+        )] == [3, 3, 3]
+        assert meta["lifecycle_state"] == "RETRY_WAIT"
+        assert meta["materialization_market_truth_pending"] is True
+        assert all(not meta.get(key) for key in (
+            "materialization_owner", "current_owner", "watcher_token", "retry_owner"
+        ))
+        assert osm.cancel_calls == []
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
+
+    @pytest.mark.parametrize("execution_mode", ["live", "paper"])
+    @pytest.mark.parametrize("broker_shape", ["found", "error", "unavailable"])
+    def test_broker_found_or_unknown_never_mutates(
+        self, monkeypatch, broker_shape, execution_mode
+    ):
+        from ap.broker_submit_identity import canonical_broker_submit_key
+
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        row = _phase_one_crash_row(execution_mode=execution_mode)
+        account_id = f"acct-{execution_mode}"
+        if broker_shape == "found":
+            broker = _AuthoritativeOrdersBroker({
+                1: {"orders": {"order": {
+                    "id": "broker-1",
+                    "status": "open",
+                    "tag": canonical_broker_submit_key(row["local_order_id"]),
+                }}}
+            }, account_id=account_id)
+        elif broker_shape == "error":
+            broker = _AuthoritativeOrdersBroker(
+                error=RuntimeError("transport down"), account_id=account_id
+            )
+        else:
+            broker = MagicMock()
+        rec, osm = _phase_one_recovery(row, broker)
+
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert osm.phase_one_recovery_calls == []
+        assert osm.cancel_calls == []
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
+
+    def test_cross_mode_owner_fails_closed_without_cleanup(self, monkeypatch):
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        row = _phase_one_crash_row(execution_mode="live")
+        broker = _AuthoritativeOrdersBroker(account_id="acct-live")
+        rec, osm = _phase_one_recovery(
+            row, broker, recovery_mode="paper"
+        )
+
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert osm.phase_one_recovery_calls == []
+        assert osm.cancel_calls == []
+        assert broker.paths == []
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
+
+    def test_pagination_finds_exact_tag_on_second_page(self, monkeypatch):
+        from ap.broker_submit_identity import canonical_broker_submit_key
+
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        row = _phase_one_crash_row()
+        page_one = [
+            {
+                "id": f"other-{index}",
+                "status": "open",
+                "tag": f"other:{index}",
+            }
+            for index in range(500)
+        ]
+        broker = _AuthoritativeOrdersBroker({
+            1: {"orders": {"order": page_one}},
+            2: {"orders": {"order": {
+                "id": "exact",
+                "status": "open",
+                "tag": canonical_broker_submit_key(row["local_order_id"]),
+            }}},
+        })
+        rec, osm = _phase_one_recovery(row, broker)
+
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert len(broker.paths) == 2
+        assert osm.phase_one_recovery_calls == []
+
+    @pytest.mark.parametrize(
+        "broker_shape",
+        [
+            ("orders_none", {"orders": None}),
+            ("orders_string_null", {"orders": "null"}),
+            ("orders_node_missing_order", {"orders": {}}),
+            ("orders_empty_object", {"orders": {"order": {}}}),
+            (
+                "orders_unrecognized_row",
+                {"orders": {"order": [{"some": "unrecognized"}]}},
+            ),
+            (
+                "orders_row_missing_status",
+                {"orders": {"order": [{"id": "row-1", "tag": "other"}]}},
+            ),
+            (
+                "orders_row_missing_id",
+                {"orders": {"order": [{"status": "open", "tag": "other"}]}},
+            ),
+            (
+                "orders_non_dict_row",
+                {"orders": {"order": ["unrecognized"]}},
+            ),
+            (
+                "orders_rows_wrong_type",
+                {"orders": {"order": "not-a-list"}},
+            ),
+            ("missing_orders", {}),
+            ("transport_error", None),
+            ("unavailable", None),
+            ("pagination_stalled", None),
+        ],
+        ids=[
+            "orders_none",
+            "orders_string_null",
+            "orders_node_missing_order",
+            "orders_empty_object",
+            "orders_unrecognized_row",
+            "orders_row_missing_status",
+            "orders_row_missing_id",
+            "orders_non_dict_row",
+            "orders_rows_wrong_type",
+            "missing_orders",
+            "transport_error",
+            "unavailable",
+            "pagination_stalled",
+        ],
+    )
+    @pytest.mark.parametrize("execution_mode", ["live", "paper"])
+    def test_malformed_or_incomplete_order_truth_never_recovers(
+        self, monkeypatch, broker_shape, execution_mode
+    ):
+        """Malformed or incomplete broker truth cannot prove exact-tag absence."""
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        row = _phase_one_crash_row(execution_mode=execution_mode)
+        before_meta = deepcopy(row["meta"])
+        account_id = f"acct-{execution_mode}"
+        shape, payload = broker_shape
+        if shape == "transport_error":
+            broker = _AuthoritativeOrdersBroker(
+                error=RuntimeError("transport down"), account_id=account_id
+            )
+        elif shape == "unavailable":
+            broker = _AuthoritativeOrdersBroker(account_id="")
+        elif shape == "pagination_stalled":
+            page = [
+                {
+                    "id": f"stalled-{index}",
+                    "status": "open",
+                    "tag": f"other:{index}",
+                }
+                for index in range(500)
+            ]
+            broker = _AuthoritativeOrdersBroker({
+                1: {"orders": {"order": page}},
+                2: {"orders": {"order": list(page)}},
+            }, account_id=account_id)
+        else:
+            broker = _AuthoritativeOrdersBroker(
+                {1: payload}, account_id=account_id
+            )
+        rec, osm = _phase_one_recovery(row, broker)
+
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert osm.phase_one_recovery_calls == []
+        assert osm.meta_writes == []
+        assert osm.cancel_calls == []
+        assert osm._rows[row["local_order_id"]]["meta"] == before_meta
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+        ],
+    )
+    def test_count_bounded_retryable_data_recovers_at_same_attempt_below_max(
+        self, monkeypatch, reason
+    ):
+        """A phase-one crash cannot spend N or terminalize while N < max."""
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+        monkeypatch.setenv("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", "5")
+        row = _phase_one_crash_row(reason)
+        broker = _AuthoritativeOrdersBroker()
+        rec, osm = _phase_one_recovery(row, broker)
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.RETRY_OWNED
+        assert len(osm.phase_one_recovery_calls) == 1
+        kwargs = osm.phase_one_recovery_calls[0][1]
+        assert kwargs["attempt"] == 3
+        assert kwargs["max_attempts"] == 5
+        assert [row["meta"][key] for key in (
+            "retry_attempt", "breach_attempt_count", "materialization_attempts"
+        )] == [3, 3, 3]
+        assert row["meta"]["lifecycle_state"] == "RETRY_WAIT"
+        assert osm.cancel_calls == []
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+        ],
+    )
+    def test_count_bounded_retryable_data_at_max_stays_terminal(
+        self, monkeypatch, reason
+    ):
+        """Count-bounded retryable data still terminalizes at N >= max."""
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+        monkeypatch.setenv("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", "5")
+        row = _phase_one_crash_row(reason)
+        row["meta"].update({
+            "retry_attempt": 5,
+            "breach_attempt_count": 5,
+            "materialization_attempts": 5,
+            "retry_max_attempts": 5,
+        })
+        broker = _AuthoritativeOrdersBroker()
+        rec, osm = _phase_one_recovery(row, broker)
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.TERMINALIZED
+        assert osm.phase_one_recovery_calls == []
+        assert len(osm.cancel_calls) == 1
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
+
+    def test_validity_bound_phase_one_retry_ignores_telemetry_max(self, monkeypatch):
+        """Validity-bound data truth remains recoverable beyond numeric max."""
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+        monkeypatch.setenv("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", "5")
+        row = _phase_one_crash_row("DIRECT_QUOTE_ZERO_BID_ASK")
+        row["meta"].update({
+            "retry_attempt": 6,
+            "breach_attempt_count": 6,
+            "materialization_attempts": 6,
+            "retry_max_attempts": 5,
+        })
+        broker = _AuthoritativeOrdersBroker()
+        rec, osm = _phase_one_recovery(row, broker)
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.RETRY_OWNED
+        assert len(osm.phase_one_recovery_calls) == 1
+        kwargs = osm.phase_one_recovery_calls[0][1]
+        assert kwargs["attempt"] == 6
+        assert kwargs["max_attempts"] == 6
+        assert osm.cancel_calls == []
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
+
+    def test_recovered_count_bounded_retry_runs_fresh_selector_once(
+        self, monkeypatch
+    ):
+        """Phase-one recovery at N is followed by exactly one fresh N+1 pass."""
+        import ap_execution_core as core_mod
+
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+        monkeypatch.setenv("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", "5")
+        row = _phase_one_crash_row("DUPLICATE_QUOTE_CONFLICT_UNRESOLVED")
+        row.update({
+            "plan_id": "plan-phase-one-restart",
+            "symbol": "SPY",
+            "score": 80.0,
+            "tier": "A",
+            "timeframe": "1d",
+            "pattern": "3-1-2",
+            "stop_underlying": 447.0,
+            "target_underlying": 455.0,
+            "qty": 1,
+            "limit_price": 0.01,
+            "reserved_cost": 0.0,
+        })
+        broker = _AuthoritativeOrdersBroker()
+        rec, osm = _phase_one_recovery(row, broker)
+
+        assert rec.recover_one_row(row) == _RowOutcome.RETRY_OWNED
+        assert [row["meta"][key] for key in (
+            "retry_attempt", "breach_attempt_count", "materialization_attempts"
+        )] == [3, 3, 3]
+        row["meta"]["materialization_next_retry_at"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat()
+        row["meta"]["next_retry_at"] = row["meta"]["materialization_next_retry_at"]
+
+        claim_calls = []
+        fresh_truth_checks = []
+        selector_calls = []
+
+        def _claim(_oid, **kwargs):
+            claim_calls.append(dict(kwargs))
+            meta = osm._rows[_oid]["meta"]
+            if kwargs.get("advance_after_market_truth"):
+                assert kwargs["retry_attempt"] == 4
+                meta.update({
+                    "lifecycle_state": "MATERIALIZING",
+                    "materialization_status": "RUNNING",
+                    "materialization_in_flight": False,
+                    "materialization_market_truth_pending": False,
+                    "materialization_generation": kwargs["new_generation"],
+                    "retry_attempt": 4,
+                    "breach_attempt_count": 4,
+                    "materialization_attempts": 4,
+                    "broker_ready": True,
+                })
+            else:
+                assert kwargs["retry_attempt"] == 3
+                meta.update({
+                    "lifecycle_state": "MATERIALIZING",
+                    "materialization_status": "RUNNING",
+                    "materialization_in_flight": True,
+                    "materialization_market_truth_pending": True,
+                    "materialization_owner": kwargs["owner"],
+                    "current_owner": kwargs["owner"],
+                    "watcher_token": kwargs["owner"],
+                    "materialization_generation": kwargs["new_generation"],
+                    "broker_ready": False,
+                })
+            return True
+
+        osm.claim_deferred_materialization = _claim
+
+        def _selector_callback(watched):
+            selector_calls.append(watched)
+            signal = watched.signal
+            fresh_truth_checks.append(signal.get(
+                "_recovery_pre_claimed_market_truth_required"
+            ))
+            assert signal["retry_attempt"] == 3
+            assert _claim(
+                row["local_order_id"],
+                owner=signal["owner"],
+                generation=signal["materialization_generation"],
+                new_generation=signal["materialization_generation"],
+                retry_attempt=4,
+                advance_retry_attempt=True,
+                advance_after_market_truth=True,
+                signal_id=row["signal_id"],
+                execution_mode="live",
+                lease_until=(datetime.now(timezone.utc) + timedelta(
+                    seconds=120
+                )).isoformat(),
+            )
+
+        core = SimpleNamespace(
+            client_id="client@test.com",
+            email="client@test.com",
+            execution_mode="live",
+            mode="LIVE",
+            paper=False,
+            order_state_machine=osm,
+            broker=MagicMock(),
+        )
+        core._on_entry_trigger = _selector_callback
+        core.resume_deferred_materialization_retry = (
+            core_mod.APExecutionCore
+            .resume_deferred_materialization_retry.__get__(core, type(core))
+        )
+
+        result = core.resume_deferred_materialization_retry(
+            local_order_id=row["local_order_id"],
+            expected_generation=7,
+            expected_retry_attempt=4,
+            owner="recovery_retry:client@test.com:phase-one-live-order:4",
+        )
+
+        assert result["disposition"] == "BROKER_READY"
+        assert result["attempt"] == 4
+        assert fresh_truth_checks == [True]
+        assert len(selector_calls) == 1
+        assert len(claim_calls) == 2
+        assert claim_calls[0]["retry_attempt"] == 3
+        assert claim_calls[0]["advance_retry_attempt"] is False
+        assert claim_calls[1]["retry_attempt"] == 4
+        assert claim_calls[1]["advance_retry_attempt"] is True
+        assert [row["meta"][key] for key in (
+            "retry_attempt", "breach_attempt_count", "materialization_attempts"
+        )] == [4, 4, 4]
+        assert core.broker.submit_order.called is False
+        assert core.broker.cancel_order.called is False
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "OI_TOO_LOW",
+            "UNKNOWN_PHASE_ONE_REASON",
+        ],
+    )
+    def test_bounded_quality_and_unknown_keep_terminal_policy(
+        self, monkeypatch, reason
+    ):
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        row = _phase_one_crash_row(reason)
+        rec, osm = _phase_one_recovery(row, _AuthoritativeOrdersBroker())
+
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.TERMINALIZED
+        assert osm.phase_one_recovery_calls == []
+        assert len(osm.cancel_calls) == 1
+
+    def test_cutoff_and_submit_evidence_fail_closed(self, monkeypatch):
+        row = _phase_one_crash_row()
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "0")
+        rec, osm = _phase_one_recovery(row, _AuthoritativeOrdersBroker())
+        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+        assert osm.phase_one_recovery_calls == []
+
+        row = _phase_one_crash_row()
+        row["meta"]["recovery_submit_owner"] = "broker-submit-owner"
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        rec, osm = _phase_one_recovery(row, _AuthoritativeOrdersBroker())
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert osm.phase_one_recovery_calls == []
+        assert osm.cancel_calls == []
+
+    def test_exact_owner_cas_loss_is_unresolved_without_cleanup(self, monkeypatch):
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        row = _phase_one_crash_row()
+        rec, osm = _phase_one_recovery(row, _AuthoritativeOrdersBroker())
+        osm.recover_stale_market_truth_pending_retry = MagicMock(
+            return_value=False
+        )
+
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        osm.recover_stale_market_truth_pending_retry.assert_called_once()
+        assert osm.cancel_calls == []
+
+    def test_conflicting_retry_reason_aliases_are_unresolved(self, monkeypatch):
+        """A phase-one row with split reason authorities must not be recovered."""
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        row = _phase_one_crash_row(reason="DIRECT_QUOTE_ZERO_BID_ASK")
+        row["meta"]["materialization_reason"] = "OI_TOO_LOW"
+        broker = _AuthoritativeOrdersBroker()
+        rec, osm = _phase_one_recovery(row, broker)
+
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert osm.phase_one_recovery_calls == []
+        assert osm.cancel_calls == []
+        broker.submit_order.assert_not_called()
+        broker.cancel_order.assert_not_called()
+
+    # ── PR #568 amendment §2 — backoff deadline clip ──────────────────────────
+    # Binding invariant: the bounded-backoff ladder must NOT schedule
+    # next_retry_at past the absolute entry deadline. When the ladder would
+    # step past the deadline, recovery must leave the row UNRESOLVED (letting
+    # the ordinary lifecycle terminate it on the next poll) rather than write
+    # a doomed retry row.
+
+    def test_backoff_that_would_pass_deadline_leaves_row_unresolved(self, monkeypatch):
+        """attempt=4 (60s cap) with deadline 20s away must NOT schedule.
+
+        The prior behavior (fixed 8s delay) would have written a retry 8s
+        out — safely inside the 20s deadline. The new ladder at attempt=4
+        wants 60s, which would land 40s past the deadline. The clip must
+        refuse and leave the row UNRESOLVED so the ordinary deadline fence
+        terminates it on the next poll instead of a durable doomed row.
+        """
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        now = datetime.now(timezone.utc)
+        row = _phase_one_crash_row()
+        # Push attempt into the 60s ladder rung; move deadline within 20s.
+        row["meta"]["retry_attempt"] = 4
+        row["meta"]["breach_attempt_count"] = 4
+        row["meta"]["materialization_attempts"] = 4
+        row["meta"]["retry_max_attempts"] = 10
+        row["meta"]["absolute_entry_deadline"] = (
+            now + timedelta(seconds=20)
+        ).isoformat()
+
+        rec, osm = _phase_one_recovery(row, _AuthoritativeOrdersBroker())
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.UNRESOLVED
+        # Zero DB mutation, zero broker action.
+        assert osm.phase_one_recovery_calls == []
+        assert osm.cancel_calls == []
+
+    def test_backoff_within_deadline_still_schedules_normally(self, monkeypatch):
+        """Sanity check the clip is *only* triggered when the ladder overruns.
+
+        attempt=1 (8s step) with a deadline 5 minutes away must still
+        schedule cleanly — the clip must not become a blanket refusal.
+        """
+        monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+        now = datetime.now(timezone.utc)
+        row = _phase_one_crash_row()
+        row["meta"]["absolute_entry_deadline"] = (
+            now + timedelta(minutes=5)
+        ).isoformat()
+
+        rec, osm = _phase_one_recovery(row, _AuthoritativeOrdersBroker())
+        outcome = rec.recover_one_row(row)
+
+        assert outcome == _RowOutcome.RETRY_OWNED
+        assert len(osm.phase_one_recovery_calls) == 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -96,7 +96,14 @@ def _shared_row():
     }
 
 
-def _pending_trigger_order_row():
+def _pending_trigger_order_row(*, include_source_provenance=True):
+    meta = {}
+    if include_source_provenance:
+        meta.update({
+            "overnight_source_table": "ap_signals",
+            "overnight_source_job_id": "sup:sig-reattach-integration",
+            "overnight_source_signal_id": "sig-reattach-integration",
+        })
     return {
         "local_order_id":       EXISTING_LOCAL_OID,
         "status":               "PENDING_TRIGGER",
@@ -117,8 +124,22 @@ def _pending_trigger_order_row():
         "signal_id":            "sig-reattach-integration",
         "qty":                  2,
         "limit_price":          0.01,
-        "meta":                 {},
+        "meta":                 meta,
         "contract":             "DEFERRED:SPY",
+    }
+
+
+def _legacy_exact_source_metadata():
+    return {
+        "source_table": "ap_signals",
+        "source_job_id": "sup:sig-reattach-integration",
+        "original_signal_id": "sig-reattach-integration",
+        "overnight": True,
+        "overnight_reeval_session_key": _SIG_DATE,
+        "client_id": "jose@example.com",
+        "execution_mode": "paper",
+        "signal_id": "sig-reattach-integration",
+        "canonical_signal_id": "sig-reattach-integration",
     }
 
 
@@ -805,11 +826,17 @@ def _run_one_attempt(
     mock_ledger,
     watcher_already_owns=False,
     legacy_confirmed=False,
+    source_provenance=True,
+    legacy_source_metadata=None,
+    legacy_opportunity_row=None,
+    provenance_update=None,
+    durable_readback_row=None,
 ):
     """Drive the real run_overnight_reeval loop for a single attempt.
     Uses spies on master_control, contract_selector, OSM create/broker to
     prove the fence assertions."""
     _install_reeval_sub_module_stubs(monkeypatch)
+    monkeypatch.setattr(ov, "_overnight_reeval_session_key", lambda *_a, **_kw: _SIG_DATE)
 
     monkeypatch.setattr(
         ov, "_fetch_watching_signals_with_status_impl",
@@ -824,21 +851,36 @@ def _run_one_attempt(
     # Opportunity ledger reports FOUND but with no proof — resolver falls
     # through to the active-order query. This mirrors "watcher armed but
     # WATCHER_ARMED durable proof write failed on the previous attempt".
-    monkeypatch.setattr(
-        ov, "_get_client_opportunity_row",
-        lambda *_a, **_kw: ov._LookupResult(
+    if legacy_opportunity_row is None:
+        _lookup_result = ov._LookupResult(
             canonical_signal_id="sig-reattach-integration",
             lookup_status=ov._LS_NOT_FOUND,
             row=None, error=None,
-        ),
-    )
+        )
+    else:
+        _lookup_result = ov._LookupResult(
+            canonical_signal_id="sig-reattach-integration",
+            lookup_status=ov._LS_FOUND,
+            row={
+                **legacy_opportunity_row,
+                "metadata": dict(legacy_opportunity_row.get("metadata") or {}),
+            },
+            error=None,
+        )
+    monkeypatch.setattr(ov, "_get_client_opportunity_row", lambda *_a, **_kw: _lookup_result)
     # Active-order query: return the same PENDING_TRIGGER row on every call
     # (both attempt 1 and attempt 2).
-    _active_row = _pending_trigger_order_row()
+    _active_row = _pending_trigger_order_row(
+        include_source_provenance=source_provenance,
+    )
     if legacy_confirmed:
         _active_row["meta"] = {
             "trigger_crossed_at": "2026-08-03T16:00:00+00:00",
         }
+    if legacy_source_metadata is not None:
+        _active_row["meta"] = dict(legacy_source_metadata)
+    _durable_order = dict(_active_row)
+    _durable_order["meta"] = dict(_active_row.get("meta") or {})
     monkeypatch.setattr(
         ov, "_query_active_entry_order",
         lambda *_a, **_kw: (ov._LS_FOUND, dict(_active_row)),
@@ -871,6 +913,38 @@ def _run_one_attempt(
     mc_evaluate = MagicMock()
     osm_create = MagicMock()
     selector_select = MagicMock()
+    if provenance_update is None:
+        provenance_update = MagicMock(return_value=True)
+    _provenance_result = provenance_update.return_value
+    _provenance_side_effect = provenance_update.side_effect
+
+    def _apply_provenance_update(*args, **kwargs):
+        if callable(_provenance_side_effect):
+            _result = _provenance_side_effect(*args, **kwargs)
+        else:
+            _result = _provenance_result
+        if _result:
+            _patch = args[1] if len(args) >= 2 else kwargs.get("meta_patch")
+            if isinstance(_patch, dict):
+                _durable_order["meta"].update(_patch)
+        return _result
+
+    provenance_update.side_effect = _apply_provenance_update
+
+    def _get_durable_order(_oid):
+        if durable_readback_row is not None:
+            return {
+                **durable_readback_row,
+                "local_order_id": _oid,
+                "meta": dict(durable_readback_row.get("meta") or {}),
+            }
+        return {
+            **_durable_order,
+            "local_order_id": _oid,
+            "meta": dict(_durable_order.get("meta") or {}),
+        }
+
+    durable_reread = MagicMock(side_effect=_get_durable_order)
 
     broker = SimpleNamespace(
         submit_order=MagicMock(), place_order=MagicMock(),
@@ -894,7 +968,8 @@ def _run_one_attempt(
         contract_selector=SimpleNamespace(select=selector_select),
         order_state_machine=SimpleNamespace(
             create_entry_order=osm_create,
-            get_order=lambda _oid: {"local_order_id": _oid, "status": "PENDING_TRIGGER"},
+            update_order_meta=provenance_update,
+            get_order=durable_reread,
         ),
         entry_watcher=entry_watcher,
         force=True,
@@ -907,11 +982,188 @@ def _run_one_attempt(
         broker=broker,
         entry_watcher=entry_watcher,
         pre_watch_fence=_pre_watch_fence,
+        provenance_update=provenance_update,
+        durable_order=_durable_order,
+        durable_reread=durable_reread,
     )
 
 
-def test_owned_reattach_legacy_evidence_retries_proof_without_rearm(monkeypatch):
-    """An existing owner may retry its durable proof, but never watch twice."""
+def test_reattach_legacy_cross_source_order_is_not_relabelled(monkeypatch):
+    """A legacy order from another source cannot be claimed by this row."""
+    proof_write = MagicMock(return_value=True)
+    state = _run_one_attempt(
+        monkeypatch,
+        mock_ledger=proof_write,
+        source_provenance=False,
+        legacy_source_metadata={
+            "source_table": "trade_queue",
+            "source_job_id": "12345",
+            "original_signal_id": "sig-reattach-integration",
+        },
+    )
+
+    assert state.result["armed"] == 0
+    assert state.result["retryable_deferred"] == 1
+    assert state.result["completed"] is False
+    state.provenance_update.assert_not_called()
+    state.entry_watcher.watch.assert_not_called()
+    state.pre_watch_fence.assert_not_called()
+    state.mc_evaluate.assert_not_called()
+    state.selector_select.assert_not_called()
+    state.osm_create.assert_not_called()
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
+
+
+def test_reattach_legacy_exact_same_source_upgrades_with_cas_and_reattaches(monkeypatch):
+    """Pre-#595 source proof may be upgraded once, then reread before watch."""
+    proof_write = MagicMock(return_value=True)
+    state = _run_one_attempt(
+        monkeypatch,
+        mock_ledger=proof_write,
+        source_provenance=False,
+        legacy_source_metadata=_legacy_exact_source_metadata(),
+    )
+
+    assert state.result["armed"] == 1
+    assert state.result["retryable_deferred"] == 0
+    state.provenance_update.assert_called_once()
+    _update_call = state.provenance_update.call_args
+    assert _update_call.args[0] == EXISTING_LOCAL_OID
+    assert _update_call.args[1] == {
+        "overnight_source_table": "ap_signals",
+        "overnight_source_job_id": "sup:sig-reattach-integration",
+        "overnight_source_signal_id": "sig-reattach-integration",
+    }
+    assert _update_call.kwargs["expected_status"] == "PENDING_TRIGGER"
+    assert _update_call.kwargs["expected_execution_mode"] == "paper"
+    assert _update_call.kwargs["expected_signal_id"] == "sig-reattach-integration"
+    assert _update_call.kwargs["expected_canonical_signal_id"] == "sig-reattach-integration"
+    assert _update_call.kwargs["expected_kind"] == "ENTRY"
+    assert set(_update_call.kwargs["expected_meta_absent"]) >= {
+        "overnight_source_table",
+        "overnight_source_job_id",
+        "overnight_source_signal_id",
+    }
+    assert _update_call.kwargs["expected_meta"]["source_table"] == "ap_signals"
+    assert _update_call.kwargs["expected_meta"]["source_job_id"] == (
+        "sup:sig-reattach-integration"
+    )
+    assert state.durable_reread.call_count == 1
+    assert state.durable_order["meta"]["overnight_source_table"] == "ap_signals"
+    assert state.durable_order["meta"]["overnight_source_job_id"] == (
+        "sup:sig-reattach-integration"
+    )
+    assert state.durable_order["meta"]["overnight_source_signal_id"] == (
+        "sig-reattach-integration"
+    )
+    assert state.entry_watcher.watch.call_count == 1
+    assert state.entry_watcher.watch.call_args.args[1] == EXISTING_LOCAL_OID
+    state.osm_create.assert_not_called()
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
+
+
+def test_reattach_legacy_ledger_source_proof_can_upgrade_order(monkeypatch):
+    """Pre-#595 proof stored in the exact opportunity row is also reusable."""
+    proof_write = MagicMock(return_value=True)
+    legacy_ledger_row = {
+        "canonical_signal_id": "sig-reattach-integration",
+        "client_id": "jose@example.com",
+        "opportunity_status": "CREATED",
+        "miss_stage": "",
+        "miss_reason": "",
+        "order_local_id": EXISTING_LOCAL_OID,
+        "metadata": {
+            "source_table": "ap_signals",
+            "source_job_id": "sup:sig-reattach-integration",
+            "original_signal_id": "sig-reattach-integration",
+            "execution_mode": "paper",
+            "overnight_reeval_session_key": _SIG_DATE,
+        },
+    }
+    state = _run_one_attempt(
+        monkeypatch,
+        mock_ledger=proof_write,
+        source_provenance=False,
+        legacy_source_metadata={"overnight": True},
+        legacy_opportunity_row=legacy_ledger_row,
+    )
+
+    assert state.result["armed"] == 1
+    state.provenance_update.assert_called_once()
+    assert state.durable_reread.call_count == 1
+    assert state.entry_watcher.watch.call_count == 1
+    assert state.entry_watcher.watch.call_args.args[1] == EXISTING_LOCAL_OID
+    state.osm_create.assert_not_called()
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
+
+
+def test_reattach_legacy_provenance_cas_miss_blocks_without_watch_or_broker(monkeypatch):
+    """A concurrent durable mutation leaves the legacy order untouched."""
+    proof_write = MagicMock(return_value=True)
+    cas_miss = MagicMock(return_value=False)
+    state = _run_one_attempt(
+        monkeypatch,
+        mock_ledger=proof_write,
+        source_provenance=False,
+        legacy_source_metadata=_legacy_exact_source_metadata(),
+        provenance_update=cas_miss,
+    )
+
+    assert state.result["armed"] == 0
+    assert state.result["retryable_deferred"] == 1
+    cas_miss.assert_called_once()
+    state.durable_reread.assert_not_called()
+    assert not any(
+        key.startswith("overnight_source_") for key in state.durable_order["meta"]
+    )
+    state.entry_watcher.watch.assert_not_called()
+    state.pre_watch_fence.assert_not_called()
+    proof_write.assert_not_called()
+    state.osm_create.assert_not_called()
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
+
+
+def test_reattach_legacy_readback_without_exact_triple_blocks(monkeypatch):
+    """A successful CAS return is insufficient when durable reread disagrees."""
+    proof_write = MagicMock(return_value=True)
+    readback = _pending_trigger_order_row(include_source_provenance=False)
+    readback["meta"] = _legacy_exact_source_metadata()
+    state = _run_one_attempt(
+        monkeypatch,
+        mock_ledger=proof_write,
+        source_provenance=False,
+        legacy_source_metadata=_legacy_exact_source_metadata(),
+        durable_readback_row=readback,
+    )
+
+    assert state.result["armed"] == 0
+    assert state.result["retryable_deferred"] == 1
+    state.provenance_update.assert_called_once()
+    assert state.durable_reread.call_count == 1
+    state.entry_watcher.watch.assert_not_called()
+    state.pre_watch_fence.assert_not_called()
+    proof_write.assert_not_called()
+    state.osm_create.assert_not_called()
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
+
+
+def test_owned_reattach_missing_provenance_fails_closed_without_rearm(monkeypatch):
+    """Missing source identity cannot manufacture durable ownership proof."""
     proof_write = MagicMock(return_value=True)
     state = _run_one_attempt(
         monkeypatch,
@@ -920,14 +1172,68 @@ def test_owned_reattach_legacy_evidence_retries_proof_without_rearm(monkeypatch)
         legacy_confirmed=True,
     )
 
-    assert state.result["armed"] == 1
+    assert state.result["armed"] == 0
     assert state.result["unresolved"] == 0
-    assert state.result["retryable_deferred"] == 0
+    assert state.result["retryable_deferred"] == 1
     state.entry_watcher.watch.assert_not_called()
     state.pre_watch_fence.assert_not_called()
-    proof_write.assert_called_once()
+    proof_write.assert_not_called()
     state.mc_evaluate.assert_not_called()
     state.selector_select.assert_not_called()
+    state.osm_create.assert_not_called()
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
+
+
+def test_restart_after_legacy_upgrade_uses_exact_triple_without_duplicate_actions(monkeypatch):
+    """After the upgrade, restart recovery follows the direct exact-triple path."""
+    first_proof = MagicMock(return_value=True)
+    first = _run_one_attempt(
+        monkeypatch,
+        mock_ledger=first_proof,
+        source_provenance=False,
+        legacy_source_metadata=_legacy_exact_source_metadata(),
+    )
+    assert first.result["armed"] == 1
+    assert first.durable_order["meta"]["overnight_source_signal_id"] == (
+        "sig-reattach-integration"
+    )
+
+    second_proof = MagicMock(return_value=True)
+    second = _run_one_attempt(
+        monkeypatch,
+        mock_ledger=second_proof,
+        watcher_already_owns=True,
+        source_provenance=True,
+    )
+
+    assert second.result["armed"] == 1
+    second.provenance_update.assert_not_called()
+    second.durable_reread.assert_not_called()
+    second.entry_watcher.watch.assert_not_called()
+    second.osm_create.assert_not_called()
+    second.broker.submit_order.assert_not_called()
+    second.broker.place_order.assert_not_called()
+    second.broker.cancel_order.assert_not_called()
+    second.broker.replace_order.assert_not_called()
+
+
+def test_brand_new_595_order_keeps_direct_exact_provenance_path(monkeypatch):
+    """A healthy #595 order does not enter the legacy upgrade path."""
+    proof_write = MagicMock(return_value=True)
+    state = _run_one_attempt(
+        monkeypatch,
+        mock_ledger=proof_write,
+        source_provenance=True,
+    )
+
+    assert state.result["armed"] == 1
+    state.provenance_update.assert_not_called()
+    state.durable_reread.assert_not_called()
+    assert state.entry_watcher.watch.call_count == 1
+    assert state.entry_watcher.watch.call_args.args[1] == EXISTING_LOCAL_OID
     state.osm_create.assert_not_called()
     state.broker.submit_order.assert_not_called()
     state.broker.place_order.assert_not_called()
