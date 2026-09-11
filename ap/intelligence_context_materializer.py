@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 from datetime import datetime, timezone
+from collections.abc import Mapping
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from ap.intelligence_market_data import (
     build_data_quality_warnings,
@@ -22,6 +25,15 @@ from ap.intelligence_snapshot_store import (
 log = logging.getLogger("ap.intelligence_context_materializer")
 
 CONTEXT_REVISION = 1
+_ET = ZoneInfo("America/New_York")
+
+
+class BreachMaterializationRejected(ValueError):
+    """Permanent BREACH input rejection; never fall through to enrichment."""
+
+    def __init__(self, error_code: str):
+        self.error_code = str(error_code or "BREACH_INPUT_REJECTED")
+        super().__init__(self.error_code)
 
 
 def _now_iso() -> str:
@@ -62,6 +74,1023 @@ def _config_hash() -> str:
         return _stable_hash({"profile_version": DEFAULT_PROFILE_VERSION})
 
 
+def _finite_number(value: Any) -> Optional[float]:
+    """Return a real finite scalar; bool and malformed values are unavailable."""
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _parse_timestamp(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        parsed = value
+    elif value not in (None, ""):
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _freeze_value(value: Any, *, depth: int = 0) -> Any:
+    """Make the handoff payload independent of mutable runtime objects."""
+    if depth > 8:
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        return {
+            str(key): _freeze_value(item, depth=depth + 1)
+            for key, item in value.items()
+            if not str(key).startswith("_")
+        }
+    if isinstance(value, (list, tuple)):
+        return [_freeze_value(item, depth=depth + 1) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _identity_conflict(field: str, values: list[str]) -> Optional[str]:
+    normalized = {
+        value.strip().lower() if field in {"client_id", "execution_mode"} else value.strip()
+        for value in values if value.strip()
+    }
+    if len(normalized) > 1:
+        return f"BREACH_IDENTITY_CONFLICT_{field.upper()}"
+    return None
+
+
+def _strict_positive_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def resolve_canonical_strategy_pattern(signal: dict[str, Any]) -> dict[str, Any]:
+    """Deterministic BREACH identity from production scanner fields.
+
+    Persists both raw_pattern and canonical_strategy_pattern. Unknown or
+    ambiguous inputs stay explicit rather than inventing a family.
+    """
+    sig = signal if isinstance(signal, dict) else {}
+    metadata = sig.get("metadata") if isinstance(sig.get("metadata"), dict) else {}
+    raw = (
+        sig.get("pattern")
+        or sig.get("pattern_id")
+        or metadata.get("pattern")
+        or metadata.get("pattern_id")
+    )
+    raw_s = str(raw).strip() if raw not in (None, "") else ""
+    timeframe = str(
+        sig.get("timeframe")
+        or sig.get("tf")
+        or metadata.get("timeframe")
+        or metadata.get("tf")
+        or ""
+    ).strip().lower()
+    authoritative = (
+        sig.get("canonical_strategy_pattern")
+        or sig.get("canonical_pattern")
+        or sig.get("strategy_pattern")
+        or metadata.get("canonical_strategy_pattern")
+        or metadata.get("canonical_pattern")
+        or metadata.get("strategy_pattern")
+    )
+    authoritative_s = (
+        str(authoritative).strip() if authoritative not in (None, "") else ""
+    )
+
+    diagnostics: dict[str, Any] = {
+        "raw_pattern": raw_s or None,
+        "timeframe": timeframe or None,
+        "authoritative_input": authoritative_s or None,
+    }
+
+    if authoritative_s:
+        return {
+            "raw_pattern": raw_s or None,
+            "canonical_strategy_pattern": authoritative_s,
+            "status": "AUTHORITATIVE",
+            "diagnostics": diagnostics,
+        }
+
+    # Production daily 2-3 scanner label -> daily 2-3-2 family.
+    normalized_raw = raw_s.replace("_", "-").replace(" ", "").lower()
+    if normalized_raw in {"2-3", "2/3", "23"} and timeframe in {"1d", "d", "daily", "1day"}:
+        return {
+            "raw_pattern": raw_s,
+            "canonical_strategy_pattern": "2-3-2",
+            "status": "RESOLVED",
+            "diagnostics": {**diagnostics, "rule": "daily_2_3_to_232"},
+        }
+    if normalized_raw in {"2-3-2", "232"}:
+        return {
+            "raw_pattern": raw_s,
+            "canonical_strategy_pattern": "2-3-2",
+            "status": "RESOLVED",
+            "diagnostics": {**diagnostics, "rule": "already_232"},
+        }
+
+    if not raw_s and not timeframe:
+        return {
+            "raw_pattern": None,
+            "canonical_strategy_pattern": None,
+            "status": "UNKNOWN",
+            "diagnostics": {**diagnostics, "reason": "missing_pattern_and_timeframe"},
+        }
+    return {
+        "raw_pattern": raw_s or None,
+        "canonical_strategy_pattern": None,
+        "status": "AMBIGUOUS" if raw_s else "UNKNOWN",
+        "diagnostics": {
+            **diagnostics,
+            "reason": "no_deterministic_mapping",
+        },
+    }
+
+
+def resolve_breach_lineage(signal: dict[str, Any]) -> dict[str, Any]:
+    """Derive INITIAL/REBREACH/RECOVERED/DIRECTION_REVERSAL from watcher truth.
+
+    Never invents rebreach from timestamps alone. Unprovable lineage stays
+    UNKNOWN with diagnostics.
+    """
+    sig = signal if isinstance(signal, dict) else {}
+    metadata = sig.get("metadata") if isinstance(sig.get("metadata"), dict) else {}
+    sources = [sig, metadata]
+    lifecycle = sig.get("breach_lifecycle") if isinstance(sig.get("breach_lifecycle"), dict) else {}
+    lifecycle_sources = (
+        sig.get("breach_lifecycle_sources")
+        if isinstance(sig.get("breach_lifecycle_sources"), dict)
+        else {}
+    )
+
+    def _get(*keys: str) -> Any:
+        for source in sources:
+            for key in keys:
+                value = source.get(key)
+                if value not in (None, ""):
+                    return value
+        for key in keys:
+            value = lifecycle.get(key)
+            if value not in (None, ""):
+                return value
+            value = lifecycle_sources.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    explicit = str(_get("breach_lineage") or "").strip().upper()
+    known = {
+        "INITIAL_BREACH",
+        "REBREACH_AFTER_RESET",
+        "RECOVERED_BREACH",
+        "DIRECTION_REVERSAL_REBREACH",
+        "UNKNOWN",
+    }
+    if explicit in known and explicit != "UNKNOWN":
+        return {
+            "breach_lineage": explicit,
+            "status": "AUTHORITATIVE",
+            "diagnostics": {"source": "explicit_breach_lineage"},
+        }
+
+    direction_reversal = bool(
+        _get("direction_reversal_lineage")
+        or _get("direction_reversed")
+        or _get("reversal_rebreach")
+    )
+    recovered = bool(
+        _get("recovered")
+        or _get("recovery_submit_fenced")
+        or _get("fenced")
+        or lifecycle.get("recovered")
+        or _get("_recovery_pre_claimed")
+    )
+    reset_seen = bool(
+        _get("breach_reset")
+        or _get("pullback_reset")
+        or _get("trigger_reset")
+        or _get("reset_after_breach")
+    )
+    breach_count = _get("breach_count", "trigger_breach_count", "confirmed_breach_count")
+    try:
+        breach_n = int(str(breach_count).strip()) if breach_count not in (None, "") else None
+    except (TypeError, ValueError):
+        breach_n = None
+
+    diagnostics = {
+        "direction_reversal": direction_reversal,
+        "recovered": recovered,
+        "reset_seen": reset_seen,
+        "breach_count": breach_n,
+        "explicit": explicit or None,
+    }
+
+    if direction_reversal:
+        return {
+            "breach_lineage": "DIRECTION_REVERSAL_REBREACH",
+            "status": "RESOLVED",
+            "diagnostics": diagnostics,
+        }
+    if recovered and (reset_seen or (breach_n is not None and breach_n > 1)):
+        return {
+            "breach_lineage": "RECOVERED_BREACH",
+            "status": "RESOLVED",
+            "diagnostics": diagnostics,
+        }
+    if reset_seen and breach_n is not None and breach_n > 1:
+        return {
+            "breach_lineage": "REBREACH_AFTER_RESET",
+            "status": "RESOLVED",
+            "diagnostics": diagnostics,
+        }
+    if breach_n == 1 and not reset_seen and not recovered and not direction_reversal:
+        return {
+            "breach_lineage": "INITIAL_BREACH",
+            "status": "RESOLVED",
+            "diagnostics": diagnostics,
+        }
+    if breach_n is not None and breach_n > 1 and reset_seen:
+        return {
+            "breach_lineage": "REBREACH_AFTER_RESET",
+            "status": "RESOLVED",
+            "diagnostics": diagnostics,
+        }
+
+    return {
+        "breach_lineage": "UNKNOWN",
+        "status": "UNKNOWN",
+        "diagnostics": {**diagnostics, "reason": "insufficient_watcher_lineage_authority"},
+    }
+
+
+def resolve_public_breach_lifecycle(signal: dict[str, Any]) -> dict[str, Any]:
+    """Resolve one public lifecycle authority BEFORE private-field stripping."""
+    sig = signal if isinstance(signal, dict) else {}
+    metadata = sig.get("metadata") if isinstance(sig.get("metadata"), dict) else {}
+    existing = sig.get("breach_lifecycle") if isinstance(sig.get("breach_lifecycle"), dict) else {}
+
+    def _pick(*keys: str) -> Any:
+        for key in keys:
+            for source in (existing, sig, metadata):
+                value = source.get(key)
+                if value not in (None, ""):
+                    return value
+        return None
+
+    generation = _pick(
+        "generation",
+        "materialization_generation",
+        "recovery_submit_generation",
+        "_recovery_pre_claimed_generation",
+        "watcher_generation",
+        "lifecycle_generation",
+    )
+    attempt = _pick(
+        "attempt",
+        "retry_attempt",
+        "retry_attempts",
+        "materialization_retry_attempt",
+        "materialization_attempts",
+        "deferred_retry_attempt",
+        "_recovery_pre_claimed_attempt",
+    )
+    owner = _pick(
+        "owner",
+        "_recovery_pre_claimed_owner",
+        "watcher_owner",
+        "ownership_token",
+    )
+    preclaimed = _pick("preclaimed", "_recovery_pre_claimed")
+    recovered = _pick(
+        "recovered",
+        "recovery_submit_fenced",
+        "fenced",
+    )
+    source = _pick(
+        "source",
+        "_recovery_pre_claimed_mode",
+        "lifecycle_source",
+        "recovery_source",
+    )
+    client_id = _pick("_recovery_pre_claimed_client_id", "client_id")
+    mode = _pick("_recovery_pre_claimed_mode", "execution_mode", "mode")
+
+    return {
+        "generation": generation,
+        "attempt": attempt,
+        "owner": owner,
+        "preclaimed": bool(preclaimed) if preclaimed not in (None, "") else False,
+        "recovered": bool(recovered) if recovered not in (None, "") else False,
+        "source": source,
+        "client_id": client_id,
+        "execution_mode": str(mode).upper() if mode not in (None, "") else None,
+    }
+
+
+
+ENTRY_TIMING_CANDIDATE_ENUMS = frozenset({
+    "READY_NOW_CANDIDATE",
+    "WAIT_PULLBACK_CANDIDATE",
+    "WAIT_FVG_RETEST_CANDIDATE",
+    "WAIT_OPPOSING_FVG_ACCEPTANCE_CANDIDATE",
+    "REBREACH_PREFERRED",
+    "SETUP_INVALID",
+})
+
+# Legacy readiness classifications retained for dual-emit / back-compat.
+LEGACY_ENTRY_READINESS_ENUMS = frozenset({
+    "READY_NOW",
+    "WAIT_CONFIRMATION",
+    "REBREACH_PREFERRED",
+    "INVALID",
+})
+
+
+def map_entry_timing_candidate(
+    classification: str,
+    *,
+    evidence: dict[str, Any] | None = None,
+) -> str:
+    """Map legacy readiness → amendment entry-timing candidate enum.
+
+    Dual-emitted alongside READY_NOW / WAIT_CONFIRMATION / INVALID. Never
+    affects eligibility / admission.
+    """
+    cls = str(classification or "").strip().upper()
+    ev = evidence if isinstance(evidence, dict) else {}
+    if cls == "READY_NOW":
+        return "READY_NOW_CANDIDATE"
+    if cls == "REBREACH_PREFERRED":
+        return "REBREACH_PREFERRED"
+    if cls == "INVALID":
+        return "SETUP_INVALID"
+
+    # WAIT_CONFIRMATION and unknowns → structure-aware wait candidate.
+    ms = ev.get("market_structure") if isinstance(ev.get("market_structure"), dict) else {}
+    rel = ms.get("relationship") if isinstance(ms.get("relationship"), dict) else {}
+    relationship = str(rel.get("relationship") or "").upper()
+    wick = ev.get("wick_vs_body_breach") if isinstance(ev.get("wick_vs_body_breach"), dict) else {}
+    style = str(wick.get("confirmation_style") or "").upper()
+    pullback = ev.get("pullback_candidate_features") if isinstance(ev.get("pullback_candidate_features"), dict) else {}
+
+    if relationship in {
+        "APPROACHING_OPPOSING_FVG",
+        "AT_OPPOSING_FRONT",
+        "INSIDE_OPPOSING_FVG",
+        "INSIDE_OPPOSING_ZONE",
+        "OPPOSING_WALL_REJECTED",
+    }:
+        return "WAIT_OPPOSING_FVG_ACCEPTANCE_CANDIDATE"
+    if relationship in {
+        "ALIGNED_RETEST_ZONE_BEHIND",
+        "INSIDE_ALIGNED_FVG",
+    } or (
+        isinstance(rel.get("aligned_retest_zone"), dict)
+        and relationship in {"CLEAR_PATH", ""}
+        and pullback.get("nearest_aligned_fvg_behind")
+    ):
+        return "WAIT_FVG_RETEST_CANDIDATE"
+    if style == "WICK_ONLY":
+        return "WAIT_PULLBACK_CANDIDATE"
+    # Default wait posture for first-breach / weak confirmation.
+    return "WAIT_PULLBACK_CANDIDATE"
+
+
+def classify_entry_readiness_observe_only(
+    signal: dict[str, Any], *, evidence: dict[str, Any]
+) -> dict[str, Any]:
+    """OBSERVE-ONLY entry-timing classification. Never affects admission."""
+    remaining = evidence.get("remaining_opportunity") if isinstance(evidence, dict) else {}
+    remaining = remaining if isinstance(remaining, dict) else {}
+    fifteen = evidence.get("fifteen_minute_confirmation") if isinstance(evidence, dict) else {}
+    fifteen = fifteen if isinstance(fifteen, dict) else {}
+    five = evidence.get("five_minute_confirmation") if isinstance(evidence, dict) else {}
+    five = five if isinstance(five, dict) else {}
+    lineage = str((evidence or {}).get("breach_lineage") or "UNKNOWN").upper()
+    wick = evidence.get("wick_vs_body_breach") if isinstance(evidence, dict) else {}
+    wick = wick if isinstance(wick, dict) else {}
+    reasons: list[str] = []
+
+    geom = extract_trade_geometry(signal if isinstance(signal, dict) else {})
+    if not geom.get("available"):
+        candidate = "SETUP_INVALID"
+        return {
+            "classification": "INVALID",
+            "entry_timing_candidate": candidate,
+            "observe_only": True,
+            "affected_eligibility": False,
+            "diagnostics": {
+                "reasons": ["missing_geometry", *(geom.get("missing_data") or [])],
+                "entry_timing_candidate": candidate,
+            },
+        }
+
+    target_reached = bool(remaining.get("target_reached") or remaining.get("target_already_reached"))
+    remaining_r = remaining.get("remaining_r")
+    if remaining_r is None:
+        remaining_r = remaining.get("remaining_R")
+    try:
+        remaining_r_f = float(remaining_r) if remaining_r is not None else None
+    except (TypeError, ValueError):
+        remaining_r_f = None
+    move_consumed = remaining.get("percent_move_consumed")
+    if move_consumed is None and remaining.get("move_consumed_pct") is not None:
+        try:
+            move_consumed = float(remaining.get("move_consumed_pct")) / 100.0
+        except (TypeError, ValueError):
+            move_consumed = None
+    try:
+        move_consumed_f = float(move_consumed) if move_consumed is not None else None
+    except (TypeError, ValueError):
+        move_consumed_f = None
+
+    if target_reached or (remaining_r_f is not None and remaining_r_f <= 0):
+        reasons.append("target_or_r_exhausted")
+        classification = "INVALID"
+    elif move_consumed_f is not None and move_consumed_f >= 0.7:
+        reasons.append("heavy_extension")
+        classification = "REBREACH_PREFERRED"
+    elif lineage in {"INITIAL_BREACH", "UNKNOWN"} and (
+        fifteen.get("status") in {"MISSING", "MISSING_OR_INVALID", "UNAVAILABLE"}
+        or five.get("status") == "MISSING"
+        or not fifteen.get("follow_through")
+        or wick.get("confirmation_style") == "WICK_ONLY"
+    ):
+        if wick.get("confirmation_style") == "WICK_ONLY":
+            reasons.append("wick_only_breach_on_first_touch")
+        reasons.append("weak_or_missing_continuation_on_first_breach")
+        classification = "WAIT_CONFIRMATION"
+    elif lineage == "REBREACH_AFTER_RESET" and fifteen.get("follow_through"):
+        reasons.append("confirmed_rebreach_with_continuation")
+        classification = "READY_NOW"
+    elif fifteen.get("follow_through") and five.get("follow_through"):
+        reasons.append("strong_5m_15m_continuation")
+        classification = "READY_NOW"
+    else:
+        reasons.append("default_wait_confirmation")
+        classification = "WAIT_CONFIRMATION"
+
+    entry_timing_candidate = map_entry_timing_candidate(classification, evidence=evidence)
+    return {
+        "classification": classification,
+        "entry_timing_candidate": entry_timing_candidate,
+        "observe_only": True,
+        "affected_eligibility": False,
+        "diagnostics": {
+            "reasons": reasons,
+            "breach_lineage": lineage,
+            "fifteen_status": fifteen.get("status"),
+            "five_status": five.get("status"),
+            "remaining_r": remaining_r_f,
+            "percent_move_consumed": move_consumed_f,
+            "target_reached": target_reached,
+            "wick_vs_body": wick.get("confirmation_style"),
+            "entry_timing_candidate": entry_timing_candidate,
+            "legacy_classification": classification,
+        },
+    }
+
+
+
+
+def _validate_breach_lifecycle(signal: dict[str, Any]) -> Optional[str]:
+    """Reject contradictory or incomplete fenced lifecycle metadata."""
+    sig = signal if isinstance(signal, dict) else {}
+    metadata = sig.get("metadata") if isinstance(sig.get("metadata"), dict) else {}
+    lifecycle = sig.get("breach_lifecycle_sources")
+    lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
+
+    def _values(*keys: str) -> list[Any]:
+        values: list[Any] = []
+        for key in keys:
+            values.extend([sig.get(key), metadata.get(key)])
+        for key in keys:
+            value = lifecycle.get(key)
+            if isinstance(value, list):
+                values.extend(value)
+            elif value not in (None, ""):
+                values.append(value)
+        return [value for value in values if value not in (None, "")]
+
+    def _has_invalid_integer(values: list[Any], *, allow_zero: bool) -> bool:
+        for value in values:
+            if isinstance(value, bool):
+                return True
+            try:
+                parsed = int(str(value).strip())
+            except (TypeError, ValueError):
+                return True
+            if parsed < 0 or (parsed == 0 and not allow_zero):
+                return True
+        return False
+
+    generation_raw = _values(
+        "materialization_generation", "recovery_submit_generation",
+        "_recovery_pre_claimed_generation", "watcher_generation",
+        "lifecycle_generation",
+    )
+    if _has_invalid_integer(generation_raw, allow_zero=True):
+        return "BREACH_LIFECYCLE_GENERATION_INVALID"
+
+    generation_values = [
+        parsed for parsed in (
+            _strict_positive_int(value)
+            for value in _values(
+                "materialization_generation", "recovery_submit_generation",
+                "_recovery_pre_claimed_generation", "watcher_generation",
+                "lifecycle_generation",
+            )
+        ) if parsed is not None
+    ]
+    if len(set(generation_values)) > 1:
+        return "BREACH_LIFECYCLE_GENERATION_CONFLICT"
+    fenced = bool(
+        sig.get("recovery_submit_fenced") or sig.get("fenced")
+        or metadata.get("recovery_submit_fenced") or metadata.get("fenced")
+    )
+    if fenced and not generation_values:
+        return "BREACH_LIFECYCLE_GENERATION_MISSING"
+
+    attempt_raw = _values(
+        "retry_attempt", "retry_attempts", "materialization_retry_attempt",
+        "materialization_attempts", "deferred_retry_attempt",
+    )
+    if _has_invalid_integer(attempt_raw, allow_zero=not generation_values and not fenced):
+        return "BREACH_LIFECYCLE_ATTEMPT_INVALID"
+
+    attempt_values = [
+        parsed for parsed in (
+            _strict_positive_int(value)
+            for value in _values(
+                "retry_attempt", "retry_attempts", "materialization_retry_attempt",
+                "materialization_attempts", "deferred_retry_attempt",
+            )
+        ) if parsed is not None
+    ]
+    if len(set(attempt_values)) > 1:
+        return "BREACH_LIFECYCLE_ATTEMPT_CONFLICT"
+    return None
+
+
+def _resolve_breach_identity(
+    signal: dict[str, Any],
+    *,
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+    local_order_id: str,
+    signal_id: str = "",
+) -> tuple[dict[str, str], Optional[str]]:
+    """Resolve the exact BREACH identity or reject it without enqueueing."""
+    sig = signal if isinstance(signal, dict) else {}
+    metadata = sig.get("metadata") if isinstance(sig.get("metadata"), dict) else {}
+    source_hints = sig.get("breach_identity_sources")
+    source_maps = [sig, metadata]
+    if isinstance(source_hints, dict):
+        source_maps.append(source_hints)
+
+    resolved_client = str(client_id or "").strip().lower()
+    if not resolved_client:
+        return {}, "BREACH_IDENTITY_MISSING_CLIENT_ID"
+    def _source_values(*keys: str) -> list[str]:
+        values: list[str] = []
+        for source in source_maps:
+            for key in keys:
+                value = source.get(key)
+                if isinstance(value, list):
+                    values.extend(str(item or "") for item in value)
+                else:
+                    values.append(str(value or ""))
+        return values
+
+    client_values = _source_values("client_id", "client_email")
+    conflict = _identity_conflict("client_id", [resolved_client, *client_values])
+    if conflict:
+        return {}, conflict
+
+    raw_mode = str(execution_mode or "").strip().upper()
+    if raw_mode not in {"LIVE", "PAPER"}:
+        return {}, "BREACH_IDENTITY_INVALID_EXECUTION_MODE"
+    mode_values = _source_values("execution_mode", "mode")
+    mode_conflict = _identity_conflict("execution_mode", [raw_mode, *mode_values])
+    if mode_conflict:
+        return {}, mode_conflict
+    if any(value.strip() and value.strip().upper() not in {"LIVE", "PAPER"}
+           for value in mode_values):
+        return {}, "BREACH_IDENTITY_INVALID_EXECUTION_MODE"
+
+    resolved_signal_id = str(signal_id or "").strip()
+    payload_signal_id = str(sig.get("signal_id") or "").strip()
+    metadata_signal_id = str(metadata.get("signal_id") or "").strip()
+    hint_signal_ids = _source_values("signal_id")
+    signal_conflict = _identity_conflict(
+        "signal_id", [resolved_signal_id, payload_signal_id, metadata_signal_id, *hint_signal_ids]
+    )
+    if signal_conflict:
+        return {}, signal_conflict
+    resolved_signal_id = resolved_signal_id or payload_signal_id or metadata_signal_id
+    if not resolved_signal_id:
+        return {}, "BREACH_IDENTITY_MISSING_SIGNAL_ID"
+
+    resolved_local = str(local_order_id or "").strip()
+    if not resolved_local:
+        return {}, "BREACH_IDENTITY_MISSING_LOCAL_ORDER_ID"
+    local_values = _source_values("local_order_id")
+    local_conflict = _identity_conflict("local_order_id", [resolved_local, *local_values])
+    if local_conflict:
+        return {}, local_conflict
+
+    explicit_canonical = str(canonical_signal_id or "").strip()
+    payload_canonical = str(sig.get("canonical_signal_id") or "").strip()
+    metadata_canonical = str(metadata.get("canonical_signal_id") or "").strip()
+    hint_canonicals = _source_values("canonical_signal_id")
+    canonical_conflict = _identity_conflict(
+        "canonical_signal_id",
+        [explicit_canonical, payload_canonical, metadata_canonical, *hint_canonicals],
+    )
+    if canonical_conflict:
+        return {}, canonical_conflict
+    resolved_canonical = (
+        explicit_canonical or payload_canonical or metadata_canonical
+        or next((value.strip() for value in hint_canonicals if value.strip()), "")
+    )
+    if not resolved_canonical:
+        canonical_input = dict(sig)
+        canonical_input.pop("canonical_signal_id", None)
+        resolved_canonical = _canonical_signal_id(canonical_input, fallback=resolved_signal_id)
+    if not resolved_canonical:
+        return {}, "BREACH_IDENTITY_MISSING_CANONICAL_SIGNAL_ID"
+
+    lifecycle_error = _validate_breach_lifecycle(sig)
+    if lifecycle_error:
+        return {}, lifecycle_error
+
+    timestamp_sources = sig.get("breach_timestamp_sources")
+    timestamp_sources = timestamp_sources if isinstance(timestamp_sources, dict) else {}
+    for field in ("trigger_crossed_at", "trigger_confirmed_at"):
+        evidence_values = [
+            source.get(field)
+            for source in (sig, metadata)
+            if source.get(field) not in (None, "")
+        ]
+        hinted_values = timestamp_sources.get(field)
+        if isinstance(hinted_values, list):
+            evidence_values.extend(value for value in hinted_values if value not in (None, ""))
+        normalized_evidence = []
+        for value in evidence_values:
+            parsed = _parse_timestamp(value)
+            if parsed is None:
+                return {}, f"BREACH_EVIDENCE_INVALID_{field.upper()}"
+            normalized_evidence.append(parsed.isoformat())
+        if len(set(normalized_evidence)) > 1:
+            return {}, f"BREACH_EVIDENCE_CONFLICT_{field.upper()}"
+
+    return {
+        "client_id": resolved_client,
+        "execution_mode": raw_mode,
+        "signal_id": resolved_signal_id,
+        "canonical_signal_id": resolved_canonical,
+        "local_order_id": resolved_local,
+    }, None
+
+
+def _frozen_breach_observation(signal: dict[str, Any]) -> dict[str, Any]:
+    price = None
+    price_source = ""
+    invalid_price = False
+    for key in ("underlying_price", "current_price", "breach_price"):
+        candidate = _finite_number(signal.get(key))
+        if candidate is not None:
+            if candidate > 0:
+                price = candidate
+                price_source = key
+                break
+            invalid_price = True
+    crossed = signal.get("trigger_crossed_at")
+    confirmed = signal.get("trigger_confirmed_at")
+    return {
+        "price": price,
+        "source": "frozen_breach_signal" if price is not None else None,
+        "price_source": price_source or None,
+        "observed_at": str(crossed or confirmed or "") or None,
+        "source_timestamp": str(crossed or confirmed or "") or None,
+        "age_seconds": 0 if price is not None else None,
+        "status": "AVAILABLE" if price is not None else (
+            "MISSING_OR_INVALID" if invalid_price else "MISSING"
+        ),
+    }
+
+
+def _breach_timing(signal: dict[str, Any]) -> dict[str, Any]:
+    raw = signal.get("trigger_crossed_at") or signal.get("breach_timestamp")
+    parsed = _parse_timestamp(raw)
+    result = {
+        "timestamp": str(raw or "") or None,
+        "timestamp_status": "AVAILABLE" if parsed else "MISSING_OR_INVALID",
+        "exchange_timezone": "America/New_York",
+        "rth_session_date": None,
+        "minutes_since_rth_open": None,
+        "opening_window": "UNKNOWN",
+    }
+    if parsed is None:
+        return result
+    local = parsed.astimezone(_ET)
+    rth_open = local.replace(hour=9, minute=30, second=0, microsecond=0)
+    minutes = round((local - rth_open).total_seconds() / 60.0, 4)
+    if local.weekday() >= 5:
+        window = "WEEKEND"
+    elif minutes < 0:
+        window = "PREMARKET"
+    elif minutes < 30:
+        window = "FIRST_30_MINUTES"
+    elif local.hour < 16:
+        window = "RTH_AFTER_OPENING_WINDOW"
+    else:
+        window = "AFTER_RTH"
+    result.update({
+        "rth_session_date": local.date().isoformat(),
+        "minutes_since_rth_open": minutes,
+        "opening_window": window,
+    })
+    return result
+
+
+def _remaining_opportunity(signal: dict[str, Any]) -> dict[str, Any]:
+    def _field(*keys: str) -> Optional[float]:
+        for key in keys:
+            if key in signal and signal.get(key) not in (None, ""):
+                return _finite_number(signal.get(key))
+        return None
+
+    side = str(signal.get("side") or signal.get("direction") or "").strip().upper()
+    trigger = _field("trigger_price", "trigger")
+    stop = _field("stop_price", "stop")
+    target = _field("target_price", "target", "pt1")
+    current = next(
+        (value for key in ("underlying_price", "current_price", "breach_price")
+         if (value := _finite_number(signal.get(key))) is not None),
+        None,
+    )
+    result = {
+        "status": "AVAILABLE",
+        "side": side,
+        "trigger_to_target": None,
+        "current_to_target": None,
+        "current_to_stop": None,
+        "move_consumed_pct": None,
+        "remaining_R": None,
+        "target_already_reached": None,
+        "stop_geometry_invalid": None,
+    }
+    if side not in {"CALL", "PUT"} or None in {trigger, stop, target, current}:
+        result["status"] = "MISSING_OR_INVALID"
+        return result
+    direction = 1.0 if side == "CALL" else -1.0
+    total = direction * (target - trigger)
+    remaining = direction * (target - current)
+    risk = direction * (trigger - stop)
+    current_to_stop = direction * (current - stop)
+    move_consumed_pct = round((1.0 - remaining / total) * 100.0, 4) if total > 0 else None
+    remaining_R = round(remaining / risk, 4) if risk > 0 else None
+    target_already_reached = remaining <= 0
+    result.update({
+        "trigger_to_target": total,
+        "current_to_target": remaining,
+        "current_to_stop": current_to_stop,
+        "move_consumed_pct": move_consumed_pct,
+        # Fraction alias consumed by readiness / pullback features (0-1).
+        "percent_move_consumed": round(move_consumed_pct / 100.0, 6)
+        if move_consumed_pct is not None else None,
+        "remaining_R": remaining_R,
+        "remaining_r": remaining_R,
+        "target_already_reached": target_already_reached,
+        "target_reached": target_already_reached,
+        "stop_geometry_invalid": risk <= 0 or current_to_stop <= 0,
+    })
+    if total <= 0 or risk <= 0 or current_to_stop <= 0:
+        result["status"] = "INVALID_GEOMETRY"
+    elif remaining <= 0:
+        result["status"] = "INVALID_OPPORTUNITY"
+    return result
+
+
+def _directional_confirmation(rows: list[dict[str, Any]], side: str, *, source: str) -> dict[str, Any]:
+    if not rows:
+        return {"status": "MISSING", "source": None, "bar_count": 0}
+    direction = 1 if side == "CALL" else -1 if side == "PUT" else 0
+    usable = []
+    for row in rows[-3:]:
+        open_price = _finite_number(row.get("open"))
+        close_price = _finite_number(row.get("close"))
+        if open_price is None or close_price is None:
+            continue
+        usable.append({
+            "directional": (close_price - open_price) * direction > 0,
+            "body": abs(close_price - open_price),
+        })
+    if not usable or not direction:
+        return {"status": "MISSING_OR_INVALID", "source": source, "bar_count": len(usable)}
+    return {
+        "status": "AVAILABLE",
+        "source": source,
+        "bar_count": len(usable),
+        "directional_closes": sum(int(row["directional"]) for row in usable),
+        "follow_through": bool(len(usable) >= 2 and all(row["directional"] for row in usable[-2:])),
+        "body_strength": round(sum(row["body"] for row in usable) / len(usable), 6),
+    }
+
+
+
+def _freeze_breach_market_structure_observe_only(
+    signal: dict[str, Any],
+    *,
+    data_sources: dict[str, Any],
+    provenance: dict[str, Any],
+    data_as_of: Any = None,
+) -> dict[str, Any]:
+    """Observe-only 4H/1H FVG geometry + relationship freeze for BREACH evidence."""
+    try:
+        from ap.intelligence_breach_market_structure import freeze_breach_market_structure
+    except Exception as exc:  # never break materialization
+        return {
+            "schema_version": "market_structure_v1",
+            "observe_only": True,
+            "affected_eligibility": False,
+            "status": "ERROR",
+            "error": f"{type(exc).__name__}:{exc}",
+        }
+    candles = dict((data_sources or {}).get("candles") or {})
+    provider = str(
+        (provenance or {}).get("intraday")
+        or (provenance or {}).get("fifteen_minute")
+        or "frozen_breach_candles"
+    )
+    return freeze_breach_market_structure(
+        signal,
+        market_context={"candles": candles},
+        data_as_of=data_as_of,
+        source_provider=provider,
+        volume_imbalance=(signal.get("volume_imbalance") if isinstance(signal, dict) else None),
+    )
+
+
+def _build_breach_evidence(
+    signal: dict[str, Any], *, data_sources: dict[str, Any],
+    provenance: dict[str, Any], observation: dict[str, Any]
+) -> dict[str, Any]:
+    candles = data_sources.get("candles") or {}
+    side = str(signal.get("side") or signal.get("direction") or "").upper()
+    five = list(candles.get("5m") or [])
+    fifteen = list(candles.get("15m") or [])
+    fifteen_source = str(provenance.get("fifteen_minute") or "frozen_signal_15m")
+    pattern_identity = resolve_canonical_strategy_pattern(signal)
+    lineage = resolve_breach_lineage(signal)
+    data_as_of = (
+        signal.get("trigger_crossed_at")
+        or signal.get("data_as_of")
+        or (observation or {}).get("observed_at")
+    )
+    evidence = {
+        "breach_timing": _breach_timing(signal),
+        "raw_pattern": pattern_identity.get("raw_pattern"),
+        "canonical_strategy_pattern": pattern_identity.get("canonical_strategy_pattern"),
+        "canonical_strategy_pattern_status": pattern_identity.get("status"),
+        "canonical_strategy_pattern_diagnostics": pattern_identity.get("diagnostics"),
+        "trigger_crossed_at_provenance": signal.get("trigger_crossed_at_provenance"),
+        "breach_lineage": lineage.get("breach_lineage") or "UNKNOWN",
+        "breach_lineage_status": lineage.get("status"),
+        "breach_lineage_diagnostics": lineage.get("diagnostics"),
+        "direction_reversal_lineage": signal.get("direction_reversal_lineage"),
+        "breach_lifecycle": (
+            signal.get("breach_lifecycle")
+            if isinstance(signal.get("breach_lifecycle"), dict)
+            else resolve_public_breach_lifecycle(signal)
+        ),
+        "breach_observation": observation,
+        "remaining_opportunity": _remaining_opportunity(signal),
+        "fifteen_minute_confirmation": _directional_confirmation(
+            fifteen, side, source=fifteen_source
+        ),
+        "five_minute_confirmation": _directional_confirmation(
+            five, side, source="frozen_signal_5min"
+        ) if five else {
+            "status": "MISSING",
+            "source": None,
+            "bar_count": 0,
+            "missing_reason": "canonical_5min_source_unavailable",
+        },
+        "volume_imbalance": {
+            "status": "MISSING",
+            "source": None,
+            "missing_reason": "bid_ask_volume_not_available_from_source",
+            "approximation_allowed": False,
+        },
+    }
+    # Observe-only market_structure freeze (4H/1H FVG geometry + relationship).
+    market_structure = _freeze_breach_market_structure_observe_only(
+        signal,
+        data_sources=data_sources,
+        provenance=provenance,
+        data_as_of=data_as_of,
+    )
+    evidence["market_structure"] = market_structure
+    if isinstance(market_structure.get("volume_imbalance"), dict):
+        evidence["volume_imbalance"] = market_structure["volume_imbalance"]
+
+    # Wick-only vs body-confirmed breach (prefer 5m OHLC, else 15m, else signal candle).
+    try:
+        from ap.intelligence_breach_market_structure import (
+            assess_breach_htf_freshness,
+            classify_wick_vs_body_breach,
+            freeze_pullback_candidate_features,
+        )
+    except Exception as exc:  # never break materialization
+        evidence["wick_vs_body_breach"] = {
+            "status": "ERROR",
+            "confirmation_style": "UNKNOWN",
+            "error": f"{type(exc).__name__}:{exc}",
+            "observe_only": True,
+            "affected_eligibility": False,
+        }
+        evidence["htf_freshness"] = {
+            "4h": {"status": "ERROR"},
+            "1h": {"status": "ERROR"},
+            "observe_only": True,
+            "affected_eligibility": False,
+        }
+        evidence["pullback_candidate_features"] = {
+            "schema_version": "pullback_candidate_features_v1",
+            "observe_only": True,
+            "affected_eligibility": False,
+            "status": "ERROR",
+            "error": f"{type(exc).__name__}:{exc}",
+            "records_future_pullback_outcomes": False,
+        }
+    else:
+        breach_candle = (
+            signal.get("breach_candle")
+            if isinstance(signal.get("breach_candle"), dict)
+            else None
+        )
+        wick_source = "signal_breach_candle"
+        wick_rows = None
+        wick_bucket = 5
+        if breach_candle is None:
+            if five:
+                wick_rows = five
+                wick_bucket = 5
+                wick_source = "frozen_signal_5min"
+            elif fifteen:
+                wick_rows = fifteen
+                wick_bucket = 15
+                wick_source = fifteen_source
+        evidence["wick_vs_body_breach"] = classify_wick_vs_body_breach(
+            side=side,
+            trigger=signal.get("trigger_price") or signal.get("trigger"),
+            candles=wick_rows,
+            breach_candle=breach_candle,
+            data_as_of=data_as_of,
+            bucket_minutes=wick_bucket,
+            source=wick_source,
+        )
+        htf_freshness = assess_breach_htf_freshness(candles, data_as_of=data_as_of)
+        evidence["htf_freshness"] = htf_freshness
+        if isinstance(market_structure, dict) and market_structure.get("status") != "ERROR":
+            market_structure = dict(market_structure)
+            market_structure["htf_freshness"] = htf_freshness
+            evidence["market_structure"] = market_structure
+        evidence["pullback_candidate_features"] = freeze_pullback_candidate_features(
+            signal=signal,
+            evidence=evidence,
+            wick_vs_body=evidence.get("wick_vs_body_breach"),
+            market_structure=evidence.get("market_structure"),
+            htf_freshness=htf_freshness,
+        )
+
+    evidence["entry_readiness_observe_only"] = classify_entry_readiness_observe_only(
+        signal, evidence=evidence
+    )
+    return evidence
+
+
+
 def build_intelligence_context_payload(
     signal: dict[str, Any],
     *,
@@ -82,6 +1111,9 @@ def build_intelligence_context_payload(
     point_in_time = collect_point_in_time_context(sig, broker=broker, phase=phase)
     observation = point_in_time.get("underlying_observation") or {}
     observed_price = observation.get("price")
+    breach_observation = _frozen_breach_observation(sig) if phase == "BREACH" else {}
+    if phase == "BREACH" and breach_observation.get("price") is not None:
+        observed_price = breach_observation["price"]
     evaluation_signal = dict(sig)
     if observed_price is not None:
         evaluation_signal["underlying_price"] = observed_price
@@ -129,6 +1161,34 @@ def build_intelligence_context_payload(
         return "AVAILABLE" if available else "MISSING"
 
     fvg_tf = ((fvg_context.get("diagnostics") or {}).get("timeframes") or {})
+    # HTF freshness: explicit STALE when completed bars exist but are too old vs as_of.
+    breach_as_of_for_freshness = (
+        _breach_timing(sig).get("timestamp")
+        if phase == "BREACH" and _breach_timing(sig).get("timestamp_status") == "AVAILABLE"
+        else point_in_time.get("collected_at") or sig.get("data_as_of")
+    )
+    htf_freshness_for_components = None
+    try:
+        from ap.intelligence_breach_market_structure import assess_breach_htf_freshness
+        htf_freshness_for_components = assess_breach_htf_freshness(
+            (data_sources.get("candles") or {}),
+            data_as_of=breach_as_of_for_freshness,
+        )
+    except Exception:
+        htf_freshness_for_components = None
+
+    def _htf_component(available: bool, freshness: dict[str, Any] | None, *, error_prefix: str) -> str:
+        base = _component(available, error_prefix=error_prefix)
+        if base == "ERROR":
+            return "ERROR"
+        if isinstance(freshness, dict) and freshness.get("status") == "STALE":
+            return "STALE"
+        if isinstance(freshness, dict) and freshness.get("status") == "MISSING" and not available:
+            return "MISSING"
+        return base
+
+    four_fresh = (htf_freshness_for_components or {}).get("4h") if isinstance(htf_freshness_for_components, dict) else None
+    one_fresh = (htf_freshness_for_components or {}).get("1h") if isinstance(htf_freshness_for_components, dict) else None
     component_statuses = {
         "geometry": _component(bool(geometry.get("available"))),
         "underlying_quote": _component(
@@ -138,14 +1198,34 @@ def build_intelligence_context_payload(
         "monthly": _component(bool(timeframe_context["monthly"].get("available")), error_prefix="daily_history"),
         "weekly": _component(bool(timeframe_context["weekly"].get("available")), error_prefix="daily_history"),
         "daily": _component(bool(timeframe_context["daily"].get("available")), error_prefix="daily_history"),
-        "four_hour": _component(bool(timeframe_context["4h"].get("available")), error_prefix="intraday_history"),
-        "one_hour_fvg": _component(bool((fvg_tf.get("1h") or {}).get("available")), error_prefix="intraday_history"),
-        "four_hour_fvg": _component(bool((fvg_tf.get("4h") or {}).get("available")), error_prefix="intraday_history"),
+        "four_hour": _htf_component(
+            bool(timeframe_context["4h"].get("available")),
+            four_fresh if isinstance(four_fresh, dict) else None,
+            error_prefix="intraday_history",
+        ),
+        "one_hour_fvg": _htf_component(
+            bool((fvg_tf.get("1h") or {}).get("available")),
+            one_fresh if isinstance(one_fresh, dict) else None,
+            error_prefix="intraday_history",
+        ),
+        "four_hour_fvg": _htf_component(
+            bool((fvg_tf.get("4h") or {}).get("available")),
+            four_fresh if isinstance(four_fresh, dict) else None,
+            error_prefix="intraday_history",
+        ),
         "market": _component((sector_context.get("diagnostics") or {}).get("market_direction") is not None, error_prefix="market_quote"),
         "sector": _component((sector_context.get("diagnostics") or {}).get("sector_direction") is not None, error_prefix="sector_quote"),
         "volume": _component((volume_context.get("diagnostics") or {}).get("relative_volume") is not None),
         "vwap": _component((vwap_context.get("diagnostics") or {}).get("vwap") is not None),
     }
+    if phase == "BREACH":
+        breach_candles = data_sources.get("candles") or {}
+        component_statuses.update({
+            "fifteen_minute": _component(bool(breach_candles.get("15m"))),
+            # Current main has no canonical broker-backed 5m source. Keep the
+            # absence explicit rather than deriving 5m evidence from 15m bars.
+            "five_minute": _component(bool(breach_candles.get("5m"))),
+        })
     required_values = list(component_statuses.values())
     status = "COMPLETE" if required_values and all(value == "AVAILABLE" for value in required_values) else "PARTIAL"
     if all(value in {"MISSING", "ERROR"} for value in required_values):
@@ -171,7 +1251,11 @@ def build_intelligence_context_payload(
         "side": str(sig.get("side") or sig.get("direction") or "").upper(),
         "pattern": str(sig.get("pattern") or sig.get("pattern_id") or ""),
         "timeframe": str(sig.get("timeframe") or ""),
-        "data_as_of": point_in_time.get("collected_at") or _now_iso(),
+        "data_as_of": (
+            _breach_timing(sig).get("timestamp")
+            if phase == "BREACH" and _breach_timing(sig).get("timestamp_status") == "AVAILABLE"
+            else point_in_time.get("collected_at") or _now_iso()
+        ),
         "signal_data_as_of": sig.get("data_as_of") or sig.get("queued_at"),
         "computed_at": _now_iso(),
         "status": status,
@@ -189,11 +1273,44 @@ def build_intelligence_context_payload(
         "sector_context": sector_context,
         "volume_context": volume_context,
         "vwap_context": vwap_context,
-        "underlying_observation": observation,
+        "underlying_observation": (
+            breach_observation if phase == "BREACH" and breach_observation.get("price") is not None
+            else observation
+        ),
+        "enrichment_underlying_observation": observation if phase == "BREACH" else None,
         "data_provenance": point_in_time.get("provenance") or {},
         "parent_snapshot_id": parent_snapshot_id,
         "compatibility_key": "intelligence_evaluation",
     }
+    if phase == "BREACH":
+        payload["breach_evidence"] = _build_breach_evidence(
+            sig,
+            data_sources=data_sources,
+            provenance=point_in_time.get("provenance") or {},
+            observation=payload["underlying_observation"],
+        )
+        # Stable observe-only key: mirror frozen structure from breach_evidence
+        # (single freeze inside _build_breach_evidence; no second detector).
+        ms = (payload.get("breach_evidence") or {}).get("market_structure")
+        if isinstance(ms, dict):
+            payload["market_structure"] = ms
+        readiness = (payload.get("breach_evidence") or {}).get("entry_readiness_observe_only")
+        if isinstance(readiness, dict):
+            payload["entry_timing_candidate_observe_only"] = {
+                **readiness,
+                "observe_only": True,
+                "affected_eligibility": False,
+            }
+            # Explicit dual-emit of amendment enum beside legacy classification.
+            if readiness.get("entry_timing_candidate"):
+                payload["entry_timing_candidate"] = readiness.get("entry_timing_candidate")
+        be = payload.get("breach_evidence") if isinstance(payload.get("breach_evidence"), dict) else {}
+        if isinstance(be.get("pullback_candidate_features"), dict):
+            payload["pullback_candidate_features"] = be["pullback_candidate_features"]
+        if isinstance(be.get("htf_freshness"), dict):
+            payload["htf_freshness"] = be["htf_freshness"]
+        if isinstance(htf_freshness_for_components, dict):
+            payload.setdefault("htf_freshness", htf_freshness_for_components)
     payload["input_hash"] = str(input_hash or _stable_hash(
         {
             "phase": phase,
@@ -215,22 +1332,92 @@ def build_snapshot_kwargs(job: dict[str, Any], *, broker: Any = None) -> dict[st
     phase = str(job.get("phase") or payload.get("phase") or "").upper()
     canonical_signal_id = str(job.get("canonical_signal_id") or payload.get("canonical_signal_id") or "")
     client_id = str(job.get("client_id") or payload.get("client_id") or "")
-    execution_mode = normalize_execution_mode(job.get("execution_mode") or payload.get("execution_mode"))
+    raw_execution_mode = job.get("execution_mode") or payload.get("execution_mode")
+    execution_mode = normalize_execution_mode(raw_execution_mode)
     local_order_id = str(job.get("local_order_id") or payload.get("local_order_id") or "")
+    signal_id = str(job.get("signal_id") or payload.get("signal_id") or signal.get("signal_id") or "")
+    if phase == "BREACH":
+        # Recheck job columns against the frozen payload before parent lookup,
+        # history access, or snapshot construction. A post-enqueue column/meta
+        # disagreement is a permanent intelligence rejection, not a reason to
+        # score whichever copy happens to be convenient.
+        for field in (
+            "client_id", "execution_mode", "signal_id", "canonical_signal_id", "local_order_id",
+        ):
+            if job.get(field) in (None, ""):
+                raise BreachMaterializationRejected(
+                    f"BREACH_IDENTITY_MISSING_JOB_{field.upper()}"
+                )
+        identity_signal = dict(signal or {})
+        existing_sources = identity_signal.get("breach_identity_sources")
+        source_hints = dict(existing_sources) if isinstance(existing_sources, dict) else {}
+        field_sources = {
+            "client_id": [
+                job.get("client_id"), payload.get("client_id"), payload.get("client_email"),
+                signal.get("client_id"), signal.get("client_email"),
+            ],
+            "execution_mode": [
+                job.get("execution_mode"), payload.get("execution_mode"), payload.get("mode"),
+                signal.get("execution_mode"), signal.get("mode"),
+            ],
+            "signal_id": [job.get("signal_id"), payload.get("signal_id"), signal.get("signal_id")],
+            "canonical_signal_id": [
+                job.get("canonical_signal_id"), payload.get("canonical_signal_id"),
+                signal.get("canonical_signal_id"),
+            ],
+            "local_order_id": [
+                job.get("local_order_id"), payload.get("local_order_id"),
+                signal.get("local_order_id"),
+            ],
+        }
+        for field, values in field_sources.items():
+            prior = source_hints.get(field)
+            if isinstance(prior, list):
+                source_hints[field] = [*prior, *values]
+            elif prior not in (None, ""):
+                source_hints[field] = [prior, *values]
+            else:
+                source_hints[field] = values
+        identity_signal["breach_identity_sources"] = source_hints
+        identity, identity_error = _resolve_breach_identity(
+            identity_signal,
+            client_id=client_id,
+            execution_mode=raw_execution_mode,
+            canonical_signal_id=canonical_signal_id,
+            local_order_id=local_order_id,
+            signal_id=signal_id,
+        )
+        if identity_error:
+            raise BreachMaterializationRejected(identity_error)
+        client_id = identity["client_id"]
+        execution_mode = identity["execution_mode"]
+        canonical_signal_id = identity["canonical_signal_id"]
+        local_order_id = identity["local_order_id"]
+        signal_id = identity["signal_id"]
+        signal = dict(signal or {})
+        signal.update(identity)
     parent_snapshot_id = payload.get("parent_snapshot_id")
     parent_link_status = payload.get("parent_link_status")
-    if phase == "PREOPEN" and not parent_snapshot_id:
-        parent = get_latest_snapshot(
-            client_id=client_id,
-            execution_mode=execution_mode,
-            canonical_signal_id=canonical_signal_id,
-            phase="PRETRIGGER",
-        )
-        if parent.get("ok"):
-            parent_snapshot_id = ((parent.get("snapshot") or {}).get("id") or None)
-            parent_link_status = "LINKED" if parent_snapshot_id else "PRETRIGGER_NOT_AVAILABLE"
-        else:
-            parent_link_status = "PRETRIGGER_LOOKUP_FAILED"
+    if phase in {"PREOPEN", "BREACH"} and not parent_snapshot_id:
+        parent_phases = ("PRETRIGGER",) if phase == "PREOPEN" else ("PREOPEN", "PRETRIGGER")
+        parent_link_status = "PARENT_NOT_AVAILABLE"
+        for parent_phase in parent_phases:
+            parent = get_latest_snapshot(
+                client_id=client_id,
+                execution_mode=execution_mode,
+                canonical_signal_id=canonical_signal_id,
+                phase=parent_phase,
+            )
+            if parent.get("ok"):
+                parent_snapshot_id = ((parent.get("snapshot") or {}).get("id") or None)
+                if parent_snapshot_id:
+                    parent_link_status = (
+                        "LINKED" if phase == "PREOPEN" else f"LINKED_{parent_phase}"
+                    )
+                    break
+                parent_link_status = f"{parent_phase}_NOT_AVAILABLE"
+            else:
+                parent_link_status = f"{parent_phase}_LOOKUP_FAILED"
     context_payload = build_intelligence_context_payload(
         dict(signal or {}),
         phase=phase,
@@ -244,13 +1431,13 @@ def build_snapshot_kwargs(job: dict[str, Any], *, broker: Any = None) -> dict[st
         input_hash=str(job.get("input_hash") or ""),
         broker=broker,
     )
-    if phase == "PREOPEN":
-        context_payload["parent_link_status"] = parent_link_status or "PRETRIGGER_NOT_AVAILABLE"
+    if phase in {"PREOPEN", "BREACH"}:
+        context_payload["parent_link_status"] = parent_link_status or "PARENT_NOT_AVAILABLE"
     return {
         "client_id": client_id,
         "execution_mode": execution_mode,
         "canonical_signal_id": canonical_signal_id,
-        "signal_id": str(job.get("signal_id") or context_payload.get("signal_id") or ""),
+        "signal_id": signal_id or str(context_payload.get("signal_id") or ""),
         "local_order_id": local_order_id,
         "phase": phase,
         "context_revision": int(job.get("context_revision") or CONTEXT_REVISION),
@@ -349,6 +1536,83 @@ def enqueue_preopen_context(
     )
 
 
+def enqueue_breach_context(
+    signal: dict[str, Any],
+    *,
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str = "",
+    local_order_id: str,
+    signal_id: str = "",
+) -> dict[str, Any]:
+    """Enqueue one immutable, observe-only BREACH envelope.
+
+    This function has no execution authority. Identity ambiguity is rejected
+    before the intelligence job store is touched so a malformed handoff cannot
+    be silently attributed to another client, mode, signal, or order.
+    """
+    sig = dict(signal or {}) if isinstance(signal, dict) else {}
+    identity, error_code = _resolve_breach_identity(
+        sig,
+        client_id=client_id,
+        execution_mode=execution_mode,
+        canonical_signal_id=canonical_signal_id,
+        local_order_id=local_order_id,
+        signal_id=signal_id,
+    )
+    if error_code:
+        return {"ok": False, "inserted": False, "error_code": error_code}
+
+    # Resolve public lifecycle + lineage + pattern BEFORE private-key stripping
+    # so restart/preclaimed authority survives freeze.
+    pattern_identity = resolve_canonical_strategy_pattern(sig)
+    lineage = resolve_breach_lineage(sig)
+    public_lifecycle = resolve_public_breach_lifecycle(sig)
+    sig = dict(sig)
+    sig["raw_pattern"] = pattern_identity.get("raw_pattern")
+    sig["canonical_strategy_pattern"] = pattern_identity.get("canonical_strategy_pattern")
+    sig["canonical_strategy_pattern_status"] = pattern_identity.get("status")
+    sig["breach_lineage"] = lineage.get("breach_lineage") or "UNKNOWN"
+    sig["breach_lineage_status"] = lineage.get("status")
+    sig["breach_lifecycle"] = public_lifecycle
+
+    frozen_signal = _freeze_value(sig)
+    if not isinstance(frozen_signal, dict):
+        return {
+            "ok": False,
+            "inserted": False,
+            "error_code": "BREACH_SIGNAL_FREEZE_FAILED",
+        }
+    # These are the resolved authorities, not caller-provided duplicates.
+    frozen_signal.update(identity)
+    frozen_signal["breach_lifecycle"] = public_lifecycle
+    frozen_signal["breach_lineage"] = lineage.get("breach_lineage") or "UNKNOWN"
+    frozen_signal["canonical_strategy_pattern"] = pattern_identity.get(
+        "canonical_strategy_pattern"
+    )
+    frozen_signal["raw_pattern"] = pattern_identity.get("raw_pattern")
+    payload = {
+        "phase": "BREACH",
+        "signal": frozen_signal,
+        **identity,
+        "observe_only": True,
+        "affected_eligibility": False,
+    }
+    input_hash = _stable_hash(payload)
+    return enqueue_intelligence_job(
+        client_id=identity["client_id"],
+        execution_mode=identity["execution_mode"],
+        canonical_signal_id=identity["canonical_signal_id"],
+        signal_id=identity["signal_id"],
+        local_order_id=identity["local_order_id"],
+        phase="BREACH",
+        context_revision=CONTEXT_REVISION,
+        profile_version=DEFAULT_PROFILE_VERSION,
+        input_hash=input_hash,
+        payload=payload,
+    )
+
+
 def recover_missing_intelligence_jobs(
     *, client_id: str, execution_mode: str, limit: int = 100
 ) -> dict[str, Any]:
@@ -357,7 +1621,7 @@ def recover_missing_intelligence_jobs(
 
     mode = normalize_execution_mode(execution_mode)
 
-    def _load() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    def _load() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         with conn() as c:
             c.execute(
                 """
@@ -405,14 +1669,59 @@ def recover_missing_intelligence_jobs(
                 (client_id, mode, mode, mode, int(limit or 100)),
             )
             preopen_rows = list(c.fetchall() or [])
-            return queue_rows, preopen_rows
+            c.execute(
+                """
+                SELECT o.signal_id, o.local_order_id, o.client_id,
+                       o.execution_mode, o.meta, q.payload
+                FROM orders o
+                JOIN trade_queue q
+                  ON q.client_id=o.client_id AND q.signal_id=o.signal_id
+                WHERE o.client_id=%s
+                  AND o.kind='ENTRY'
+                  AND (
+                    (
+                      o.status IN ('PENDING_TRIGGER','WATCHING')
+                      AND o.broker_order_id IS NULL
+                    )
+                    OR (
+                      -- Telemetry-only crash recovery after execution advanced:
+                      -- rebuild missing BREACH intel when identity+provenance remain exact.
+                      o.status NOT IN ('REJECTED','ERROR','CANCELED','CANCELLED','EXPIRED')
+                      AND NULLIF(BTRIM(COALESCE(o.meta->>'trigger_crossed_at', o.meta->>'trigger_confirmed_at')), '') IS NOT NULL
+                      AND NULLIF(BTRIM(o.local_order_id), '') IS NOT NULL
+                    )
+                  )
+                  AND upper(COALESCE(o.execution_mode, %s))=%s
+                  AND (
+                    NULLIF(BTRIM(o.meta->>'trigger_crossed_at'), '') IS NOT NULL
+                    OR NULLIF(BTRIM(o.meta->>'trigger_confirmed_at'), '') IS NOT NULL
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM ap_intelligence_jobs j
+                    WHERE j.client_id=o.client_id
+                      AND lower(j.execution_mode)=lower(%s)
+                      AND j.signal_id=o.signal_id
+                      AND COALESCE(NULLIF(BTRIM(j.local_order_id), ''), '__none__')=
+                          COALESCE(NULLIF(BTRIM(o.local_order_id), ''), '__none__')
+                      AND j.phase='BREACH'
+                  )
+                ORDER BY o.created_ts DESC
+                LIMIT %s
+                """,
+                (client_id, mode, mode, mode, int(limit or 100)),
+            )
+            breach_rows = list(c.fetchall() or [])
+            return queue_rows, preopen_rows, breach_rows
 
     try:
-        queue_rows, preopen_rows = run_with_retry(_load)
+        queue_rows, preopen_rows, breach_rows = run_with_retry(_load)
     except Exception as exc:
-        return {"ok": False, "pretrigger": 0, "preopen": 0, "error": str(exc)[:500]}
+        return {
+            "ok": False, "pretrigger": 0, "preopen": 0,
+            "breach": 0, "breach_errors": 0, "error": str(exc)[:500],
+        }
 
-    counts = {"pretrigger": 0, "preopen": 0}
+    counts = {"pretrigger": 0, "preopen": 0, "breach": 0, "breach_errors": 0}
     for row in queue_rows:
         payload = row.get("payload") if isinstance(row, dict) else row[1]
         if isinstance(payload, str):
@@ -443,4 +1752,95 @@ def recover_missing_intelligence_jobs(
             local_order_id=str(local_order_id or ""),
         )
         counts["preopen"] += int(bool(result.get("inserted")))
+    for row in breach_rows:
+        if isinstance(row, dict):
+            row_signal_id = str(row.get("signal_id") or "").strip()
+            row_local_order_id = str(row.get("local_order_id") or "").strip()
+            row_client_id = str(row.get("client_id") or client_id).strip()
+            row_mode = str(row.get("execution_mode") or mode).strip()
+            raw_meta = row.get("meta") or {}
+            raw_payload = row.get("payload") or {}
+        else:
+            row_signal_id, row_local_order_id, row_client_id, row_mode, raw_meta, raw_payload = row
+            row_signal_id = str(row_signal_id or "").strip()
+            row_local_order_id = str(row_local_order_id or "").strip()
+            row_client_id = str(row_client_id or client_id).strip()
+            row_mode = str(row_mode or mode).strip()
+        if isinstance(raw_meta, str):
+            try:
+                raw_meta = json.loads(raw_meta)
+            except Exception:
+                raw_meta = {}
+        if not isinstance(raw_meta, dict):
+            raw_meta = {}
+        if isinstance(raw_payload, str):
+            try:
+                raw_payload = json.loads(raw_payload)
+            except Exception:
+                raw_payload = {}
+        if not isinstance(raw_payload, dict):
+            raw_payload = {}
+        payload_signal = raw_payload.get("signal")
+        signal = dict(payload_signal if isinstance(payload_signal, dict) else raw_payload)
+        payload_metadata = signal.get("metadata")
+        if payload_metadata is not None and not isinstance(payload_metadata, dict):
+            counts["breach_errors"] += 1
+            continue
+        merged_metadata = dict(payload_metadata or {})
+        duplicate_conflict = False
+        for field in (
+            "client_id", "execution_mode", "local_order_id", "canonical_signal_id",
+            "signal_id", "trigger_crossed_at", "trigger_confirmed_at",
+            "materialization_generation", "recovery_submit_generation",
+            "_recovery_pre_claimed_generation", "watcher_generation",
+            "retry_attempt", "retry_attempts", "materialization_retry_attempt",
+            "materialization_attempts", "deferred_retry_attempt",
+            "recovery_submit_fenced", "fenced",
+        ):
+            if field in merged_metadata and field in raw_meta:
+                if str(merged_metadata[field] or "") != str(raw_meta[field] or ""):
+                    duplicate_conflict = True
+                    break
+            elif field in raw_meta:
+                merged_metadata[field] = raw_meta[field]
+        if duplicate_conflict:
+            counts["breach_errors"] += 1
+            continue
+        if merged_metadata:
+            signal["metadata"] = merged_metadata
+        for field in (
+            "trigger_crossed_at", "trigger_crossed_at_provenance",
+            "trigger_confirmed_at", "first_breach_bid", "first_breach_ask",
+            "breach_price", "underlying_price", "current_price",
+            "breach_lineage", "direction_reversal_lineage",
+            "materialization_generation", "recovery_submit_generation",
+            "_recovery_pre_claimed_generation", "watcher_generation",
+            "retry_attempt", "retry_attempts", "materialization_retry_attempt",
+            "materialization_attempts", "deferred_retry_attempt",
+            "recovery_submit_fenced", "fenced",
+        ):
+            if field in raw_meta:
+                if field in signal and str(signal.get(field) or "") != str(raw_meta[field] or ""):
+                    duplicate_conflict = True
+                    break
+                signal.setdefault(field, raw_meta[field])
+        if duplicate_conflict:
+            counts["breach_errors"] += 1
+            continue
+        signal.setdefault("signal_id", row_signal_id)
+        signal.setdefault("client_id", row_client_id)
+        signal.setdefault("execution_mode", row_mode)
+        signal.setdefault("local_order_id", row_local_order_id)
+        result = enqueue_breach_context(
+            signal,
+            client_id=row_client_id,
+            execution_mode=row_mode,
+            canonical_signal_id=str(signal.get("canonical_signal_id") or ""),
+            local_order_id=row_local_order_id,
+            signal_id=row_signal_id,
+        )
+        if result.get("inserted"):
+            counts["breach"] += 1
+        elif not result.get("duplicate"):
+            counts["breach_errors"] += 1
     return {"ok": True, **counts}

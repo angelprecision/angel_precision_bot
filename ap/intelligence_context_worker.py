@@ -94,11 +94,14 @@ def process_due_intelligence_jobs_once(
             errors += 1
             attempts = int(job.get("attempt_count") or 0)
             max_attempts = int(job.get("max_attempts") or 3)
+            error_code = str(getattr(exc, "error_code", "") or type(exc).__name__)
+            if error_code.startswith("BREACH_"):
+                attempts = max_attempts
             if attempts >= max_attempts:
                 transition = mark_job_terminal(
                     str(job.get("id")),
                     claim_owner=owner,
-                    error_code=type(exc).__name__,
+                    error_code=error_code,
                     error_detail=str(exc)[:500],
                 )
                 if transition.get("ok") and transition.get("updated"):
@@ -111,7 +114,7 @@ def process_due_intelligence_jobs_once(
                 transition = mark_job_retry(
                     str(job.get("id")),
                     claim_owner=owner,
-                    error_code=type(exc).__name__,
+                    error_code=error_code,
                     error_detail=str(exc)[:500],
                     retry_delay_seconds=30,
                 )
@@ -160,8 +163,8 @@ def start_intelligence_context_worker(
                     client_id=client_id, execution_mode=execution_mode,
                 )
                 last_recovery = now
-                if not recovery.get("ok"):
-                    log.warning("[%s] intelligence recovery scan failed: %s", client_id, recovery)
+                if not recovery.get("ok") or recovery.get("breach_errors"):
+                    log.warning("[%s] intelligence recovery scan incomplete: %s", client_id, recovery)
             result = process_due_intelligence_jobs_once(
                 claim_owner=owner,
                 client_id=client_id,

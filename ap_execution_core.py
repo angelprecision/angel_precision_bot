@@ -78,6 +78,220 @@ def _resolve_submit_execution_mode(approved_plan, signal, runtime_mode, paper_fl
     if isinstance(paper_flag, bool):
         return "paper" if paper_flag else "live"
     return None
+
+
+def _copy_breach_value(value, *, depth: int = 0):
+    """Copy only serializable breach-time values; never retain runtime objects."""
+    if depth > 8:
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        return {
+            str(key): _copy_breach_value(item, depth=depth + 1)
+            for key, item in value.items()
+            if not str(key).startswith("_")
+        }
+    if isinstance(value, (list, tuple)):
+        return [_copy_breach_value(item, depth=depth + 1) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _first_breach_value(*values):
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _first_positive_breach_value(*values):
+    for value in values:
+        if value in (None, "") or isinstance(value, bool):
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number) and number > 0:
+            return value
+    return None
+
+
+def _build_breach_intelligence_signal(
+    signal: Mapping,
+    watched,
+    approved_plan,
+    *,
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+    local_order_id: str,
+    signal_id: str,
+) -> dict:
+    """Freeze watcher/plan truth at the confirmed-breach callback seam."""
+    sig = dict(signal or {}) if isinstance(signal, Mapping) else {}
+    plan_meta = getattr(approved_plan, "metadata", None)
+    plan_meta = dict(plan_meta) if isinstance(plan_meta, Mapping) else {}
+    ownership = sig.get("_callback_ownership_context")
+    ownership = dict(ownership) if isinstance(ownership, Mapping) else {}
+    frozen = _copy_breach_value(sig)
+    if not isinstance(frozen, dict):
+        frozen = {}
+
+    side = str(_first_breach_value(
+        getattr(approved_plan, "side", None), sig.get("side"), sig.get("direction")
+    ) or "").upper()
+    ticker = str(_first_breach_value(
+        getattr(approved_plan, "ticker", None), sig.get("ticker"), watched.ticker
+    ) or "")
+    trigger = _first_positive_breach_value(
+        getattr(approved_plan, "trigger_price", None),
+        getattr(watched, "trigger_price", None),
+        sig.get("trigger_price"), sig.get("trigger"),
+    )
+    stop = _first_positive_breach_value(
+        sig.get("stop_price"), sig.get("stop"), sig.get("stop_level"),
+        getattr(approved_plan, "stop_price", None),
+        getattr(approved_plan, "stop_underlying", None),
+        getattr(approved_plan, "stop", None),
+    )
+    target = _first_positive_breach_value(
+        sig.get("target_price"), sig.get("target"), sig.get("pt1"),
+        getattr(approved_plan, "target_price", None),
+        getattr(approved_plan, "target_underlying", None),
+        getattr(approved_plan, "target", None),
+    )
+    quote_key = "last_quote_ask" if side == "CALL" else "last_quote_bid"
+    first_quote_key = "first_breach_ask" if side == "CALL" else "first_breach_bid"
+    observed = _first_positive_breach_value(
+        getattr(watched, first_quote_key, None),
+        getattr(watched, "breach_price", None),
+        getattr(watched, quote_key, None),
+        sig.get("underlying_price"), sig.get("current_price"),
+    )
+    crossed_at = _first_breach_value(
+        getattr(watched, "trigger_crossed_at", None),
+        sig.get("trigger_crossed_at"), plan_meta.get("trigger_crossed_at"),
+    )
+    confirmed_at = _first_breach_value(
+        getattr(watched, "triggered_at", None),
+        sig.get("trigger_confirmed_at"), plan_meta.get("trigger_confirmed_at"),
+    )
+    frozen["breach_identity_sources"] = {
+        "client_id": [
+            sig.get("client_id"), getattr(approved_plan, "client_id", None),
+            ownership.get("client_id"), client_id,
+        ],
+        "execution_mode": [
+            sig.get("execution_mode"), sig.get("mode"),
+            getattr(approved_plan, "execution_mode", None),
+            getattr(approved_plan, "mode", None), ownership.get("execution_mode"),
+            execution_mode,
+        ],
+        "signal_id": [
+            sig.get("signal_id"), getattr(approved_plan, "signal_id", None), signal_id,
+        ],
+        "canonical_signal_id": [
+            sig.get("canonical_signal_id"), plan_meta.get("canonical_signal_id"),
+            canonical_signal_id,
+        ],
+        "local_order_id": [
+            sig.get("local_order_id"), plan_meta.get("local_order_id"),
+            ownership.get("local_order_id"), local_order_id,
+        ],
+    }
+    frozen["breach_lifecycle_sources"] = {
+        "materialization_generation": [
+            sig.get("materialization_generation"),
+            plan_meta.get("materialization_generation"),
+            ownership.get("generation"),
+        ],
+        "recovery_submit_generation": [
+            sig.get("recovery_submit_generation"),
+            plan_meta.get("recovery_submit_generation"),
+            ownership.get("generation"),
+        ],
+        "lifecycle_generation": [ownership.get("generation")],
+        "retry_attempt": [
+            sig.get("retry_attempt"), plan_meta.get("retry_attempt"),
+            ownership.get("retry_attempt"),
+        ],
+        "materialization_retry_attempt": [
+            sig.get("materialization_retry_attempt"),
+            plan_meta.get("materialization_retry_attempt"),
+            ownership.get("retry_attempt"),
+        ],
+        "retry_attempts": [sig.get("retry_attempts"), plan_meta.get("retry_attempts")],
+        "materialization_attempts": [
+            sig.get("materialization_attempts"), plan_meta.get("materialization_attempts"),
+        ],
+    }
+    frozen["breach_timestamp_sources"] = {
+        "trigger_crossed_at": [
+            getattr(watched, "trigger_crossed_at", None),
+            sig.get("trigger_crossed_at"), plan_meta.get("trigger_crossed_at"),
+        ],
+        "trigger_confirmed_at": [
+            getattr(watched, "triggered_at", None),
+            sig.get("trigger_confirmed_at"), plan_meta.get("trigger_confirmed_at"),
+        ],
+    }
+    frozen.update({
+        "client_id": str(client_id or "").strip(),
+        "execution_mode": str(execution_mode or "").strip().upper(),
+        "signal_id": str(signal_id or sig.get("signal_id") or "").strip(),
+        "canonical_signal_id": str(canonical_signal_id or sig.get("canonical_signal_id") or "").strip(),
+        "local_order_id": str(local_order_id or sig.get("local_order_id") or "").strip(),
+        "ticker": ticker,
+        "side": side,
+        "trigger_price": trigger,
+        "stop_price": stop,
+        "target_price": target,
+        "underlying_price": observed,
+        "current_price": observed,
+        "breach_price": _first_positive_breach_value(
+            getattr(watched, "breach_price", None), observed
+        ),
+        "trigger_crossed_at": (
+            crossed_at.isoformat() if hasattr(crossed_at, "isoformat") else crossed_at
+        ),
+        "trigger_confirmed_at": (
+            confirmed_at.isoformat() if hasattr(confirmed_at, "isoformat") else confirmed_at
+        ),
+        "trigger_crossed_at_provenance": _first_breach_value(
+            sig.get("trigger_crossed_at_provenance"),
+            plan_meta.get("trigger_crossed_at_provenance"),
+        ),
+        "first_breach_bid": _first_positive_breach_value(
+            getattr(watched, "first_breach_bid", None), sig.get("first_breach_bid")
+        ),
+        "first_breach_ask": _first_positive_breach_value(
+            getattr(watched, "first_breach_ask", None), sig.get("first_breach_ask")
+        ),
+        "trigger_source": "watcher_confirmed_breach",
+        "trigger_type": "recovered_breach" if ownership.get("is_recovered") else "initial_breach",
+        "lifecycle_generation": _first_breach_value(
+            ownership.get("generation"), sig.get("materialization_generation"),
+            plan_meta.get("materialization_generation"),
+        ),
+        "retry_attempt": _first_breach_value(
+            ownership.get("retry_attempt"), sig.get("retry_attempt"),
+            plan_meta.get("retry_attempt"),
+        ),
+        "breach_lineage": _first_breach_value(
+            sig.get("breach_lineage"), plan_meta.get("breach_lineage"), "UNKNOWN"
+        ),
+        "direction_reversal_lineage": _first_breach_value(
+            sig.get("direction_reversal_lineage"),
+            plan_meta.get("direction_reversal_lineage"),
+        ),
+    })
+    return frozen
+
 ET  = ZoneInfo("America/New_York")
 # Canonical compact OCC/OSI contract: 1-6 character root, YYMMDD expiry,
 # call/put right, and eight-digit strike multiplied by 1,000.  This is a
@@ -5255,6 +5469,48 @@ class APExecutionCore:
             # this terminal state.
             _terminalize_breach_failure("approved_plan_missing_after_revalidation")
             return
+
+        # ── PR #435: freeze the confirmed BREACH before selector/materialization ──
+        # This handoff is bounded, observe-only, and intentionally non-authoritative.
+        # It must not read the broker, wait on persistence, or gate any execution
+        # path. The existing selector/materializer remains the sole next authority.
+        try:
+            from ap.intelligence_context_handoff import enqueue_breach_context_best_effort
+
+            _breach_mode_for_intelligence = str(
+                _callback_mode
+                or getattr(approved_plan, "execution_mode", None)
+                or getattr(self, "execution_mode", None)
+                or ""
+            ).strip().upper()
+            _breach_input = _build_breach_intelligence_signal(
+                sig,
+                watched,
+                approved_plan,
+                client_id=_breach_client_id,
+                execution_mode=_breach_mode_for_intelligence,
+                canonical_signal_id=str(sig.get("canonical_signal_id") or ""),
+                local_order_id=str(queue_local_order_id or ""),
+                signal_id=signal_id,
+            )
+            _breach_handoff = enqueue_breach_context_best_effort(
+                _breach_input,
+                client_id=_breach_client_id,
+                execution_mode=_breach_mode_for_intelligence,
+                canonical_signal_id=str(_breach_input.get("canonical_signal_id") or ""),
+                local_order_id=str(queue_local_order_id or ""),
+                signal_id=signal_id,
+            )
+            if not _breach_handoff.get("ok"):
+                log.warning(
+                    "[%s] BREACH_INTELLIGENCE_HANDOFF_NOT_ACCEPTED signal_id=%s reason=%s",
+                    ticker, signal_id or "?", _breach_handoff.get("error") or _breach_handoff.get("error_code"),
+                )
+        except Exception as _breach_intelligence_exc:
+            log.warning(
+                "[%s] BREACH_INTELLIGENCE_HANDOFF_FAILED signal_id=%s error=%s",
+                ticker, signal_id or "?", _breach_intelligence_exc,
+            )
 
         # ── Intelligence PR 1: dispatch immediately after plan is confirmed ──────
         # Fires before any post-plan terminal return (rejections, expiry, submit).

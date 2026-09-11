@@ -83,3 +83,22 @@ def enqueue_preopen_context_best_effort(signal: dict[str, Any], **kwargs: Any) -
         signal_id=str((signal or {}).get("signal_id") or ""),
         **kwargs,
     )
+
+
+def enqueue_breach_context_best_effort(signal: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+    """Freeze and hand off BREACH evidence without waiting on persistence."""
+    if not intelligence_context_enabled():
+        return {"ok": True, "accepted": False, "disabled": True}
+    from ap.intelligence_context_materializer import enqueue_breach_context
+
+    # ``signal_id`` belongs to the handoff logger, while the frozen signal
+    # already carries the identity consumed by enqueue_breach_context. Do not
+    # pass the same keyword into both layers.
+    handoff_signal_id = str(kwargs.pop("signal_id", (signal or {}).get("signal_id") or ""))
+    return submit_intelligence_enqueue(
+        enqueue_breach_context,
+        copy.deepcopy(signal or {}),
+        phase="BREACH",
+        signal_id=handoff_signal_id,
+        **kwargs,
+    )

@@ -7,11 +7,16 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 os.environ["INTELLIGENCE_CONTEXT_STORE_BACKEND"] = "memory"
 
 from ap.intelligence_context_materializer import (  # noqa: E402
+    BreachMaterializationRejected,
     build_intelligence_context_payload,
+    build_snapshot_kwargs,
     _canonical_signal_id,
+    enqueue_breach_context,
     enqueue_preopen_context,
     enqueue_pretrigger_context,
     recover_missing_intelligence_jobs,
@@ -20,6 +25,7 @@ from ap.intelligence_market_data import extract_underlying_price  # noqa: E402
 from ap.intelligence_context_worker import process_due_intelligence_jobs_once  # noqa: E402
 from ap.intelligence_context_handoff import submit_intelligence_enqueue  # noqa: E402
 from ap.intelligence_context_handoff import (  # noqa: E402
+    enqueue_breach_context_best_effort,
     enqueue_pretrigger_context_best_effort,
 )
 from ap.intelligence_snapshot_store import (  # noqa: E402
@@ -82,6 +88,316 @@ def test_pretrigger_enqueue_is_idempotent_and_observe_only():
     assert first["ok"] and first["inserted"]
     assert second["ok"] and second["duplicate"]
     assert first["job_id"] == second["job_id"]
+
+
+def _breach_signal():
+    return {
+        **_signal(),
+        "local_order_id": "loid-breach-1",
+        "trigger_crossed_at": "2026-07-14T13:30:00+00:00",
+        "trigger_confirmed_at": "2026-07-14T13:30:02+00:00",
+        "underlying_price": 502.0,
+        "breach_price": 502.0,
+        "first_breach_bid": 501.9,
+        "first_breach_ask": 502.0,
+        "trigger_crossed_at_provenance": {
+            "signal_id": "sig-123", "local_order_id": "loid-breach-1",
+        },
+        "candles_5m": [
+            {"time": "2026-07-14T13:20:00+00:00", "open": 501.0, "high": 502.0,
+             "low": 500.9, "close": 501.8, "volume": 1000},
+            {"time": "2026-07-14T13:30:00+00:00", "open": 502.0, "high": 503.0,
+             "low": 501.8, "close": 502.8, "volume": 1200},
+        ],
+        "candles_15m": [
+            {"time": "2026-07-14T13:00:00+00:00", "open": 500.0, "high": 501.5,
+             "low": 499.8, "close": 501.2, "volume": 3000},
+            {"time": "2026-07-14T13:30:00+00:00", "open": 502.0, "high": 503.0,
+             "low": 501.8, "close": 502.8, "volume": 3500},
+        ],
+    }
+
+
+def test_breach_enqueue_is_idempotent_frozen_and_observe_only():
+    signal = _breach_signal()
+    first = enqueue_breach_context(
+        signal, client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", local_order_id="loid-breach-1",
+        signal_id="sig-123",
+    )
+    second = enqueue_breach_context(
+        signal, client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", local_order_id="loid-breach-1",
+        signal_id="sig-123",
+    )
+    assert first["ok"] and first["inserted"]
+    assert second["ok"] and second["duplicate"]
+    job = next(iter(_MEMORY_JOBS.values()))
+    frozen = job["payload"]["signal"]
+    assert "_approved_plan" not in frozen
+    assert frozen["trigger_crossed_at"] == signal["trigger_crossed_at"]
+    assert job["phase"] == "BREACH"
+    result = _process(limit=1)
+    assert result["completed"] == 1
+    snapshot = get_latest_snapshot(
+        client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", phase="BREACH",
+    )["snapshot"]
+    assert snapshot["payload"]["observe_only"] is True
+    assert snapshot["payload"]["affected_eligibility"] is False
+    assert snapshot["payload"]["breach_evidence"]["breach_timing"]["opening_window"] == "FIRST_30_MINUTES"
+    assert snapshot["payload"]["breach_evidence"]["remaining_opportunity"]["remaining_R"] > 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error_code"),
+    [
+        ("client_id", "other@example.com", "BREACH_IDENTITY_CONFLICT_CLIENT_ID"),
+        ("execution_mode", "LIVE", "BREACH_IDENTITY_CONFLICT_EXECUTION_MODE"),
+        ("canonical_signal_id", "canon-other", "BREACH_IDENTITY_CONFLICT_CANONICAL_SIGNAL_ID"),
+        ("local_order_id", "loid-other", "BREACH_IDENTITY_CONFLICT_LOCAL_ORDER_ID"),
+    ],
+)
+def test_breach_identity_conflict_fails_closed_without_enqueue(field, value, error_code):
+    signal = _breach_signal()
+    signal[field] = value
+    result = enqueue_breach_context(
+        signal, client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", local_order_id="loid-breach-1",
+        signal_id="sig-123",
+    )
+    assert result == {"ok": False, "inserted": False, "error_code": error_code}
+    assert _MEMORY_JOBS == {}
+
+
+@pytest.mark.parametrize("mode", ["", "unknown", "live-paper", "  "])
+def test_breach_invalid_execution_mode_fails_closed(mode):
+    result = enqueue_breach_context(
+        _breach_signal(), client_id="client@example.com", execution_mode=mode,
+        canonical_signal_id="canon-123", local_order_id="loid-breach-1",
+        signal_id="sig-123",
+    )
+    assert result["ok"] is False
+    assert result["error_code"] == "BREACH_IDENTITY_INVALID_EXECUTION_MODE"
+    assert _MEMORY_JOBS == {}
+
+
+def test_breach_duplicate_authority_sources_fail_closed():
+    signal = _breach_signal()
+    signal["breach_identity_sources"] = {
+        "client_id": ["client@example.com", "other@example.com"],
+        "execution_mode": ["PAPER"],
+        "signal_id": ["sig-123"],
+        "canonical_signal_id": ["canon-123"],
+        "local_order_id": ["loid-breach-1"],
+    }
+    result = enqueue_breach_context(
+        signal, client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", local_order_id="loid-breach-1",
+        signal_id="sig-123",
+    )
+    assert result["ok"] is False
+    assert result["error_code"] == "BREACH_IDENTITY_CONFLICT_CLIENT_ID"
+    assert _MEMORY_JOBS == {}
+
+
+def test_breach_duplicate_timestamp_authorities_fail_closed():
+    signal = _breach_signal()
+    signal["metadata"] = {
+        "trigger_crossed_at": "2026-07-14T13:31:00+00:00",
+    }
+    result = enqueue_breach_context(
+        signal, client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", local_order_id="loid-breach-1",
+        signal_id="sig-123",
+    )
+    assert result["ok"] is False
+    assert result["error_code"] == "BREACH_EVIDENCE_CONFLICT_TRIGGER_CROSSED_AT"
+    assert _MEMORY_JOBS == {}
+
+
+def test_breach_timestamp_source_list_conflict_fails_closed():
+    signal = _breach_signal()
+    signal["breach_timestamp_sources"] = {
+        "trigger_crossed_at": [
+            signal["trigger_crossed_at"], "2026-07-14T13:31:00+00:00",
+        ],
+    }
+    result = enqueue_breach_context(
+        signal, client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", local_order_id="loid-breach-1",
+        signal_id="sig-123",
+    )
+    assert result["ok"] is False
+    assert result["error_code"] == "BREACH_EVIDENCE_CONFLICT_TRIGGER_CROSSED_AT"
+    assert _MEMORY_JOBS == {}
+
+
+def test_breach_malformed_timestamp_fails_closed_before_enqueue():
+    signal = _breach_signal()
+    signal["trigger_crossed_at"] = "not-a-timestamp"
+    result = enqueue_breach_context(
+        signal, client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", local_order_id="loid-breach-1",
+        signal_id="sig-123",
+    )
+    assert result["ok"] is False
+    assert result["error_code"] == "BREACH_EVIDENCE_INVALID_TRIGGER_CROSSED_AT"
+    assert _MEMORY_JOBS == {}
+
+
+def test_breach_generation_mismatch_fails_closed_without_enqueue():
+    signal = _breach_signal()
+    signal["materialization_generation"] = 4
+    signal["recovery_submit_generation"] = 5
+    result = enqueue_breach_context(
+        signal, client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", local_order_id="loid-breach-1",
+        signal_id="sig-123",
+    )
+    assert result["ok"] is False
+    assert result["error_code"] == "BREACH_LIFECYCLE_GENERATION_CONFLICT"
+    assert _MEMORY_JOBS == {}
+
+
+def test_breach_fenced_retry_without_generation_fails_closed_without_enqueue():
+    signal = _breach_signal()
+    signal["recovery_submit_fenced"] = True
+    result = enqueue_breach_context(
+        signal, client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", local_order_id="loid-breach-1",
+        signal_id="sig-123",
+    )
+    assert result["ok"] is False
+    assert result["error_code"] == "BREACH_LIFECYCLE_GENERATION_MISSING"
+    assert _MEMORY_JOBS == {}
+
+
+def test_breach_retry_counter_contradiction_fails_closed_without_enqueue():
+    signal = _breach_signal()
+    signal["retry_attempt"] = 2
+    signal["materialization_retry_attempt"] = 3
+    result = enqueue_breach_context(
+        signal, client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", local_order_id="loid-breach-1",
+        signal_id="sig-123",
+    )
+    assert result["ok"] is False
+    assert result["error_code"] == "BREACH_LIFECYCLE_ATTEMPT_CONFLICT"
+    assert _MEMORY_JOBS == {}
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error_code"),
+    [
+        ("materialization_generation", "not-an-int", "BREACH_LIFECYCLE_GENERATION_INVALID"),
+        ("retry_attempt", "not-an-int", "BREACH_LIFECYCLE_ATTEMPT_INVALID"),
+        ("retry_attempt", -1, "BREACH_LIFECYCLE_ATTEMPT_INVALID"),
+    ],
+)
+def test_breach_malformed_lifecycle_field_fails_closed(field, value, error_code):
+    signal = _breach_signal()
+    signal[field] = value
+    result = enqueue_breach_context(
+        signal, client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", local_order_id="loid-breach-1",
+        signal_id="sig-123",
+    )
+    assert result["ok"] is False
+    assert result["error_code"] == error_code
+    assert _MEMORY_JOBS == {}
+
+
+def test_breach_zero_or_negative_geometry_is_not_scored_as_valid_opportunity():
+    for field, value in (("trigger_price", 0), ("underlying_price", -1)):
+        signal = _breach_signal()
+        signal[field] = value
+        payload = build_intelligence_context_payload(
+            signal, phase="BREACH", client_id="client@example.com",
+            execution_mode="PAPER", canonical_signal_id="canon-123",
+            local_order_id="loid-breach-1",
+        )
+        assert payload["breach_evidence"]["remaining_opportunity"]["status"] in {
+            "INVALID_GEOMETRY", "INVALID_OPPORTUNITY", "MISSING_OR_INVALID",
+        }, (field, payload["breach_evidence"]["remaining_opportunity"])
+
+
+def test_breach_excludes_future_five_and_fifteen_minute_bars():
+    payload = build_intelligence_context_payload(
+        _breach_signal(), phase="BREACH", client_id="client@example.com",
+        execution_mode="PAPER", canonical_signal_id="canon-123",
+        local_order_id="loid-breach-1",
+    )
+    evidence = payload["breach_evidence"]
+    assert evidence["five_minute_confirmation"]["bar_count"] == 1
+    assert evidence["fifteen_minute_confirmation"]["bar_count"] == 1
+    assert payload["data_as_of"] == "2026-07-14T13:30:00+00:00"
+    assert payload["underlying_observation"]["price"] == 502.0
+    assert payload["component_statuses"]["five_minute"] == "AVAILABLE"
+
+
+def test_breach_malformed_timestamp_fails_closed_without_using_future_bars():
+    signal = _breach_signal()
+    signal["trigger_crossed_at"] = "not-a-timestamp"
+
+    class BrokerShouldNotBeTouched:
+        def __getattr__(self, name):
+            raise AssertionError(f"broker touched: {name}")
+
+    payload = build_intelligence_context_payload(
+        signal, phase="BREACH", client_id="client@example.com",
+        execution_mode="PAPER", canonical_signal_id="canon-123",
+        local_order_id="loid-breach-1", broker=BrokerShouldNotBeTouched(),
+    )
+    evidence = payload["breach_evidence"]
+    assert evidence["breach_timing"]["timestamp_status"] == "MISSING_OR_INVALID"
+    assert evidence["five_minute_confirmation"]["status"] == "MISSING"
+    assert evidence["fifteen_minute_confirmation"]["status"] == "MISSING"
+    assert payload["data_as_of"] != signal["trigger_crossed_at"]
+
+
+def test_breach_without_five_minute_source_is_explicitly_missing():
+    signal = _breach_signal()
+    signal.pop("candles_5m")
+    payload = build_intelligence_context_payload(
+        signal, phase="BREACH", client_id="client@example.com",
+        execution_mode="PAPER", canonical_signal_id="canon-123",
+        local_order_id="loid-breach-1",
+    )
+    five = payload["breach_evidence"]["five_minute_confirmation"]
+    assert five["status"] == "MISSING"
+    assert five["source"] is None
+    assert payload["component_statuses"]["five_minute"] == "MISSING"
+
+
+def test_breach_handoff_disabled_returns_without_executor_or_database(monkeypatch):
+    monkeypatch.delenv("INTELLIGENCE_CONTEXT_WORKER_ENABLED", raising=False)
+    result = enqueue_breach_context_best_effort(
+        _breach_signal(), client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", local_order_id="loid-breach-1",
+    )
+    assert result == {"ok": True, "accepted": False, "disabled": True}
+
+
+def test_breach_handoff_forwards_signal_id_once_to_async_enqueue(monkeypatch):
+    monkeypatch.setenv("INTELLIGENCE_CONTEXT_WORKER_ENABLED", "1")
+    captured = {}
+
+    def capture(enqueue, *args, phase, signal_id, **kwargs):
+        captured["kwargs"] = dict(kwargs)
+        return enqueue(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "ap.intelligence_context_handoff.submit_intelligence_enqueue", capture
+    )
+    result = enqueue_breach_context_best_effort(
+        _breach_signal(), client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", local_order_id="loid-breach-1",
+        signal_id="sig-123",
+    )
+    assert result["ok"] and result["inserted"]
+    assert "signal_id" not in captured["kwargs"]
+    assert next(iter(_MEMORY_JOBS.values()))["signal_id"] == "sig-123"
 
 
 def test_phase_mode_client_identity_keys_are_distinct():
@@ -613,7 +929,9 @@ def test_recovery_scan_backfills_missing_phase_jobs_from_durable_truth(monkeypat
         def fetchall(self):
             if self.query == 1:
                 return [{"signal_id": signal_id, "payload": payload}]
-            return [{"signal_id": signal_id, "local_order_id": "loid-1", "payload": payload}]
+            if self.query == 2:
+                return [{"signal_id": signal_id, "local_order_id": "loid-1", "payload": payload}]
+            return []
 
     cursor = Cursor()
     monkeypatch.setitem(
@@ -623,12 +941,145 @@ def test_recovery_scan_backfills_missing_phase_jobs_from_durable_truth(monkeypat
     result = recover_missing_intelligence_jobs(
         client_id="client@example.com", execution_mode="PAPER"
     )
-    assert result == {"ok": True, "pretrigger": 1, "preopen": 1}
+    assert result == {
+        "ok": True, "pretrigger": 1, "preopen": 1,
+        "breach": 0, "breach_errors": 0,
+    }
     jobs = list(_MEMORY_JOBS.values())
     assert {job["phase"] for job in jobs} == {"PRETRIGGER", "PREOPEN"}
     assert {job["canonical_signal_id"] for job in jobs} == {
         "REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72"
     }
+
+
+def test_recovery_scan_rebuilds_breach_from_order_meta_without_execution_side_effect(monkeypatch):
+    signal = _breach_signal()
+
+    class Cursor:
+        query = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _sql, _params):
+            self.query += 1
+
+        def fetchall(self):
+            if self.query < 3:
+                return []
+            return [{
+                "signal_id": "sig-123",
+                "local_order_id": "loid-breach-1",
+                "client_id": "client@example.com",
+                "execution_mode": "PAPER",
+                "meta": {
+                    "trigger_crossed_at": signal["trigger_crossed_at"],
+                    "trigger_confirmed_at": signal["trigger_confirmed_at"],
+                },
+                "payload": signal,
+            }]
+
+    cursor = Cursor()
+    monkeypatch.setitem(
+        sys.modules, "ap.db",
+        types.SimpleNamespace(conn=lambda: cursor, run_with_retry=lambda fn: fn()),
+    )
+    result = recover_missing_intelligence_jobs(
+        client_id="client@example.com", execution_mode="PAPER"
+    )
+    assert result["ok"] is True
+    assert result["breach"] == 1
+    assert result["breach_errors"] == 0
+    assert {job["phase"] for job in _MEMORY_JOBS.values()} == {"BREACH"}
+
+
+def test_recovery_conflicting_timestamp_authorities_fail_closed(monkeypatch):
+    signal = _breach_signal()
+
+    class Cursor:
+        query = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _sql, _params):
+            self.query += 1
+
+        def fetchall(self):
+            if self.query < 3:
+                return []
+            return [{
+                "signal_id": "sig-123",
+                "local_order_id": "loid-breach-1",
+                "client_id": "client@example.com",
+                "execution_mode": "PAPER",
+                "meta": {"trigger_crossed_at": "2026-07-14T13:31:00+00:00"},
+                "payload": signal,
+            }]
+
+    cursor = Cursor()
+    monkeypatch.setitem(
+        sys.modules, "ap.db",
+        types.SimpleNamespace(conn=lambda: cursor, run_with_retry=lambda fn: fn()),
+    )
+    result = recover_missing_intelligence_jobs(
+        client_id="client@example.com", execution_mode="PAPER"
+    )
+    assert result["breach"] == 0
+    assert result["breach_errors"] == 1
+    assert _MEMORY_JOBS == {}
+
+
+def test_breach_store_failure_is_reported_without_synthesizing_execution_state(monkeypatch):
+    monkeypatch.setattr(
+        "ap.intelligence_context_materializer.enqueue_intelligence_job",
+        lambda **_kwargs: {
+            "ok": False, "inserted": False,
+            "error_code": "INTELLIGENCE_STORE_UNAVAILABLE",
+        },
+    )
+    result = enqueue_breach_context(
+        _breach_signal(), client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", local_order_id="loid-breach-1",
+        signal_id="sig-123",
+    )
+    assert result["ok"] is False
+    assert result["error_code"] == "INTELLIGENCE_STORE_UNAVAILABLE"
+    assert _MEMORY_JOBS == {}
+
+
+def test_breach_materializer_rejects_job_column_payload_identity_disagreement():
+    inserted = enqueue_breach_context(
+        _breach_signal(), client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", local_order_id="loid-breach-1",
+        signal_id="sig-123",
+    )
+    assert inserted["inserted"] is True
+    job = dict(next(iter(_MEMORY_JOBS.values())))
+    job["local_order_id"] = "loid-other"
+    with pytest.raises(BreachMaterializationRejected) as rejected:
+        build_snapshot_kwargs(job)
+    assert rejected.value.error_code == "BREACH_IDENTITY_CONFLICT_LOCAL_ORDER_ID"
+
+
+def test_breach_materializer_rejection_terminalizes_without_retry():
+    enqueue_breach_context(
+        _breach_signal(), client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", local_order_id="loid-breach-1",
+        signal_id="sig-123",
+    )
+    job = next(iter(_MEMORY_JOBS.values()))
+    job["local_order_id"] = "loid-other"
+    result = _process(limit=1)
+    assert result["terminal"] == 1
+    assert result["retried"] == 0
+    assert job["last_error_code"] == "BREACH_IDENTITY_CONFLICT_LOCAL_ORDER_ID"
 
 
 def test_preopen_refreshes_time_sensitive_quote_instead_of_relabeling_pretrigger(monkeypatch):

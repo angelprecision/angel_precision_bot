@@ -61,6 +61,20 @@ env:
     tests/test_p0_disable_standing_protective_stop.py
     tests/test_p0_seam4_e2e_deferred_lifecycle.py
     tests/test_p0_intelligence_postgres.py
+    tests/test_p0_intelligence_context_snapshots.py
+    tests/test_p0_intelligence_evidence_wiring.py
+    tests/test_p0_435_canonical_identity.py
+    tests/test_p0_435_fvg_as_of_cache.py
+    tests/test_p0_435_market_structure_freeze.py
+    tests/test_p0_435_behavioral_matrix.py
+    tests/test_p0_435_aapl_opening_replay_shape.py
+    tests/test_p0_435_money_path_non_authority.py
+    tests/test_p0_435_september_live_cohort.py
+    tests/test_p0_435_runtime_restart_materializer_parity.py
+    tests/test_p0_435_exactly_one_submit_and_zero_broker.py
+    tests/test_p0_435_deferred_gaps_closed.py
+    tests/test_p0_435_fvg_touch_lineage.py
+    tests/test_p0_435_enrichment_failure_shapes.py
     tests/test_p0_pending_trigger_restart_recovery.py
     tests/test_p0_live_recovered_watcher_lifecycle_msft.py
     tests/test_p0_pr597_terminal_watcher_recut.py

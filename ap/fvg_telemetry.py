@@ -67,7 +67,7 @@ LOOKBACK_DAYS = int(os.getenv("FVG_LOOKBACK_DAYS", "15"))
 _CACHE_MAX_TICKERS = 256
 
 _cache_lock = threading.Lock()
-_candle_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_candle_cache: dict[str, tuple[float, list[dict[str, Any]], Optional[str]]] = {}
 
 # ── singleflight (#283 review amendment, round 2) ────────────────────────────
 # The TTL cache alone protects read/write, not IN-FLIGHT fetches: a 50–100
@@ -119,9 +119,59 @@ def _resolve_base_url(broker: Any) -> str:
         return base
 
 
+
+
+def _completed_15m_bucket_key(now: Optional[datetime]) -> str:
+    """Cache bucket key for point-in-time 15m coverage.
+
+    ``now is None`` (PRETRIGGER/PREOPEN live path) → ``"live"`` so TTL
+    behavior stays ticker-scoped and as-of-agnostic.
+
+    Otherwise return the UTC ISO key of the floored completed 15m boundary
+    for ``now`` (minute % 15 == 0, seconds cleared). Distinct completed
+    buckets therefore cannot share a cache entry.
+    """
+    if now is None:
+        return "live"
+    now_utc = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    floored = now_utc.replace(second=0, microsecond=0)
+    floored = floored - timedelta(minutes=floored.minute % 15)
+    return floored.isoformat()
+
+
+def cache_covers_as_of(bars: list[dict[str, Any]], now: Optional[datetime]) -> bool:
+    """True if ``bars`` already cover every completed 15m bar required by ``now``.
+
+    Live path (``now is None``) always covers. Empty bars skip the coverage
+    check (caller still respects TTL / miss semantics). For non-empty bars,
+    coverage_through = last bar open time + 15m; ``now`` needs the completed
+    boundary at its UTC-floored 15m key — miss when that boundary is beyond
+    coverage_through.
+    """
+    if now is None:
+        return True
+    if not bars:
+        return True
+    last_dt = _bar_dt(bars[-1])
+    if last_dt is None:
+        return False
+    if last_dt.tzinfo is None:
+        last_dt = last_dt.replace(tzinfo=timezone.utc)
+    coverage_through = last_dt.astimezone(timezone.utc) + timedelta(minutes=15)
+    now_utc = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    needed = now_utc.replace(second=0, microsecond=0)
+    needed = needed - timedelta(minutes=needed.minute % 15)
+    return coverage_through >= needed
+
+
 def fetch_15m_bars(ticker: str, broker: Any, *, now: Optional[datetime] = None) -> list[dict[str, Any]]:
-    """15-min RTH bars for the trailing LOOKBACK_DAYS. Cached per ticker,
-    singleflighted per ticker (one in-flight network call max).
+    """15-min RTH bars for the trailing LOOKBACK_DAYS.
+
+    Cached per ``ticker|bucket_key`` where bucket_key is ``live`` when
+    ``now is None`` (PRETRIGGER/PREOPEN TTL path) or the UTC-floored completed
+    15m boundary for BREACH as_of. Non-live hits also require
+    ``cache_covers_as_of`` so a stale earlier bucket cannot satisfy a later
+    as_of. Singleflighted per cache key (one in-flight network call max).
 
     Returns [] on any failure so callers degrade to 'no candles' — identical
     to the pre-PR state for that signal.
@@ -130,19 +180,29 @@ def fetch_15m_bars(ticker: str, broker: Any, *, now: Optional[datetime] = None) 
     if not key or broker is None:
         return []
 
+    bucket_key = _completed_15m_bucket_key(now)
+    cache_key = f"{key}|{bucket_key}"
+
+    def _hit_ok(hit: tuple[float, list[dict[str, Any]], Optional[str]], mono: float) -> bool:
+        if (mono - hit[0]) >= CANDLE_TTL_SEC:
+            return False
+        if bucket_key == "live":
+            return True
+        return cache_covers_as_of(hit[1], now)
+
     while True:
         now_mono = time.monotonic()
         with _cache_lock:
-            hit = _candle_cache.get(key)
-            if hit and (now_mono - hit[0]) < CANDLE_TTL_SEC:
+            hit = _candle_cache.get(cache_key)
+            if hit and _hit_ok(hit, now_mono):
                 return hit[1]
 
-        # Leader election for this ticker.
+        # Leader election for this ticker|bucket (preserves live vs as_of isolation).
         with _inflight_lock:
-            evt = _inflight.get(key)
+            evt = _inflight.get(cache_key)
             if evt is None:
                 evt = threading.Event()
-                _inflight[key] = evt
+                _inflight[cache_key] = evt
                 is_leader = True
             else:
                 is_leader = False
@@ -152,22 +212,22 @@ def fetch_15m_bars(ticker: str, broker: Any, *, now: Optional[datetime] = None) 
             # re-read the cache exactly once. Empty cache after wait → degrade.
             evt.wait(FETCH_WAIT_SEC)
             with _cache_lock:
-                hit = _candle_cache.get(key)
-                if hit and (time.monotonic() - hit[0]) < CANDLE_TTL_SEC:
+                hit = _candle_cache.get(cache_key)
+                if hit and _hit_ok(hit, time.monotonic()):
                     return hit[1]
             return []
 
         try:
-            return _fetch_15m_bars_network(key, broker, now=now)
+            return _fetch_15m_bars_network(key, broker, now=now, cache_key=cache_key)
         finally:
             # Release followers and clear in-flight marker even on failure —
             # a stuck marker would silently disable fetches for the ticker.
             with _inflight_lock:
-                _inflight.pop(key, None)
+                _inflight.pop(cache_key, None)
             evt.set()
 
 
-def _fetch_15m_bars_network(key: str, broker: Any, *, now: Optional[datetime] = None) -> list[dict[str, Any]]:
+def _fetch_15m_bars_network(key: str, broker: Any, *, now: Optional[datetime] = None, cache_key: Optional[str] = None) -> list[dict[str, Any]]:
     """The actual network fetch. Leader-only; caller owns singleflight."""
     # #283 REVIEW AMENDMENT: prefer the attached data_broker for market-data
     # reads, matching the quote-truth pattern (#248/#227 and #277's resolver).
@@ -219,11 +279,19 @@ def _fetch_15m_bars_network(key: str, broker: Any, *, now: Optional[datetime] = 
                 })
             except (KeyError, TypeError, ValueError):
                 continue
+        coverage_iso: Optional[str] = None
+        if bars:
+            last_dt = _bar_dt(bars[-1])
+            if last_dt is not None:
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+                coverage_iso = (last_dt.astimezone(timezone.utc) + timedelta(minutes=15)).isoformat()
+        store_key = cache_key or f"{key}|{_completed_15m_bucket_key(now)}"
         with _cache_lock:
             if len(_candle_cache) >= _CACHE_MAX_TICKERS:
                 oldest = min(_candle_cache, key=lambda k: _candle_cache[k][0])
                 _candle_cache.pop(oldest, None)
-            _candle_cache[key] = (time.monotonic(), bars)
+            _candle_cache[store_key] = (time.monotonic(), bars, coverage_iso)
         return bars
     except Exception as exc:
         log.warning("fvg_telemetry: timesales fetch failed for %s: %s", key, exc)
