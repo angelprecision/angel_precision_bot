@@ -1,7 +1,16 @@
 import os
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@127.0.0.1:5432/test")
 from datetime import datetime
+from types import SimpleNamespace
 import pytest
+from ap.brokers.tradier import TradierBroker
+import ap.fill_monitor as fill_monitor_mod
+from ap.fill_monitor import check_order_with_broker
+from ap.manual_close_reconciliation import (
+    BROKER_ORDER_UPDATED_AT_KEY,
+    BROKER_ORDER_UPDATED_AT_SOURCE,
+    FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY,
+)
 import ap.order_state_machine as osm_mod
 from ap.order_state_machine import APOrderStateMachine, OrderStatus
 from ap_reconciler import APBrokerReconciler, _extract_broker_fill_timestamp
@@ -89,20 +98,72 @@ def test_raw_tradier_transaction_date_is_not_execution_timestamp():
     assert _extract_broker_fill_timestamp(raw_tradier_order()) is None
 
 
-def test_raw_tradier_filled_transaction_date_holds_before_osm():
+def test_raw_tradier_documented_order_shape_flows_to_osm_as_nonexact_fill():
     o = FakeOSM(); r = rec(o); s = summary()
     r._advance_order_to_broker_fill(
         order(qty=5), raw_tradier_order(remaining_quantity=3), "filled", s
     )
 
-    assert o.calls == []
-    assert s["orders_corrected"] == 0
-    assert s["orders_alerted"] == 1
-    assert "EXIT_FILL_TIMESTAMP_MISSING_OR_INVALID" in r.alerts[-1]
+    assert len(o.calls) == 1
+    _, status, evidence = o.calls[0]
+    assert status == "EXIT_FILLED"
+    assert evidence["filled_qty"] == 2
+    assert evidence["fill_price"] == 1.19
+    assert evidence["filled_ts"] is None
+    assert evidence["fill_timestamp_quality"] == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY
+    assert evidence["fill_timestamp_source"] == BROKER_ORDER_UPDATED_AT_SOURCE
+    assert evidence["fill_timestamp_key"] == BROKER_ORDER_UPDATED_AT_KEY
+    assert evidence["broker_order_updated_at"]
+    assert s["orders_corrected"] == 1
+    assert s["orders_alerted"] == 0
+
+
+def test_tradier_get_order_preserves_documented_raw_fill_fields():
+    raw = raw_tradier_order()
+    broker = TradierBroker.__new__(TradierBroker)
+    broker.cfg = SimpleNamespace(account_id="ACCOUNT-605")
+    broker._get = lambda path: {"order": raw}
+
+    fetched = broker.get_order("145345180")
+    assert fetched == raw
+    assert "last_fill_date" not in fetched
+    assert fetched["exec_quantity"] == 2
+    assert fetched["avg_fill_price"] == 1.19
+    assert fetched["transaction_date"] == "2026-09-10T14:35:58.000Z"
+
+    result = check_order_with_broker(broker, order(qty=5))
+    assert result["status"] == "EXIT_FILLED"
+    assert result["filled_qty"] == 2
+    assert result["avg_fill"] == 1.19
+    assert result["filled_ts"] is None
+    assert result["fill_timestamp_quality"] == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY
+    assert result["fill_timestamp_source"] == BROKER_ORDER_UPDATED_AT_SOURCE
+    assert result["fill_timestamp_key"] == BROKER_ORDER_UPDATED_AT_KEY
+    assert result["broker_order_updated_at"]
+
+
+def test_fill_monitor_never_uses_tradier_limit_price_as_execution_price(monkeypatch):
+    monkeypatch.setattr(fill_monitor_mod, "audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        fill_monitor_mod,
+        "emit_fill_event",
+        lambda *args, **kwargs: None,
+    )
+    raw = raw_tradier_order(price=9.99)
+    raw.pop("avg_fill_price")
+    result = check_order_with_broker(
+        SimpleNamespace(get_order=lambda _broker_id: raw),
+        order(qty=5),
+    )
+
+    assert result["status"] == "ERROR"
+    assert result["reason"] == "BROKER_FILLED_INVALID_PRICE"
+    assert result["filled_qty"] == 2
+    assert result["avg_fill"] == 0.0
 
 
 @pytest.mark.parametrize("broker_status", ["partially_filled", "canceled", "rejected", "expired"])
-def test_raw_tradier_partial_or_terminal_transaction_date_holds_before_mutation(
+def test_raw_tradier_partial_or_terminal_transaction_date_converges_before_mutation(
     broker_status,
 ):
     o = FakeOSM(); r = rec(o); s = summary()
@@ -115,10 +176,25 @@ def test_raw_tradier_partial_or_terminal_transaction_date_holds_before_mutation(
             order(qty=5, position_id=None), broker_status, s, broker_raw=raw
         )
 
-    assert o.calls == []
-    assert s["orders_corrected"] == 0
-    assert s["orders_alerted"] == 1
-    assert "EXIT_FILL_TIMESTAMP_MISSING_OR_INVALID" in r.alerts[-1]
+    assert o.calls
+    assert o.calls[0][2]["filled_ts"] is None
+    assert o.calls[0][2]["fill_timestamp_quality"] == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY
+    assert o.calls[0][2]["fill_timestamp_source"] == BROKER_ORDER_UPDATED_AT_SOURCE
+    assert o.calls[0][2]["fill_timestamp_key"] == BROKER_ORDER_UPDATED_AT_KEY
+    assert o.calls[0][2]["broker_order_updated_at"]
+    if broker_status == "partially_filled":
+        assert [status for _, status, _ in o.calls] == ["EXIT_PARTIAL_FILL"]
+    else:
+        assert [status for _, status, _ in o.calls] == [
+            "EXIT_PARTIAL_FILL",
+            {
+                "canceled": "CANCELED",
+                "rejected": "REJECTED",
+                "expired": "EXPIRED",
+            }[broker_status],
+        ]
+    assert s["orders_corrected"] == 1
+    assert s["orders_alerted"] == 0
 
 def test_normal_exit_fill_propagates_timestamp_and_identity():
     o = FakeOSM(); r = rec(o); s = summary()

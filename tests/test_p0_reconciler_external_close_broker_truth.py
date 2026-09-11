@@ -223,8 +223,8 @@ def test_canonical_manual_close_uses_broker_fill_not_current_quote(monkeypatch):
     assert mutations == []
 
 
-def test_tradier_filled_transaction_date_only_is_not_fill_evidence():
-    """Raw Tradier transaction_date is order chronology, not fill evidence."""
+def test_tradier_filled_transaction_date_is_nonexact_fill_evidence():
+    """Raw Tradier transaction_date proves economics, not exact execution time."""
     position = _position(
         contract="PEP260821C00141000",
         underlying="PEP",
@@ -251,8 +251,19 @@ def test_tradier_filled_transaction_date_only_is_not_fill_evidence():
         detected_at=datetime(2026, 8, 14, 17, 46, tzinfo=timezone.utc),
     )
 
-    assert evidence is None
-    assert reason == "no_exact_external_filled_exit_order"
+    assert reason == "exact_external_broker_fill"
+    assert evidence is not None
+    assert evidence["filled_qty"] == 1
+    assert evidence["fill_price"] == pytest.approx(1.52)
+    assert evidence["filled_ts"] is None
+    assert evidence["fill_timestamp_quality"] == (
+        manual_mod.FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY
+    )
+    assert evidence["fill_timestamp_source"] == (
+        manual_mod.BROKER_ORDER_UPDATED_AT_SOURCE
+    )
+    assert evidence["fill_timestamp_key"] == manual_mod.BROKER_ORDER_UPDATED_AT_KEY
+    assert evidence["broker_order_updated_at"].tzinfo is not None
 
 
 def test_historical_exit_for_other_position_cannot_mutate_current_position(monkeypatch):
@@ -496,14 +507,14 @@ def test_unsafe_or_naive_timestamp_cannot_prove_external_fill(order):
         (_tradier_order(status="working"), "no_exact_external_filled_exit_order"),
         (_tradier_order(contract=WRONG_CONTRACT), "no_exact_external_filled_exit_order"),
         (_tradier_order(side="buy_to_open"), "no_exact_external_filled_exit_order"),
-        (_tradier_order(qty=2.0), "no_exact_external_filled_exit_order"),
+        (_tradier_order(qty=2.0), "external_fill_qty_ambiguous:2/3"),
         (
             _tradier_order(transaction_date="2025-01-02T13:59:00.000Z"),
             "no_exact_external_filled_exit_order",
         ),
     ],
 )
-def test_transaction_date_still_requires_exact_terminal_fill(order, expected_reason):
+def test_transaction_date_still_requires_terminal_and_quantity_alignment(order, expected_reason):
     evidence, reason = _select(_position(), [order])
 
     assert evidence is None

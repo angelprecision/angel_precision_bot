@@ -30,7 +30,12 @@ SRC = (_REPO / "ap_recovery.py").read_text()
 def _guard_block(marker: str) -> str:
     """From the guard's if-condition through its terminating `continue`."""
     m_idx = SRC.rindex(marker)  # the f-string in the guard (last occurrence)
-    start = SRC.rindex("if not filled_qty or filled_qty <= 0", 0, m_idx)
+    # The EXIT guard is intentionally multiline; do not accidentally select
+    # the earlier ENTRY guard while extracting the source-level fence.
+    if marker.startswith("RECOVERY_EXIT"):
+        start = SRC.rfind("if (", 0, m_idx)
+    else:
+        start = SRC.rindex("if not filled_qty or filled_qty <= 0", 0, m_idx)
     end = SRC.index("continue", m_idx) + len("continue")
     return SRC[start:end]
 

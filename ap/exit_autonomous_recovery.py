@@ -40,7 +40,14 @@ from ap.manual_close_reconciliation import (
     ORDERS_UNAVAILABLE,
     fetch_all_current_session_orders,
     order_contract as _shared_order_contract,
-    order_filled_at,
+    broker_fill_timestamp_evidence,
+    BROKER_FILL_TIMESTAMP_KEYS,
+    BROKER_FILL_TIMESTAMP_SOURCE,
+    BROKER_ORDER_UPDATED_AT_KEY,
+    BROKER_ORDER_UPDATED_AT_SOURCE,
+    FILL_TIMESTAMP_QUALITY_EXACT,
+    FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY,
+    FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
     order_has_instrument_identity as _shared_order_has_instrument_identity,
     order_has_structured_direction as _shared_order_has_structured_direction,
     order_is_exit_like as _shared_order_is_exit_like,
@@ -296,20 +303,69 @@ def _extract_fill_price(raw: dict) -> Optional[float]:
     return None
 
 
+def _recovery_fill_timestamp_evidence(raw: dict) -> dict:
+    """Classify broker fill chronology without promoting transaction_date."""
+    evidence = broker_fill_timestamp_evidence(raw)
+    return {
+        **evidence,
+        "filled_ts": (
+            evidence.get("filled_ts").astimezone(timezone.utc).isoformat()
+            if isinstance(evidence.get("filled_ts"), datetime)
+            else evidence.get("filled_ts")
+        ),
+        "broker_order_updated_at": (
+            evidence.get("broker_order_updated_at").astimezone(timezone.utc).isoformat()
+            if isinstance(evidence.get("broker_order_updated_at"), datetime)
+            else evidence.get("broker_order_updated_at")
+        ),
+    }
+
+
 def _recovery_fill_timestamp(raw: dict) -> Optional[str]:
     """Return only an explicit, timezone-aware broker execution timestamp."""
-    try:
-        filled_at = order_filled_at(raw)
-    except Exception:
-        return None
-    if not isinstance(filled_at, datetime):
-        return None
-    try:
-        if filled_at.tzinfo is None or filled_at.utcoffset() is None:
-            return None
-        return filled_at.astimezone(timezone.utc).isoformat()
-    except Exception:
-        return None
+    evidence = _recovery_fill_timestamp_evidence(raw)
+    return (
+        evidence.get("filled_ts")
+        if evidence.get("fill_timestamp_quality") == FILL_TIMESTAMP_QUALITY_EXACT
+        else None
+    )
+
+
+def _usable_recovery_fill_evidence(evidence: dict) -> bool:
+    quality = str(evidence.get("fill_timestamp_quality") or "").strip()
+    source = str(evidence.get("fill_timestamp_source") or "").strip()
+    key = str(evidence.get("fill_timestamp_key") or "").strip()
+
+    def _aware(value) -> bool:
+        if value in (None, ""):
+            return False
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed.tzinfo is not None and parsed.utcoffset() is not None
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    if quality == FILL_TIMESTAMP_QUALITY_EXACT:
+        return (
+            _aware(evidence.get("filled_ts"))
+            and source == BROKER_FILL_TIMESTAMP_SOURCE
+            and key in BROKER_FILL_TIMESTAMP_KEYS
+        )
+    if quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY:
+        return (
+            evidence.get("filled_ts") in (None, "")
+            and _aware(evidence.get("broker_order_updated_at"))
+            and source == BROKER_ORDER_UPDATED_AT_SOURCE
+            and key == BROKER_ORDER_UPDATED_AT_KEY
+        )
+    return False
+
+
+def _recovery_order_state_reason(state: str) -> str:
+    """Keep incomplete fill chronology distinct from malformed containers."""
+    if state == "fill_timestamp_unproven":
+        return "broker_order_fill_timestamp_unproven"
+    return f"broker_order_truth_{state}"
 
 
 def _get_order_truth(broker: Any, broker_order_id: str) -> tuple[str, Optional[dict]]:
@@ -366,6 +422,20 @@ def _get_order_truth(broker: Any, broker_order_id: str) -> tuple[str, Optional[d
             return "malformed", None
         row["_recovery_fill_qty"] = filled_qty
         row["_recovery_fill_price"] = fill_price
+        timestamp_evidence = _recovery_fill_timestamp_evidence(row)
+        row["_recovery_fill_timestamp_quality"] = timestamp_evidence.get(
+            "fill_timestamp_quality", FILL_TIMESTAMP_QUALITY_UNAVAILABLE
+        )
+        row["_recovery_fill_timestamp_source"] = timestamp_evidence.get(
+            "fill_timestamp_source", ""
+        )
+        row["_recovery_fill_timestamp_key"] = timestamp_evidence.get(
+            "fill_timestamp_key", ""
+        )
+        row["_recovery_broker_order_updated_at"] = timestamp_evidence.get(
+            "broker_order_updated_at"
+        )
+        row["_recovery_filled_ts"] = timestamp_evidence.get("filled_ts")
     return "available", row
 
 
@@ -427,8 +497,28 @@ def _matching_open_exit_orders_with_truth(
                 or filled_qty != _qty(row)
             ):
                 return "malformed", []
+            fill_timestamp_evidence = _recovery_fill_timestamp_evidence(row)
+            if not _usable_recovery_fill_evidence(fill_timestamp_evidence):
+                # A filled account-wide match without a usable chronology
+                # marker is not negative proof.  Stop the recovery decision
+                # rather than allowing replacement authorization to proceed
+                # on an incomplete row.
+                return "fill_timestamp_unproven", []
             row["_recovery_fill_qty"] = filled_qty
             row["_recovery_fill_price"] = fill_price
+            row["_recovery_fill_timestamp_quality"] = fill_timestamp_evidence.get(
+                "fill_timestamp_quality"
+            )
+            row["_recovery_fill_timestamp_source"] = fill_timestamp_evidence.get(
+                "fill_timestamp_source"
+            )
+            row["_recovery_fill_timestamp_key"] = fill_timestamp_evidence.get(
+                "fill_timestamp_key"
+            )
+            row["_recovery_broker_order_updated_at"] = fill_timestamp_evidence.get(
+                "broker_order_updated_at"
+            )
+            row["_recovery_filled_ts"] = fill_timestamp_evidence.get("filled_ts")
         matches.append((broker_id, row))
     return state, matches
 
@@ -838,6 +928,7 @@ def _adopt_tagged_exit_order(
     broker_order_id: str,
     contract: str,
     source: str,
+    fill_timestamp_evidence: Optional[dict] = None,
 ) -> tuple[bool, Optional[dict], dict, str]:
     """Adopt a tagged broker order through OSM, then prove the reread."""
     adopt = getattr(osm, "adopt_broker_owned_exit_request", None)
@@ -847,14 +938,35 @@ def _adopt_tagged_exit_order(
     if expected_qty is None or expected_qty <= 0:
         return False, None, {}, "broker_order_quantity_unproven"
     try:
+        adoption_kwargs = {
+            "local_order_id": local_order_id,
+            "broker_order_id": broker_order_id,
+            "execution_mode": _norm(getattr(pos, "execution_mode", "")).lower(),
+            "client_id": _norm(getattr(pos, "client_id", "")),
+            "position_id": _position_id(pos),
+            "expected_qty": expected_qty,
+            "source": source,
+        }
+        if fill_timestamp_evidence:
+            adoption_kwargs.update(
+                {
+                    "fill_timestamp_quality": fill_timestamp_evidence.get(
+                        "fill_timestamp_quality"
+                    ),
+                    "fill_timestamp_source": fill_timestamp_evidence.get(
+                        "fill_timestamp_source"
+                    ),
+                    "fill_timestamp_key": fill_timestamp_evidence.get(
+                        "fill_timestamp_key"
+                    ),
+                    "filled_ts": fill_timestamp_evidence.get("filled_ts"),
+                    "broker_order_updated_at": fill_timestamp_evidence.get(
+                        "broker_order_updated_at"
+                    ),
+                }
+            )
         result = adopt(
-            local_order_id,
-            broker_order_id=broker_order_id,
-            execution_mode=_norm(getattr(pos, "execution_mode", "")).lower(),
-            client_id=_norm(getattr(pos, "client_id", "")),
-            position_id=_position_id(pos),
-            expected_qty=expected_qty,
-            source=source,
+            **adoption_kwargs,
         )
     except Exception as exc:
         log.warning(
@@ -1050,7 +1162,7 @@ def recover_exit_position(
         order_state, raw = _get_order_truth(broker, pending_broker_id)
         if order_state != "available" or raw is None:
             return _hold(
-                f"broker_order_truth_{order_state}",
+                _recovery_order_state_reason(order_state),
                 pid,
                 local_id,
                 pending_broker_id,
@@ -1098,7 +1210,8 @@ def recover_exit_position(
         if status == "filled":
             filled_qty = raw.get("_recovery_fill_qty")
             fill_price = raw.get("_recovery_fill_price")
-            filled_ts = _recovery_fill_timestamp(raw)
+            fill_timestamp_evidence = _recovery_fill_timestamp_evidence(raw)
+            filled_ts = fill_timestamp_evidence.get("filled_ts")
             remaining = _position_remaining(pos)
             previous_filled = _previous_exit_cumulative_fill(
                 pos,
@@ -1109,12 +1222,24 @@ def recover_exit_position(
                 "status": status,
                 "filled_qty": filled_qty,
                 "filled_ts": filled_ts,
+                "fill_timestamp_quality": fill_timestamp_evidence.get(
+                    "fill_timestamp_quality"
+                ),
+                "fill_timestamp_source": fill_timestamp_evidence.get(
+                    "fill_timestamp_source"
+                ),
+                "fill_timestamp_key": fill_timestamp_evidence.get(
+                    "fill_timestamp_key"
+                ),
+                "broker_order_updated_at": fill_timestamp_evidence.get(
+                    "broker_order_updated_at"
+                ),
                 "previous_cumulative_filled": previous_filled,
                 "local_remaining": remaining,
                 "contract": contract,
                 "quote_health": qh,
             }
-            if filled_ts is None:
+            if not _usable_recovery_fill_evidence(fill_timestamp_evidence):
                 return _hold(
                     "broker_order_fill_timestamp_unproven",
                     pid,
@@ -1175,6 +1300,18 @@ def recover_exit_position(
                         filled_qty=filled_qty,
                         fill_price=fill_price,
                         filled_ts=filled_ts,
+                        fill_timestamp_quality=fill_timestamp_evidence.get(
+                            "fill_timestamp_quality"
+                        ),
+                        fill_timestamp_source=fill_timestamp_evidence.get(
+                            "fill_timestamp_source"
+                        ),
+                        fill_timestamp_key=fill_timestamp_evidence.get(
+                            "fill_timestamp_key"
+                        ),
+                        broker_order_updated_at=fill_timestamp_evidence.get(
+                            "broker_order_updated_at"
+                        ),
                     )
                 except Exception as exc:
                     log.warning(
@@ -1221,6 +1358,18 @@ def recover_exit_position(
                         broker_order_id=pending_broker_id,
                         cumulative_filled=filled_qty,
                         filled_ts=filled_ts,
+                        fill_timestamp_quality=fill_timestamp_evidence.get(
+                            "fill_timestamp_quality"
+                        ),
+                        fill_timestamp_source=fill_timestamp_evidence.get(
+                            "fill_timestamp_source"
+                        ),
+                        fill_timestamp_key=fill_timestamp_evidence.get(
+                            "fill_timestamp_key"
+                        ),
+                        broker_order_updated_at=fill_timestamp_evidence.get(
+                            "broker_order_updated_at"
+                        ),
                         reconciled=True,
                     )
                 except Exception as exc:
@@ -1254,6 +1403,18 @@ def recover_exit_position(
                     broker_order_id=pending_broker_id,
                     cumulative_filled=filled_qty,
                     filled_ts=filled_ts,
+                    fill_timestamp_quality=fill_timestamp_evidence.get(
+                        "fill_timestamp_quality"
+                    ),
+                    fill_timestamp_source=fill_timestamp_evidence.get(
+                        "fill_timestamp_source"
+                    ),
+                    fill_timestamp_key=fill_timestamp_evidence.get(
+                        "fill_timestamp_key"
+                    ),
+                    broker_order_updated_at=fill_timestamp_evidence.get(
+                        "broker_order_updated_at"
+                    ),
                 )
             except Exception as exc:
                 log.warning("autonomous recovery partial-fill hook failed: %s", exc)
@@ -1278,7 +1439,7 @@ def recover_exit_position(
             )
             if order_state not in {ORDERS_AVAILABLE_COMPLETE, ORDERS_AVAILABLE_EMPTY}:
                 return _hold(
-                    f"broker_order_truth_{order_state}",
+                    _recovery_order_state_reason(order_state),
                     pid,
                     local_id,
                     pending_broker_id,
@@ -1400,7 +1561,13 @@ def recover_exit_position(
         include_filled=True,
     )
     if order_state not in {ORDERS_AVAILABLE_COMPLETE, ORDERS_AVAILABLE_EMPTY}:
-        return _hold(f"broker_order_truth_{order_state}", pid, local_id, "", {"contract": contract, "quote_health": qh})
+        return _hold(
+            _recovery_order_state_reason(order_state),
+            pid,
+            local_id,
+            "",
+            {"contract": contract, "quote_health": qh},
+        )
     tagged_matches: list[tuple[str, dict]] = []
     untagged_matches: list[tuple[str, dict]] = []
     for broker_id, raw in matches:
@@ -1459,19 +1626,33 @@ def recover_exit_position(
                     "quote_health": qh,
                 },
             )
+        fill_timestamp_evidence = None
         if _status(raw) == "filled":
             filled_qty = raw.get("_recovery_fill_qty")
             fill_price = raw.get("_recovery_fill_price")
-            filled_ts = _recovery_fill_timestamp(raw)
+            fill_timestamp_evidence = _recovery_fill_timestamp_evidence(raw)
+            filled_ts = fill_timestamp_evidence.get("filled_ts")
             fill_details = {
                 "status": "filled",
                 "filled_qty": filled_qty,
                 "fill_price": fill_price,
                 "filled_ts": filled_ts,
+                "fill_timestamp_quality": fill_timestamp_evidence.get(
+                    "fill_timestamp_quality"
+                ),
+                "fill_timestamp_source": fill_timestamp_evidence.get(
+                    "fill_timestamp_source"
+                ),
+                "fill_timestamp_key": fill_timestamp_evidence.get(
+                    "fill_timestamp_key"
+                ),
+                "broker_order_updated_at": fill_timestamp_evidence.get(
+                    "broker_order_updated_at"
+                ),
                 "contract": contract,
                 "quote_health": qh,
             }
-            if filled_ts is None:
+            if not _usable_recovery_fill_evidence(fill_timestamp_evidence):
                 return _hold(
                     "broker_order_fill_timestamp_unproven",
                     pid,
@@ -1495,6 +1676,7 @@ def recover_exit_position(
             broker_order_id=recovered_id,
             contract=contract,
             source="autonomous_recovery",
+            fill_timestamp_evidence=fill_timestamp_evidence,
         )
         if not adopted:
             return _hold(
@@ -1517,6 +1699,18 @@ def recover_exit_position(
                     filled_qty=filled_qty,
                     fill_price=fill_price,
                     filled_ts=filled_ts,
+                    fill_timestamp_quality=fill_timestamp_evidence.get(
+                        "fill_timestamp_quality"
+                    ),
+                    fill_timestamp_source=fill_timestamp_evidence.get(
+                        "fill_timestamp_source"
+                    ),
+                    fill_timestamp_key=fill_timestamp_evidence.get(
+                        "fill_timestamp_key"
+                    ),
+                    broker_order_updated_at=fill_timestamp_evidence.get(
+                        "broker_order_updated_at"
+                    ),
                 )
             except Exception as exc:
                 log.warning(

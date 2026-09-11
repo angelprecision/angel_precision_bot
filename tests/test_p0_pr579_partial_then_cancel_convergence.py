@@ -464,8 +464,11 @@ class TestPartialThenCancelPreservesExecutedQuantity:
             f"apply_fill_update fired even though no new delta exists — "
             f"prev_filled=2 broker_filled=2. got {osm.fill_updates}"
         )
-        # NO new convergence.
-        assert pm.converge_calls == []
+        # The terminal branch still replays the broker evidence through the
+        # canonical convergence hook.  The durable cumulative is unchanged,
+        # so this is an idempotent proof check rather than a second quantity
+        # application.
+        assert len(pm.converge_calls) == 1
         # Terminal transition proceeds for the remainder.
         assert any(t["mapped"] == "CANCELED" for t in osm.transitions)
 
