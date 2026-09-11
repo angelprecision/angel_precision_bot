@@ -123,6 +123,8 @@ def _run_entry_trigger(
         "id": "local-1",
         "local_order_id": "local-1",
         "client_id": "client@example.com",
+        "canonical_signal_id": "sig-1",
+        "signal_id": "sig-1",
         "execution_mode": execution_mode,
         "status": "PENDING_TRIGGER",
         "broker_order_id": None,
@@ -145,11 +147,60 @@ def _run_entry_trigger(
         "status": "SUBMITTED",
         "error": None,
     }
-    def _update_order_meta(local_order_id, patch):
+    def _read_trigger_confirmation_authority(
+        local_order_id,
+        *,
+        client_id,
+        execution_mode,
+        signal_id,
+        canonical_signal_id,
+        expected_materialization_generation=None,
+    ):
+        if local_order_id != order_row["local_order_id"]:
+            return None
+        meta = order_row.get("meta") or {}
+        provenance = meta.get("trigger_crossed_at_provenance")
+        if (
+            order_row.get("status") != "PENDING_TRIGGER"
+            or str(order_row.get("client_id") or "").strip().lower()
+            != str(client_id or "").strip().lower()
+            or str(order_row.get("execution_mode") or "").strip().lower()
+            != str(execution_mode or "").strip().lower()
+            or str(order_row.get("signal_id") or "").strip()
+            != str(signal_id or "").strip()
+            or str(order_row.get("canonical_signal_id") or "").strip()
+            != str(canonical_signal_id or "").strip()
+            or not isinstance(meta.get("trigger_crossed_at"), str)
+            or not isinstance(provenance, dict)
+            or provenance != {
+                "canonical_signal_id": str(canonical_signal_id or "").strip(),
+                "client_id": str(client_id or "").strip().lower(),
+                "execution_mode": str(execution_mode or "").strip().lower(),
+                "local_order_id": str(local_order_id or "").strip(),
+            }
+        ):
+            return None
+        generation = meta.get("materialization_generation")
+        if (
+            expected_materialization_generation is not None
+            and generation != expected_materialization_generation
+        ):
+            return None
+        return {
+            "proven": True,
+            "trigger_crossed_at": meta["trigger_crossed_at"],
+            "trigger_crossed_at_provenance": dict(provenance),
+            "materialization_generation": generation,
+        }
+
+    def _update_order_meta(local_order_id, patch, **_expected):
         order_row.setdefault("meta", {}).update(patch)
         return True
 
     osm.update_order_meta.side_effect = _update_order_meta
+    osm.read_trigger_confirmation_authority.side_effect = (
+        _read_trigger_confirmation_authority
+    )
     osm.expire_pending_entry.return_value = True
 
     core = core_mod.APExecutionCore.__new__(core_mod.APExecutionCore)
@@ -191,6 +242,7 @@ def _run_entry_trigger(
             "canonical_signal_id": "sig-1",
             "local_order_id": "local-1",
             "client_id": "client@example.com",
+            "execution_mode": execution_mode,
             "timeframe": "1d",
             "score": 78,
         },
@@ -263,7 +315,12 @@ def _run_watcher_poll_to_submit(
     if watcher_quote is not None:
         quote.update(watcher_quote)
 
-    watcher = _Watcher(_DummyBroker(), quotes={"AAPL": quote})
+    watcher = _Watcher(
+        _DummyBroker(),
+        order_state_machine=result["osm"],
+        mode=execution_mode,
+        quotes={"AAPL": quote},
+    )
     watcher.on_trigger = core._on_entry_trigger
     watched = WatchedSignal(
         {
@@ -276,6 +333,7 @@ def _run_watcher_poll_to_submit(
             "canonical_signal_id": "sig-1",
             "local_order_id": "local-1",
             "client_id": "client@example.com",
+            "execution_mode": execution_mode,
             "timeframe": "1d",
             "score": 78,
         },
