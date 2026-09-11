@@ -560,6 +560,9 @@ class _CursorWrapper:
         self.cursor.execute(sql, params)
         return self
 
+    def fetchall(self):
+        return self.cursor.fetchall()
+
 
 def _read_meta(url, schema, local_order_id):
     import psycopg2
