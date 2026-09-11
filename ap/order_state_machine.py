@@ -3036,7 +3036,7 @@ class APOrderStateMachine:
                          OR (
                                 NULLIF(meta->>'trigger_crossed_at', '') IS NOT NULL
                             AND meta->>'trigger_crossed_at' ~* '(z|[+-][0-9]{2}:?[0-9]{2})$'
-                            AND (meta->>'trigger_crossed_at')::timestamptz = %s::timestamptz
+                            AND meta->>'trigger_crossed_at' = %s
                             AND jsonb_typeof(
                                   COALESCE(meta, '{}'::jsonb)->'trigger_crossed_at_provenance'
                                 ) = 'object'
