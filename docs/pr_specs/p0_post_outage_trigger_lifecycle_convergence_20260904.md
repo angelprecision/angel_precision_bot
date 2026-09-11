@@ -6,7 +6,7 @@
 
 Live PR base: `59eb1882dc84d6bb33475b4bdd0225486a2309fc`
 Latest code/test head before this attestation:
-`c852020ff68490261ab6b55bbfed7a6ce47bc033`
+`f1ee8cf56fa3e6cf54962bb5b9efee4542d6b6b8`
 PR state: **Draft / open / MERGE CANDIDATE**. The final branch head including this
 attestation is recorded in the PR body; no merge, deploy, close, or replacement
 PR was performed.
@@ -17,7 +17,7 @@ Prior amended head before live-base rebase: `bb7d2084f014ff216a7915873e34f5bbd92
 Amendment applied: 2026-09-10
 
 Latest code amendment commit (before this documentation attestation):
-`c852020ff68490261ab6b55bbfed7a6ce47bc033`. The final branch SHA, including
+`f1ee8cf56fa3e6cf54962bb5b9efee4542d6b6b8`. The final branch SHA, including
 this specification update, is recorded in the PR body after the documentation
 commit.
 
@@ -34,7 +34,7 @@ Dependencies (§STATUS binding order):
 This section supersedes older audit snapshots below. The PR branch is based on
 the live committed GitHub `main` at
 `59eb1882dc84d6bb33475b4bdd0225486a2309fc`. The code/test commit immediately
-before this attestation is `c852020ff68490261ab6b55bbfed7a6ce47bc033`; the
+before this attestation is `f1ee8cf56fa3e6cf54962bb5b9efee4542d6b6b8`; the
 final documentation commit SHA is recorded in the PR body. The PR remains
 Draft/open and must not be merged, deployed, or closed during this audit.
 
@@ -131,23 +131,18 @@ changing the PR's ownership boundary.
 
 Focused local evidence for this amendment:
 
-- the real PostgreSQL/APStartupRecovery/APEntryWatcher/APExecutionCore deferred
-  LIVE restart regression: `1 passed`;
-- the real PostgreSQL trigger-ready `KEEP_WATCHER` restart regression plus the
-  deferred LIVE callback regression: `2 passed`;
-- the complete lifecycle-integrity file was previously green at `180 passed`;
-- the exact-head and pull-request merge-ref jobs below each collected the same
-  canonical inventory and completed `5298 passed` with PostgreSQL enabled;
+- the non-PostgreSQL lifecycle-integrity run: `156 passed, 29 skipped`;
+- the fresh PostgreSQL exact-head and pull-request merge-ref jobs below passed
+  the stale-claim startup, race, and authority-negative controls;
 - the local disposable PostgreSQL server is environmental evidence only; the
   GitHub PostgreSQL jobs are the authoritative CI rerun.
 
 The exact-head/merge-ref P0 workflow for code/test head
-`c852020ff68490261ab6b55bbfed7a6ce47bc033` is run `34543937426`:
+`f1ee8cf56fa3e6cf54962bb5b9efee4542d6b6b8` is run `34551538740`:
 
-- exact-head `p0-tests`, job `103092381233`: **PASS**;
-- pull-request merge-ref `p0-merge-ref-tests`, job `103092381062`: **PASS**;
-- both jobs collected `5298` tests and completed `5298 passed`;
-- the separate `p0-rollback-failfirst` guard, job `103092380931`, also passed,
+- exact-head `p0-tests`, job `103115305724`: **PASS**;
+- pull-request merge-ref `p0-merge-ref-tests`, job `103115305400`: **PASS**;
+- the separate `p0-rollback-failfirst` guard, job `103115305644`, also passed,
   but its pre-#579 historical base is not used as #580 clearance evidence.
 
 The historical implementation/gate notes below are retained for audit
