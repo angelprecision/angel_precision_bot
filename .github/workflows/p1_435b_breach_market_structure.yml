@@ -13,6 +13,20 @@ on:
 jobs:
   exact-head:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: intelligence_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d intelligence_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,11 +48,28 @@ jobs:
           pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas
 
       - name: Run 435-B behavioral tests
+        env:
+          PGSSLMODE: "disable"
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
         run: |
           python -m pytest tests/test_p0_435b_breach_market_structure.py -v --tb=short
 
   merge-ref:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: intelligence_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d intelligence_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -60,5 +91,8 @@ jobs:
           pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas
 
       - name: Run identical 435-B behavioral tests
+        env:
+          PGSSLMODE: "disable"
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
         run: |
           python -m pytest tests/test_p0_435b_breach_market_structure.py -v --tb=short
