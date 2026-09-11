@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+
 jobs:
   focused-proof:
     runs-on: ubuntu-latest
