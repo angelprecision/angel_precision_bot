@@ -1593,6 +1593,10 @@ def test_pr566_restart_adopts_exact_tagged_filled_order_into_original_exit_once(
             "filled_qty": 2,
             "fill_price": 1.25,
             "filled_ts": "2026-09-04T17:07:14+00:00",
+            "fill_timestamp_quality": "exact_execution",
+            "fill_timestamp_source": "broker_response",
+            "fill_timestamp_key": "filled_at",
+            "broker_order_updated_at": None,
         },
     )
     assert hooks.order_state_machine.row["local_order_id"] == "local-exit-566"
@@ -2081,6 +2085,10 @@ def test_pr566_filled_recovery_delegates_to_canonical_osm_and_dedupes():
         "filled_qty": 2,
         "fill_price": 1.25,
         "filled_ts": "2026-09-04T17:07:14+00:00",
+        "fill_timestamp_quality": "exact_execution",
+        "fill_timestamp_source": "broker_response",
+        "fill_timestamp_key": "filled_at",
+        "broker_order_updated_at": None,
     }
     assert hooks.closed_calls == []
     assert hooks.partial_calls == []
