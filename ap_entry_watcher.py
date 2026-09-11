@@ -3529,6 +3529,46 @@ class APEntryWatcher:
             )
             return False
 
+    def _restore_recovered_trigger_ready_lifecycle(self, watched) -> bool:
+        signal = getattr(watched, "signal", {}) or {}
+        if signal.get("__recovered_trigger_ready") is not True:
+            return True
+        if not signal.get("__durable_trigger_authority_proven"):
+            return False
+        signal_id = str(signal.get("signal_id") or "").strip()
+        ticker = str(getattr(watched, "ticker", "") or "").strip().upper()
+        if not signal_id or not ticker or not _EW_LIFECYCLE_OK:
+            return False
+        try:
+            current = _EW_LEDGER.current_state(signal_id)
+            if current is None:
+                _EW_LEDGER.transition(
+                    signal_id,
+                    ticker,
+                    _EW_SS.ADOPTED,
+                    _EW_LO.WATCHER,
+                    "restart_recovered_trigger_ready",
+                    strict=True,
+                )
+                current = _EW_SS.ADOPTED
+            if current == _EW_SS.ADOPTED:
+                _EW_LEDGER.transition(
+                    signal_id,
+                    ticker,
+                    _EW_SS.WATCHING,
+                    _EW_LO.WATCHER,
+                    "restart_recovered_trigger_ready_watcher_owned",
+                    strict=True,
+                )
+                current = _EW_SS.WATCHING
+            return current in {_EW_SS.WATCHING, _EW_SS.TRIGGER_READY}
+        except Exception:
+            log.exception(
+                "RECOVERED_TRIGGER_READY_LIFECYCLE_RESTORE_FAILED signal_id=%s",
+                signal_id,
+            )
+            return False
+
     def add_signal(
         self, signal: dict, *, registration_provenance_out: Optional[dict] = None,
     ) -> bool:
@@ -3620,22 +3660,32 @@ class APEntryWatcher:
             # the disarmed signal later reclaims, both would be active simultaneously.
             # Using (w.is_active or w.rearm_mode) ensures rearm signals participate
             # in the same scoring and cancellation logic as normal signals.
-            same_side = [
-                w
-                for w in self._pending
-                if (w.is_active or getattr(w, "rearm_mode", False))
-                and w.ticker == watched.ticker
-                and w.side == watched.side
-                and self._same_side_conflict_applies(watched, w)
-            ]
-            opposite_side = [
-                w
-                for w in self._pending
-                if (w.is_active or getattr(w, "rearm_mode", False))
-                and w.ticker == watched.ticker
-                and w.side != watched.side
-                and self._opposite_conflict_applies(watched, w)
-            ]
+            _recovered_trigger_ready = (
+                watched.signal.get("__recovered_trigger_ready") is True
+            )
+            if _recovered_trigger_ready:
+                # Package-level admission has already performed the exact
+                # incumbent hold.  Keep this base path registration-only so
+                # no legacy cancellation, pruning, or replacement can run.
+                same_side = []
+                opposite_side = []
+            else:
+                same_side = [
+                    w
+                    for w in self._pending
+                    if (w.is_active or getattr(w, "rearm_mode", False))
+                    and w.ticker == watched.ticker
+                    and w.side == watched.side
+                    and self._same_side_conflict_applies(watched, w)
+                ]
+                opposite_side = [
+                    w
+                    for w in self._pending
+                    if (w.is_active or getattr(w, "rearm_mode", False))
+                    and w.ticker == watched.ticker
+                    and w.side != watched.side
+                    and self._opposite_conflict_applies(watched, w)
+                ]
 
             # Never keep both CALL and PUT armed for the same ticker. Stronger
             # score wins. Equal/lower score gets blocked to avoid OSM conflict.
@@ -3998,6 +4048,29 @@ class APEntryWatcher:
                 self._dedup_set.add(dedup_key)
 
             self._pending.append(watched)
+            if watched.signal.get("__recovered_trigger_ready") is True:
+                # WatchedSignal consumes the durable-proof handoff into its
+                # private authority field.  Temporarily expose that same
+                # proof to the lifecycle helper; never derive it from the
+                # timestamp and never leave the handoff in callback payloads.
+                if getattr(watched, "_trigger_authority_persisted", False):
+                    watched.signal["__durable_trigger_authority_proven"] = True
+                _lifecycle_restored = self._restore_recovered_trigger_ready_lifecycle(
+                    watched
+                )
+                watched.signal.pop("__durable_trigger_authority_proven", None)
+                if not _lifecycle_restored:
+                    # Roll back only the exact object/key this call inserted.
+                    # No durable cancel or broker action is safe on this path.
+                    self._pending = [
+                        item for item in self._pending if item is not watched
+                    ]
+                    if dedup_key:
+                        self._dedup_set.discard(dedup_key)
+                    self._last_reject_reason = (
+                        "recovered_trigger_ready_lifecycle_restore_failed"
+                    )
+                    return False
             # PR #421 final amendment (P0-1): this is the exact, sole
             # point a new WatchedSignal registration is committed to the
             # registry. Provenance must be set here, from the object this
@@ -4014,6 +4087,7 @@ class APEntryWatcher:
             if (
                 watched.signal.get("__recovery_rearm")
                 and not watched.signal.get("__materialization_resume")
+                and watched.signal.get("__recovered_trigger_ready") is not True
                 and not self._restore_recovered_watcher_lifecycle(watched)
             ):
                 self._pending = [item for item in self._pending if item is not watched]
@@ -4129,6 +4203,14 @@ class APEntryWatcher:
         _recovery_rearm    = bool(recovery_rearm)
         _materialization_resume = bool(materialization_resume)
         _no_cancel_on_reject = bool(no_cancel_on_reject or recovery_rearm)
+        _recovered_trigger_ready = (
+            getattr(plan, "_recovered_trigger_ready", False) is True
+        )
+        if _recovered_trigger_ready and (
+            not _recovery_rearm or _materialization_resume
+        ):
+            self._last_reject_reason = "invalid_recovered_trigger_ready_context"
+            return False
         _plan_metadata = getattr(plan, "metadata", None) or {}
         if not isinstance(_plan_metadata, dict):
             _plan_metadata = {}
@@ -4320,6 +4402,13 @@ class APEntryWatcher:
                         local_order_id or "?",
                     )
                     return False
+            if _recovered_trigger_ready:
+                if not signal_dict.get("__durable_trigger_authority_proven"):
+                    self._last_reject_reason = (
+                        RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+                    )
+                    return False
+                signal_dict["__recovered_trigger_ready"] = True
             if not recovery_trigger_evidence_identity_is_proven(
                 signal_dict, local_order_id
             ):
@@ -4395,7 +4484,11 @@ class APEntryWatcher:
                 )
                 return False
 
-        if _recovery_rearm and not _materialization_resume:
+        if (
+            _recovery_rearm
+            and not _materialization_resume
+            and not _recovered_trigger_ready
+        ):
             try:
                 from ap.pending_trigger_classifier import (
                     PendingTriggerClassification,
@@ -4892,6 +4985,7 @@ class APEntryWatcher:
             and trigger
             and float(trigger or 0) > 0
             and not _materialization_resume
+            and not _recovered_trigger_ready
         ):
             try:
                 _bug_c_quote = self._get_quote(ticker) or {}
@@ -6347,50 +6441,82 @@ class APEntryWatcher:
         if not active:
             return
 
-        tickers = list({w.ticker for w in active})
-        try:
-            quotes = self._fetch_quotes(tickers)
-        except Exception as exc:
-            log.warning("Quote fetch failed: %s", exc)
-            return
-
         completed = []
+        ordinary_active = []
+
+        def _retry_is_due(w) -> bool:
+            _retry_not_before = getattr(w, "deferred_retry_not_before", None)
+            if _retry_not_before is not None:
+                try:
+                    if isinstance(_retry_not_before, str):
+                        _retry_not_before = datetime.fromisoformat(_retry_not_before)
+                    if _retry_not_before.tzinfo is None:
+                        _retry_not_before = _retry_not_before.replace(tzinfo=timezone.utc)
+                    if datetime.now(timezone.utc) < _retry_not_before:
+                        return False
+                    w.deferred_retry_not_before = None
+                except Exception:
+                    # Invalid retry timestamps never create an indefinite wait;
+                    # clear and let the normal breach check re-prove the trigger.
+                    w.deferred_retry_not_before = None
+            return True
+
+        # A recovered trigger is already durably confirmed.  Route it to the
+        # existing callback path before bulk quote transport so a quote outage
+        # cannot strand a trigger that explicitly does not need a fresh quote.
         with self._lock:
             for w in active:
-                _retry_not_before = getattr(w, "deferred_retry_not_before", None)
-                if _retry_not_before is not None:
-                    try:
-                        if isinstance(_retry_not_before, str):
-                            _retry_not_before = datetime.fromisoformat(_retry_not_before)
-                        if _retry_not_before.tzinfo is None:
-                            _retry_not_before = _retry_not_before.replace(tzinfo=timezone.utc)
-                        if datetime.now(timezone.utc) < _retry_not_before:
-                            continue
-                        w.deferred_retry_not_before = None
-                    except Exception:
-                        # Invalid retry timestamps never create an indefinite wait;
-                        # clear and let the normal breach check re-prove the trigger.
-                        w.deferred_retry_not_before = None
-                quote = quotes.get(w.ticker)
-                if not isinstance(quote, dict):
-                    quote = {}
+                if (
+                    (getattr(w, "signal", {}) or {}).get(
+                        "__recovered_trigger_ready"
+                    )
+                    is True
+                ):
+                    if _retry_is_due(w):
+                        completed.append(("trigger", w))
+                    continue
+                ordinary_active.append(w)
 
-                # Keep raw canonical side values intact for WatchedSignal.check().
-                # The watcher owns type/finite/positive validation and must see
-                # (None, None) for an absent quote. LAST is never promoted to
-                # trigger authority; the exported shim may turn LAST-only
-                # observations into an empty quote, which must still reach this
-                # check() call so bounded continuity is evaluated immediately.
-                bid = quote.get("bid")
-                ask = quote.get("ask")
-                _quote_age_ms = self._coerce_quote_age_ms(quote.get("quote_age_ms"))
-                w.last_quote_age_ms = _quote_age_ms
+        quotes = {}
+        quote_fetch_failed = False
+        if ordinary_active:
+            tickers = list({w.ticker for w in ordinary_active})
+            try:
+                quotes = self._fetch_quotes(tickers)
+            except Exception as exc:
+                log.warning("Quote fetch failed: %s", exc)
+                quote_fetch_failed = True
 
-                new_state = w.check(bid, ask, quote_age_ms=_quote_age_ms)
-                if new_state == WatchState.TRIGGERED:
-                    completed.append(("trigger", w))
-                elif new_state in (WatchState.EXPIRED, WatchState.INVALIDATED):
-                    completed.append(("done", w))
+        # Preserve ordinary quote-failure behavior: only the already-confirmed
+        # recovered entries collected above may continue through dispatch.
+        if quote_fetch_failed and not completed:
+            return
+
+        with self._lock:
+            if not quote_fetch_failed:
+                for w in ordinary_active:
+                    if not _retry_is_due(w):
+                        continue
+                    quote = quotes.get(w.ticker)
+                    if not isinstance(quote, dict):
+                        quote = {}
+
+                    # Keep raw canonical side values intact for WatchedSignal.check().
+                    # The watcher owns type/finite/positive validation and must see
+                    # (None, None) for an absent quote. LAST is never promoted to
+                    # trigger authority; the exported shim may turn LAST-only
+                    # observations into an empty quote, which must still reach this
+                    # check() call so bounded continuity is evaluated immediately.
+                    bid = quote.get("bid")
+                    ask = quote.get("ask")
+                    _quote_age_ms = self._coerce_quote_age_ms(quote.get("quote_age_ms"))
+                    w.last_quote_age_ms = _quote_age_ms
+
+                    new_state = w.check(bid, ask, quote_age_ms=_quote_age_ms)
+                    if new_state == WatchState.TRIGGERED:
+                        completed.append(("trigger", w))
+                    elif new_state in (WatchState.EXPIRED, WatchState.INVALIDATED):
+                        completed.append(("done", w))
 
             # ── P0 (PR #304) Bug B fix: DO NOT remove triggered watchers here.
             # ── PR #324: DO NOT remove EXPIRED/INVALIDATED watchers here either.

@@ -349,6 +349,14 @@ class PendingTriggerRestartRecovery:
             is_past_eod=self.is_past_eod,
             live_quote_already_through_trigger=None,
         )
+        _meta = _extract_meta(row)
+        _durable_trigger_timestamp_present = bool(
+            str(
+                row.get("trigger_crossed_at")
+                or _meta.get("trigger_crossed_at")
+                or ""
+            ).strip()
+        )
 
         def _observe_materialization_owner() -> str:
             meta = row.get("meta") or {}
@@ -382,6 +390,25 @@ class PendingTriggerRestartRecovery:
             # classifier priority changes later.
             if is_active_materialization_in_flight(row):
                 return _observe_materialization_owner()
+
+        # A durably proven trigger is a lifecycle fact, not a fresh-quote
+        # candidate.  When no watcher, materializer, or canonical retry owner
+        # exists, restore the existing watcher/callback path before any live
+        # quote work.  The plan carries only a private local marker; the
+        # public watcher API remains unchanged.
+        if (
+            cls == PTC.STUCK_TRIGGER_READY
+            and watcher_owned is not True
+            and _evidence_proven
+            and _durable_trigger_timestamp_present
+            and not _canonical_retry_after_trigger
+        ):
+            return self._rearm_and_verify(
+                row,
+                local_oid,
+                plan_builder_fn=plan_builder_fn,
+                recovered_trigger_ready=True,
+            )
 
         # Live quote check.
         live_quote_abt: Optional[bool] = None
@@ -499,15 +526,10 @@ class PendingTriggerRestartRecovery:
             return self._handle_retryable(row, local_oid, live_quote_abt, plan_builder_fn)
 
         elif cls == PTC.STUCK_TRIGGER_READY:
-            _meta = row.get("meta") or {}
-            return self._terminalize_with_reason(
-                local_oid, row,
-                "restart_stuck_trigger_ready_no_broker_proof",
-                meta_patch={
-                    "restart_recovery_cls":        cls,
-                    "restart_recovery_trigger_ts": _meta.get("trigger_crossed_at"),
-                },
-            )
+            # A trigger-ready shape that did not satisfy the exact durable
+            # authority path is ambiguous; never destroy it during restart.
+            self._mark_failure(local_oid, "restart_trigger_ready_authority_unproven")
+            return _RowOutcome.UNRESOLVED
 
         elif cls == PTC.STUCK_INVALIDATED:
             _meta = row.get("meta") or {}
@@ -708,7 +730,14 @@ class PendingTriggerRestartRecovery:
 
     # ── Rearm + post-registration verification ────────────────────────────────
 
-    def _rearm_and_verify(self, row: dict, local_oid: str, *, plan_builder_fn=None) -> str:
+    def _rearm_and_verify(
+        self,
+        row: dict,
+        local_oid: str,
+        *,
+        plan_builder_fn=None,
+        recovered_trigger_ready: bool = False,
+    ) -> str:
         """
         Call watch() once, then verify actual registry ownership.
         watch() returning True is NOT proof.
@@ -725,6 +754,15 @@ class PendingTriggerRestartRecovery:
         if plan is None:
             log.critical("RESTART_RECOVERY_PLAN_BUILD_FAILED local=%s", local_oid)
             return _RowOutcome.UNRESOLVED
+
+        if recovered_trigger_ready:
+            try:
+                setattr(plan, "_recovered_trigger_ready", True)
+            except Exception:
+                self._mark_failure(
+                    local_oid, "recovered_trigger_ready_plan_marker_failed"
+                )
+                return _RowOutcome.UNRESOLVED
 
         if self.dry_run:
             log.info("RESTART_RECOVERY_DRY_RUN local=%s — would watch(recovery_rearm=True)", local_oid)
@@ -749,6 +787,18 @@ class PendingTriggerRestartRecovery:
             return _RowOutcome.UNRESOLVED
 
         if not armed:
+            if recovered_trigger_ready:
+                _reason = getattr(watcher, "_last_reject_reason", None) or (
+                    "recovered_trigger_ready_watch_returned_false"
+                )
+                self._mark_failure(local_oid, _reason)
+                log.critical(
+                    "RESTART_RECOVERY_RECOVERED_TRIGGER_READY_WATCH_FALSE "
+                    "local=%s reason=%s — row left unchanged",
+                    local_oid,
+                    _reason,
+                )
+                return _RowOutcome.UNRESOLVED
             if getattr(watcher, "_last_reject_reason", None) == (
                 RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
             ):
