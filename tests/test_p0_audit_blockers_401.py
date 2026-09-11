@@ -277,7 +277,7 @@ class TestRetryMaximumAuthorityNoLocalFallback:
         monkeypatch.delenv("MAX_BREACH_SELECTOR_RETRIES", raising=False)
         import ap.deferred_materializer as deferred_materializer_mod
         cfg = deferred_materializer_mod._cfg()
-        assert cfg["max_attempts"] == 5
+        assert cfg["max_attempts"] == 20
 
     def test_no_dead_fallback_wrappers_remain(self):
         """Structural guard: the three now-removed wrapper functions that
@@ -592,8 +592,8 @@ class TestCanonicalResolverDirectly:
         from ap.selector_retry_policy import resolve_deferred_materialization_max_attempts
         return resolve_deferred_materialization_max_attempts()
 
-    def test_both_absent_returns_five(self, monkeypatch):
-        assert self._resolve(monkeypatch) == 5
+    def test_both_absent_returns_twenty(self, monkeypatch):
+        assert self._resolve(monkeypatch) == 20
 
     def test_only_breach_set_returns_that_value(self, monkeypatch):
         assert self._resolve(monkeypatch, breach_env="3") == 3
