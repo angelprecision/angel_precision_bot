@@ -1,0 +1,64 @@
+name: P1 435-B Breach Market Structure
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "ap/intelligence_breach_market_structure.py"
+      - "tests/test_p0_435b_breach_market_structure.py"
+      - "docs/pr_specs/p1_435b_breach_market_structure_20260911.md"
+      - ".github/workflows/p1_435b_breach_market_structure.yml"
+
+jobs:
+  exact-head:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Assert exact PR head
+        run: |
+          expected="${{ github.event.pull_request.head.sha }}"
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$expected"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install focused dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+
+      - name: Run 435-B behavioral tests
+        run: |
+          python -m pytest tests/test_p0_435b_breach_market_structure.py -v --tb=short
+
+  merge-ref:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+
+      - name: Assert synthetic merge ref
+        run: |
+          expected="${{ github.sha }}"
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$expected"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install focused dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+
+      - name: Run identical 435-B behavioral tests
+        run: |
+          python -m pytest tests/test_p0_435b_breach_market_structure.py -v --tb=short
