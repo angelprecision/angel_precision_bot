@@ -2319,7 +2319,8 @@ class APOrderStateMachine:
                         " AND COALESCE(broker_order_id, '') = ''"
                         " AND submitted_ts IS NULL"
                         " AND NULLIF(COALESCE(meta->>'submit_intent_at', ''), '') IS NULL"
-                        " AND LOWER(TRIM(COALESCE(meta->>'broker_ready', 'false'))) IN ('false', '')"
+                        " AND (COALESCE(meta->>'broker_ready', '') = ''"
+                        " OR LOWER(TRIM(meta->>'broker_ready')) = 'false')"
                     )
                 if expected_existing_trigger_authority:
                     existing_provenance = (
@@ -2354,7 +2355,8 @@ class APOrderStateMachine:
                         " AND COALESCE(broker_order_id, '') = ''"
                         " AND submitted_ts IS NULL"
                         " AND NULLIF(COALESCE(meta->>'submit_intent_at', ''), '') IS NULL"
-                        " AND LOWER(TRIM(COALESCE(meta->>'broker_ready', 'false'))) IN ('false', '')"
+                        " AND (COALESCE(meta->>'broker_ready', '') = ''"
+                        " OR LOWER(TRIM(meta->>'broker_ready')) = 'false')"
                     )
                     _params.extend([
                         existing_crossed_at.strip(),
@@ -2461,7 +2463,8 @@ class APOrderStateMachine:
                        AND COALESCE(broker_order_id, '') = ''
                        AND submitted_ts IS NULL
                        AND NULLIF(COALESCE(meta->>'submit_intent_at', ''), '') IS NULL
-                       AND LOWER(TRIM(COALESCE(meta->>'broker_ready', 'false'))) IN ('false', '')
+                       AND (COALESCE(meta->>'broker_ready', '') = ''
+                            OR LOWER(TRIM(meta->>'broker_ready')) = 'false')
                 """
                 _params = [_local, _client, _mode, _signal, _canonical]
                 if expected_materialization_generation is not None:
@@ -2561,7 +2564,9 @@ class APOrderStateMachine:
         elif isinstance(_broker_ready, bool):
             _broker_not_ready = _broker_ready is False
         elif isinstance(_broker_ready, str):
-            _broker_not_ready = _broker_ready.strip().lower() in {"false", ""}
+            _broker_not_ready = (
+                _broker_ready == "" or _broker_ready.strip().lower() == "false"
+            )
         else:
             _broker_not_ready = False
         if not _broker_not_ready:

@@ -426,8 +426,11 @@ def test_readback_accepts_explicit_broker_not_ready_values(monkeypatch, broker_r
 
 @pytest.mark.parametrize(
     "broker_ready",
-    [True, "true", "broker-free", 0, 1, [], {}],
-    ids=["bool-true", "text-true", "malformed-text", "zero", "one", "list", "object"],
+    [True, "true", "broker-free", "   ", 0, 1, [], {}],
+    ids=[
+        "bool-true", "text-true", "malformed-text", "whitespace-only",
+        "zero", "one", "list", "object",
+    ],
 )
 def test_readback_rejects_truthy_or_malformed_broker_ready_values(monkeypatch, broker_ready):
     import ap.order_state_machine as osm_module
