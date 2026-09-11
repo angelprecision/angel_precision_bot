@@ -2837,6 +2837,36 @@ class APOrderStateMachine:
         if not _owner or not _signal_id or _mode not in ("live", "paper"):
             return False
 
+        # Trigger evidence is one atomic authority pair: timestamp + identity.
+        # Never fabricate a breach time and never persist timestamp-only state.
+        _crossed_at = str(trigger_crossed_at or "").strip()
+        if not _crossed_at:
+            return False
+        try:
+            _crossed_dt = datetime.fromisoformat(
+                _crossed_at[:-1] + "+00:00"
+                if _crossed_at.endswith(("Z", "z"))
+                else _crossed_at
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if _crossed_dt.tzinfo is None or _crossed_dt.utcoffset() is None:
+            return False
+
+        _local_order_id = str(local_order_id or "").strip()
+        _client_key = str(self.client_id or "").strip().lower()
+        _canonical_signal_id = str(
+            build_canonical_signal_id(_signal_id) or ""
+        ).strip()
+        if not _local_order_id or not _client_key or not _canonical_signal_id:
+            return False
+        _trigger_provenance = {
+            "canonical_signal_id": _canonical_signal_id,
+            "client_id": _client_key,
+            "execution_mode": _mode,
+            "local_order_id": _local_order_id,
+        }
+
         _now = now_utc_iso()
         _patch = {
             "lifecycle_state": "MATERIALIZING",
@@ -2858,7 +2888,8 @@ class APOrderStateMachine:
             "materialization_lease_until": str(lease_until or ""),
             "materialization_started_at": _now,
             "selector_started_at": _now,
-            "trigger_crossed_at": str(trigger_crossed_at or _now),
+            "trigger_crossed_at": _crossed_at,
+            "trigger_crossed_at_provenance": _trigger_provenance,
             "breach_received_at": _now,
             "trigger_price": float(trigger_price or 0),
             "observed_underlying_price": float(observed_underlying_price or 0),
@@ -2921,6 +2952,9 @@ class APOrderStateMachine:
             _prev_attempt = _ra - 1
         try:
             _patch_json = _json_local.dumps(_patch, default=str)
+            _trigger_provenance_json = _json_local.dumps(
+                _trigger_provenance, default=str
+            )
         except Exception:
             return False
 
@@ -2996,11 +3030,26 @@ class APOrderStateMachine:
                             COALESCE(meta->>'lifecycle_state','') IN ('', 'RETRY_WAIT')
                          OR COALESCE(meta->>'materialization_lease_until','') < %s
                       )
+                      AND (
+                            (NOT (COALESCE(meta, '{}'::jsonb) ? 'trigger_crossed_at')
+                             AND NOT (COALESCE(meta, '{}'::jsonb) ? 'trigger_crossed_at_provenance'))
+                         OR (
+                                NULLIF(meta->>'trigger_crossed_at', '') IS NOT NULL
+                            AND meta->>'trigger_crossed_at' ~* '(z|[+-][0-9]{2}:?[0-9]{2})$'
+                            AND (meta->>'trigger_crossed_at')::timestamptz = %s::timestamptz
+                            AND jsonb_typeof(
+                                  COALESCE(meta, '{}'::jsonb)->'trigger_crossed_at_provenance'
+                                ) = 'object'
+                            AND COALESCE(meta, '{}'::jsonb)->'trigger_crossed_at_provenance' = %s::jsonb
+                         )
+                      )
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                     """ + _attempt_predicate,
                     (
                         _patch_json, local_order_id, self.client_id,
-                        _signal_id, _mode, _now, _expected_previous_generation,
+                        _signal_id, _mode, _now,
+                        _crossed_at, _trigger_provenance_json,
+                        _expected_previous_generation,
                         *_attempt_params,
                     ),
                 )
