@@ -1738,6 +1738,287 @@ class APEntryWatcher:
         contract = str((signal or {}).get("contract_symbol") or "").strip().upper()
         return bool((signal or {}).get("contract_deferred")) or contract.startswith("DEFERRED:")
 
+    @staticmethod
+    def _deferred_watcher_identity(watched) -> dict:
+        """Resolve the exact durable identity carried by a deferred watcher."""
+        signal = getattr(watched, "signal", {}) or {}
+        metadata = signal.get("metadata") if isinstance(signal, dict) else {}
+        metadata = metadata if isinstance(metadata, dict) else {}
+
+        def _values(keys):
+            values = []
+            for source in (signal, metadata):
+                for key in keys:
+                    raw = source.get(key)
+                    if raw is None or (isinstance(raw, str) and not raw.strip()):
+                        continue
+                    values.append(str(raw).strip())
+            return values
+
+        def _consistent(keys, *, lower=False):
+            values = _values(keys)
+            normalized = [value.lower() if lower else value for value in values]
+            if len(set(normalized)) > 1:
+                return "", "watcher_identity_conflict:" + "/".join(keys)
+            return (normalized[0] if normalized else ""), ""
+
+        local_order_id, error = _consistent(("local_order_id",))
+        if error:
+            return {"valid": False, "reason": error}
+        client_id, error = _consistent(("client_id", "client_email"), lower=True)
+        if error:
+            return {"valid": False, "reason": error}
+        execution_mode, error = _consistent(("execution_mode",), lower=True)
+        if error:
+            return {"valid": False, "reason": error}
+        signal_id, error = _consistent(("signal_id",))
+        if error:
+            return {"valid": False, "reason": error}
+        explicit_canonical, error = _consistent(("canonical_signal_id",))
+        if error:
+            return {"valid": False, "reason": error}
+        canonical_signal_id = explicit_canonical or build_canonical_signal_id(signal_id)
+
+        if not local_order_id:
+            return {"valid": False, "reason": "missing_exact_identity:local_order_id"}
+        if not client_id:
+            return {"valid": False, "reason": "missing_exact_identity:client_id"}
+        if execution_mode not in {"live", "paper"}:
+            return {"valid": False, "reason": "missing_or_invalid_identity:execution_mode"}
+        if not signal_id:
+            return {"valid": False, "reason": "missing_exact_identity:signal_id"}
+        return {
+            "valid": True,
+            "local_order_id": local_order_id,
+            "client_id": client_id,
+            "execution_mode": execution_mode,
+            "signal_id": signal_id,
+            "canonical_signal_id": canonical_signal_id,
+        }
+
+    def _read_deferred_terminal_truth(self, watched) -> tuple[str, dict | None, str]:
+        """Read-only proof of exact deferred-row terminal convergence.
+
+        The result is ``(classification, row, reason)``.  Only
+        ``TERMINAL_DURABLE`` authorizes watcher removal; every other result is
+        a hold unless the exact row is an ordinary broker-free PENDING_TRIGGER.
+        """
+        signal = getattr(watched, "signal", {}) or {}
+        identity = self._deferred_watcher_identity(watched)
+        if not identity.get("valid"):
+            return "HOLD", None, str(identity.get("reason") or "identity_unproven")
+
+        osm = getattr(self, "order_state_machine", None)
+        get_order = getattr(osm, "get_order", None)
+        if not callable(get_order):
+            get_order = getattr(osm, "_get_order", None)
+        if not callable(get_order):
+            return "UNKNOWN", None, "get_order_unavailable"
+        try:
+            row = get_order(identity["local_order_id"])
+        except Exception:
+            return "UNKNOWN", None, "get_order_raised"
+        if not isinstance(row, dict):
+            return "UNKNOWN", None, "row_unreadable"
+
+        meta_raw = row.get("meta")
+        if meta_raw is None:
+            meta = {}
+        elif isinstance(meta_raw, str):
+            try:
+                meta = json.loads(meta_raw)
+            except Exception:
+                return "HOLD", row, "metadata_unreadable"
+            if not isinstance(meta, dict):
+                return "HOLD", row, "metadata_unreadable"
+        elif isinstance(meta_raw, dict):
+            meta = dict(meta_raw)
+        else:
+            return "HOLD", row, "metadata_unreadable"
+
+        def _present(value) -> bool:
+            return value is not None and not (
+                isinstance(value, str) and not value.strip()
+            )
+
+        def _row_values(keys):
+            values = []
+            for source in (row, meta):
+                for key in keys:
+                    raw = source.get(key)
+                    if _present(raw):
+                        values.append(str(raw).strip())
+            return values
+
+        def _match(keys, expected, *, lower=False):
+            values = _row_values(keys)
+            normalized = [value.lower() if lower else value for value in values]
+            if not normalized:
+                return False, "missing_durable_identity:" + "/".join(keys)
+            if len(set(normalized)) > 1:
+                return False, "durable_identity_conflict:" + "/".join(keys)
+            if normalized[0] != expected:
+                return False, "durable_identity_mismatch:" + "/".join(keys)
+            return True, ""
+
+        identity_problem = None
+        for keys, expected, lower in (
+            (("local_order_id",), identity["local_order_id"], False),
+            (("client_id", "client_email"), identity["client_id"], True),
+            (("execution_mode",), identity["execution_mode"], True),
+            (("signal_id",), identity["signal_id"], False),
+        ):
+            matched, reason = _match(keys, expected, lower=lower)
+            if not matched:
+                identity_problem = reason
+                break
+
+        if identity_problem and not identity_problem.startswith("missing_durable_identity:"):
+            return "HOLD", row, identity_problem
+
+        canonical_values = _row_values(("canonical_signal_id",))
+        if canonical_values:
+            if len(set(canonical_values)) > 1:
+                return "HOLD", row, "durable_identity_conflict:canonical_signal_id"
+            if canonical_values[0] != identity["canonical_signal_id"]:
+                return "HOLD", row, "durable_identity_mismatch:canonical_signal_id"
+
+        kind = row.get("kind")
+        if _present(kind) and str(kind).strip().upper() != "ENTRY":
+            return "HOLD", row, "durable_identity_mismatch:kind"
+
+        surfaces = [row, meta]
+        nested_materialization = meta.get("materialization")
+        if isinstance(nested_materialization, dict):
+            surfaces.append(nested_materialization)
+
+        def _has_broker_handoff() -> bool:
+            if _present(row.get("broker_order_id")) or _present(row.get("submitted_ts")):
+                return True
+            for surface in surfaces:
+                broker_ready = surface.get("broker_ready")
+                if _present(broker_ready) and not (
+                    broker_ready is False
+                    or (isinstance(broker_ready, str) and broker_ready.strip().lower() == "false")
+                ):
+                    return True
+                for key in (
+                    "submit_intent_at",
+                    "broker_submit_key",
+                    "broker_submit_payload_hash",
+                    "submit_intent_owner",
+                    "recovery_submit_owner",
+                ):
+                    if _present(surface.get(key)):
+                        return True
+            return False
+
+        status = str(row.get("status") or "").strip().upper()
+        terminal_statuses = {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}
+        if status not in terminal_statuses:
+            if status == "PENDING_TRIGGER" and _has_broker_handoff():
+                return "HOLD", row, "broker_handoff_unresolved"
+            return "NOT_TERMINAL", row, "pending_trigger" if status == "PENDING_TRIGGER" else status
+
+        if identity_problem:
+            return "HOLD", row, identity_problem
+
+        if _has_broker_handoff():
+            return "HOLD", row, "broker_handoff_unresolved"
+
+        def _reason_value(raw):
+            if not _present(raw):
+                return None, False
+            if not isinstance(raw, str):
+                return None, True
+            value = raw.strip()
+            if not value or value.lower() == "trigger_ready":
+                return None, False
+            return value, False
+
+        canonical_reasons = []
+        invalid_canonical_reason = False
+        for raw in [
+            row.get("last_error"),
+            meta.get("restart_recovery_terminal_reason"),
+            meta.get("terminal_reason"),
+            meta.get("reason_code"),
+            meta.get("final_reason"),
+            meta.get("watcher_invalidation_reason"),
+        ]:
+            reason, invalid = _reason_value(raw)
+            invalid_canonical_reason = invalid_canonical_reason or invalid
+            if reason:
+                canonical_reasons.append(reason)
+        if invalid_canonical_reason:
+            return "HOLD", row, "terminal_reason_malformed"
+        if len(set(canonical_reasons)) > 1:
+            return "HOLD", row, "conflicting_canonical_terminal_reasons"
+        if canonical_reasons:
+            return "TERMINAL_DURABLE", row, canonical_reasons[0]
+
+        legacy_reason, legacy_invalid = _reason_value(meta.get("materialization_reason"))
+        if legacy_reason and not legacy_invalid:
+            return "TERMINAL_DURABLE", row, legacy_reason
+        return "HOLD", row, "terminal_reason_unproven"
+
+    def _remove_exact_terminal_watcher(self, watched) -> bool:
+        """Remove only the exact proven watcher and its exact dedup key."""
+        signal = getattr(watched, "signal", {}) or {}
+        dedup_key = self._dedup_key_for_signal(signal)
+        with self._lock:
+            if not any(item is watched for item in self._pending):
+                return False
+            self._pending = [item for item in self._pending if item is not watched]
+            if dedup_key:
+                self._dedup_set.discard(dedup_key)
+            watched.state = WatchState.CANCELLED
+        try:
+            watched._release_dedup_key()
+        except Exception:
+            pass
+        return True
+
+    def _converge_terminal_deferred_watchers(self, completed):
+        """Converge exact terminal deferred rows before any trigger side effect."""
+        retained = []
+        for action, watched in list(completed or []):
+            signal = getattr(watched, "signal", {}) or {}
+            if action != "trigger" or not self._is_deferred_signal(signal):
+                retained.append((action, watched))
+                continue
+
+            classification, _row, reason = self._read_deferred_terminal_truth(watched)
+            if classification == "TERMINAL_DURABLE":
+                removed = self._remove_exact_terminal_watcher(watched)
+                log.info(
+                    "WATCHER_TERMINAL_DURABLE_CONVERGED ticker=%s local_order_id=%s "
+                    "reason=%s removed_from_pending=%s dedup_released=%s",
+                    getattr(watched, "ticker", ""),
+                    str(signal.get("local_order_id") or "").strip() or "?",
+                    reason,
+                    removed,
+                    removed,
+                )
+                continue
+
+            if classification == "NOT_TERMINAL":
+                retained.append((action, watched))
+                continue
+
+            with self._lock:
+                if any(item is watched for item in self._pending):
+                    watched.state = WatchState.PENDING
+            log.warning(
+                "WATCHER_DEFERRED_TRIGGER_HOLD ticker=%s local_order_id=%s "
+                "classification=%s reason=%s callback_suppressed=true",
+                getattr(watched, "ticker", ""),
+                str(signal.get("local_order_id") or "").strip() or "?",
+                classification,
+                reason,
+            )
+        return retained
+
     def _resolve_trigger_callback_disposition(self, watched, result) -> tuple[str, str | None]:
         """Prove the durable owner/state before a triggered watcher is removed.
 
@@ -1781,17 +2062,38 @@ class APEntryWatcher:
                 return claimed_disposition, claimed_next_retry
             return "OWNERSHIP_TRANSFERRED", None
 
+        # ── Deferred: the shared terminal probe wins any stale claim ───
+        # Legacy unit callers may provide only a local order id.  Preserve
+        # their existing retry/submission verifier below, but production
+        # WatchedSignal instances must pass the complete exact-identity fence.
+        _probe_identity = self._deferred_watcher_identity(watched)
+        _terminal_probe = self._read_deferred_terminal_truth(watched)
+        _probe_classification, _probe_row, _probe_reason = _terminal_probe
+        if _probe_classification == "TERMINAL_DURABLE":
+            return "TERMINAL_DURABLE", None
+        if _probe_identity.get("valid"):
+            if _probe_classification == "HOLD":
+                if _probe_reason == "broker_handoff_unresolved":
+                    return "RECONCILE_BROKER_INTENT", None
+                return "KEEP_WATCHER", None
+            if _probe_classification == "UNKNOWN":
+                return "UNKNOWN", None
+
         # ── Deferred: always re-read the row ─────────────────────────
         local_order_id = str(signal.get("local_order_id") or "").strip()
         get_order = getattr(self.order_state_machine, "get_order", None)
+        if not callable(get_order):
+            get_order = getattr(self.order_state_machine, "_get_order", None)
         if not local_order_id or not callable(get_order):
             return "UNKNOWN", None
-        try:
-            row = get_order(local_order_id)
-        except Exception:
-            return "UNKNOWN", None
-        if not isinstance(row, dict):
-            return "UNKNOWN", None
+        row = _probe_row if isinstance(_probe_row, dict) else None
+        if row is None:
+            try:
+                row = get_order(local_order_id)
+            except Exception:
+                return "UNKNOWN", None
+            if not isinstance(row, dict):
+                return "UNKNOWN", None
 
         status = str(row.get("status") or "").upper()
         broker_order_id = str(row.get("broker_order_id") or "").strip()
@@ -1813,10 +2115,20 @@ class APEntryWatcher:
             return status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}
 
         def _terminal_reason_present() -> bool:
-            return bool(
-                meta.get("reason_code")
-                or meta.get("final_reason")
-                or meta.get("materialization_reason")
+            candidates = [
+                row.get("last_error"),
+                meta.get("restart_recovery_terminal_reason"),
+                meta.get("terminal_reason"),
+                meta.get("reason_code"),
+                meta.get("final_reason"),
+                meta.get("watcher_invalidation_reason"),
+                meta.get("materialization_reason"),
+            ]
+            return any(
+                isinstance(value, str)
+                and value.strip()
+                and value.strip().lower() != "trigger_ready"
+                for value in candidates
             )
 
         def _verify_submitted() -> tuple[str, str | None]:
@@ -6013,6 +6325,11 @@ class APEntryWatcher:
         # The package watcher uses this post-check/pre-callback seam to make a
         # batch-level confirmed-breach direction claim.  It may remove proven
         # losers or convert an ambiguous batch to a fail-closed hold.
+        # A deferred watcher may still be process-active after restart
+        # recovery terminalized its exact durable ENTRY row.  Converge that
+        # identity before the package direction hook and before any audit,
+        # trigger-authority CAS, or callback work.
+        completed = self._converge_terminal_deferred_watchers(completed)
         completed = self._before_trigger_dispatch(completed)
         completed = self._apply_open_protection(completed, open_protect_active)
 
@@ -6131,6 +6448,28 @@ class APEntryWatcher:
                             raise RuntimeError(
                                 "deferred_trigger_callback_returned_without_durable_outcome"
                             )
+                        if (
+                            _callback_disposition == "TERMINAL_DURABLE"
+                            and self._is_deferred_signal(getattr(w, "signal", {}) or {})
+                        ):
+                            # Re-read at the removal boundary as well.  This
+                            # keeps a legacy/malformed callback claim from
+                            # removing a watcher without the same exact
+                            # terminal proof used by the resolver.
+                            _terminal_after_callback = self._read_deferred_terminal_truth(w)
+                            if _terminal_after_callback[0] != "TERMINAL_DURABLE":
+                                with self._lock:
+                                    w.state = WatchState.PENDING
+                                log.warning(
+                                    "WATCHER_TERMINAL_CALLBACK_HOLD "
+                                    "ticker=%s local_order_id=%s classification=%s "
+                                    "reason=%s callback_suppressed=true",
+                                    w.ticker,
+                                    _ts_pre_local_oid or "?",
+                                    _terminal_after_callback[0],
+                                    _terminal_after_callback[2],
+                                )
+                                continue
                         w._trigger_attempts = 0   # reset on success
                         # ── P0 (PR #304) Bug B: explicit removal on SUCCESS.
                         # Since Bug B fix stopped removing triggered watchers
