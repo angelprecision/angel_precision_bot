@@ -109,10 +109,22 @@ It has:
 
 - Missing `data_as_of` means no candle can be proven complete, so candle-derived
   evidence stays missing.
-- Timestamp-less or malformed OHLC bars are excluded.
+- Timestamps must be timezone-aware. Naive or malformed timestamps are excluded;
+  the helper never guesses that a naive value is ET.
+- OHLC bars must start on the session-aligned 09:30 ET grid and fall inside
+  US-equity RTH. Premarket, postmarket, weekend, and misaligned bars are
+  excluded.
 - Future/incomplete 4H/1H/15m/5m bars are excluded.
 - Non-finite values cannot improve classification.
-- VI is never approximated.
+- The breach price comes only from explicit frozen breach evidence such as
+  `breach_price`, `frozen_underlying_price`, or a timestamped breach-evidence
+  mapping. Generic worker-time `underlying_price` / `current_price` aliases are
+  not accepted.
+- VI requires an available status, non-empty source, aware timestamp no later
+  than the snapshot, and numeric exact evidence. Approximate or malformed VI is
+  `MISSING`.
+- Penetration evidence cannot predate the selected FVG's formation; pullback /
+  reclaim / re-breach sequencing begins at the supplied breach timestamp.
 
 ## Focused behavioral tests
 
@@ -120,21 +132,24 @@ The focused suite executes:
 
 - inside / above / below / boundary FVG positioning;
 - missing-as-of future-data exclusion;
+- strict timezone/session-bar admission;
 - incomplete 4H invalidator exclusion;
 - NOW-shaped PUT at bullish FVG bottom with wick-only rejection;
+- frozen breach-price provenance and missing-price zone selection;
 - strong PUT 15m >=50% body break;
 - symmetric CALL break through bearish FVG resistance;
+- pre-formation penetration exclusion;
 - completed-close pullback -> reclaim -> re-breach;
-- exact-VI-or-MISSING contract;
+- exact-VI-or-MISSING provenance and approximation contract;
 - regime no-fabrication;
 - malformed/non-finite candle failure;
 - input immutability + zero-authority invariant.
 
 Local isolated execution against the current canonical detector contract:
-`11 passed`.
+`18 passed` after the PIT/session hardening amendment.
 
-Repository CI remains the merge proof. This PR stays HARD HOLD until exact-head
-CI is green and the diff is independently audited.
+Repository CI remains the merge proof. Any exact-head and merge-ref checks from
+the prior head must rerun for this amendment. This PR stays HARD HOLD.
 
 ## Follow-up boundary
 

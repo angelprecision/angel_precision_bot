@@ -34,6 +34,8 @@ KNOWN_REGIMES = {
 
 
 def _num(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
     try:
         out = float(value)
         return out if math.isfinite(out) else None
@@ -51,8 +53,8 @@ def _ts(value: Any) -> Optional[datetime]:
             dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         except (TypeError, ValueError):
             return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=ET)
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        return None
     return dt.astimezone(timezone.utc)
 
 
@@ -60,9 +62,23 @@ def _row_ts(row: Mapping[str, Any]) -> Optional[datetime]:
     return _ts(row.get("time") or row.get("timestamp") or row.get("start"))
 
 
-def _bucket_end(start: datetime, minutes: int) -> datetime:
+def _bucket_end(start: datetime, minutes: int) -> Optional[datetime]:
+    if minutes <= 0:
+        return None
     local = start.astimezone(ET)
+    session_open = local.replace(hour=9, minute=30, second=0, microsecond=0)
     close = local.replace(hour=16, minute=0, second=0, microsecond=0)
+    if local.weekday() >= 5 or local < session_open or local >= close:
+        return None
+    offset_seconds = (local - session_open).total_seconds()
+    if offset_seconds % 60 != 0:
+        return None
+    offset_minutes = int(offset_seconds // 60)
+    if minutes == 240:
+        if offset_minutes not in {0, 240}:
+            return None
+    elif offset_minutes % minutes != 0:
+        return None
     return min(local + timedelta(minutes=minutes), close).astimezone(timezone.utc)
 
 
@@ -84,7 +100,8 @@ def completed_bars_as_of(
         o, h, l, c = vals
         if h < l or not (l <= o <= h and l <= c <= h):
             continue
-        if _bucket_end(start, minutes) > cutoff:
+        bucket_end = _bucket_end(start, minutes)
+        if bucket_end is None or bucket_end > cutoff:
             continue
         out.append(dict(raw))
     out.sort(key=lambda row: _row_ts(row) or datetime.min.replace(tzinfo=timezone.utc))
@@ -144,6 +161,53 @@ def _break_boundary(zone: Mapping[str, Any] | None, side: str) -> Optional[float
     return None
 
 
+def _frozen_breach_price(
+    signal: Mapping[str, Any], *, as_of: Any
+) -> tuple[Optional[float], Optional[str]]:
+    """Use only explicitly frozen breach-price evidence.
+
+    Generic ``underlying_price`` and ``current_price`` aliases are deliberately
+    excluded: their provenance is ambiguous and they may be a later worker-time
+    quote.  Mapping-shaped evidence must carry an aware timestamp no later than
+    the snapshot cutoff.
+    """
+    cutoff = _ts(as_of)
+    if cutoff is None:
+        return None, None
+    candidates = (
+        ("signal.breach_price", signal.get("breach_price")),
+        ("signal.frozen_underlying_price", signal.get("frozen_underlying_price")),
+        ("signal.underlying_at_breach", signal.get("underlying_at_breach")),
+        ("signal.price_at_breach", signal.get("price_at_breach")),
+        ("signal.breach_evidence", signal.get("breach_evidence")),
+    )
+    for source, raw in candidates:
+        if isinstance(raw, Mapping):
+            price = None
+            for key in ("price", "underlying_price", "breach_price", "value"):
+                price = _num(raw.get(key))
+                if price is not None:
+                    break
+            if price is None:
+                continue
+            raw_ts = next(
+                (
+                    raw.get(key)
+                    for key in ("as_of", "data_as_of", "timestamp", "observed_at", "time")
+                    if raw.get(key) not in (None, "")
+                ),
+                None,
+            )
+            observed = _ts(raw_ts)
+            if observed is None or (cutoff is not None and observed > cutoff):
+                continue
+            return price, source
+        price = _num(raw)
+        if price is not None:
+            return price, source
+    return None, None
+
+
 def freeze_fvg_zones(
     *, side: str, price: Optional[float], candles: Mapping[str, Any],
     as_of: Any, tolerance: float = 0.01,
@@ -177,25 +241,80 @@ def freeze_fvg_zones(
     return zones
 
 
-def freeze_volume_imbalance(value: Any) -> dict[str, Any]:
-    """VI is exact PIT evidence or MISSING. This PR never approximates it."""
-    if isinstance(value, Mapping):
-        numeric = any(
-            _num(value.get(k)) is not None
-            for k in ("imbalance", "imbalance_ratio", "bid_volume", "ask_volume", "delta")
-        )
-        if str(value.get("status") or "").upper() in {"AVAILABLE", "COMPLETE", "OK"} and numeric:
-            out = dict(value)
-            out.update(status="AVAILABLE", approximation_allowed=False)
-            return out
+def _missing_volume_imbalance(
+    value: Any, reason: str
+) -> dict[str, Any]:
     return {
         "status": "MISSING",
         "source": value.get("source") if isinstance(value, Mapping) else None,
-        "missing_reason": (
-            value.get("missing_reason") if isinstance(value, Mapping) else None
-        ) or "exact_pit_volume_imbalance_absent",
+        "missing_reason": reason,
         "approximation_allowed": False,
     }
+
+
+def freeze_volume_imbalance(
+    value: Any, *, as_of: Any = None, require_as_of: bool = False
+) -> dict[str, Any]:
+    """Accept VI only with explicit, non-approximate PIT provenance."""
+    cutoff = _ts(as_of) if as_of not in (None, "") else None
+    if require_as_of and cutoff is None:
+        return _missing_volume_imbalance(value, "snapshot_as_of_missing_or_invalid")
+    if not isinstance(value, Mapping):
+        return _missing_volume_imbalance(value, "exact_pit_volume_imbalance_absent")
+
+    raw_status = value.get("status")
+    if not isinstance(raw_status, str) or raw_status.upper() not in {
+        "AVAILABLE", "COMPLETE", "OK"
+    }:
+        return _missing_volume_imbalance(value, "volume_imbalance_status_unavailable")
+
+    source = value.get("source")
+    if not isinstance(source, str) or not source.strip():
+        return _missing_volume_imbalance(value, "volume_imbalance_source_missing")
+
+    raw_ts = next(
+        (
+            value.get(key)
+            for key in ("as_of", "data_as_of", "timestamp", "observed_at", "time")
+            if value.get(key) not in (None, "")
+        ),
+        None,
+    )
+    observed = _ts(raw_ts)
+    if observed is None:
+        return _missing_volume_imbalance(
+            value, "volume_imbalance_timestamp_missing_or_invalid"
+        )
+    if cutoff is not None and observed > cutoff:
+        return _missing_volume_imbalance(value, "volume_imbalance_after_snapshot")
+
+    if any(
+        key in value and value.get(key) is not False
+        for key in ("approximation_allowed", "approximate", "is_approximate")
+    ) or ("exact" in value and value.get("exact") is not True):
+        return _missing_volume_imbalance(value, "volume_imbalance_approximation_disallowed")
+
+    numeric_keys = ("imbalance", "imbalance_ratio", "bid_volume", "ask_volume", "delta")
+    numeric = False
+    for key in numeric_keys:
+        if key not in value or value.get(key) in (None, ""):
+            continue
+        if _num(value.get(key)) is None:
+            return _missing_volume_imbalance(
+                value, "volume_imbalance_numeric_value_invalid"
+            )
+        numeric = True
+    if not numeric:
+        return _missing_volume_imbalance(value, "volume_imbalance_numeric_value_missing")
+
+    out = dict(value)
+    out.update(
+        status="AVAILABLE",
+        approximation_allowed=False,
+        exact=True,
+        pit_timestamp=observed.isoformat(),
+    )
+    return out
 
 
 def _empty_penetration(tf: str, boundary: Optional[float]) -> dict[str, Any]:
@@ -264,12 +383,17 @@ def measure_boundary_penetration(
 
 
 def _last_boundary_interaction(
-    rows: Any, *, boundary: Optional[float], side: str, as_of: Any, minutes: int
+    rows: Any, *, boundary: Optional[float], side: str, as_of: Any, minutes: int,
+    not_before: Optional[datetime] = None,
 ) -> Optional[dict[str, Any]]:
     if boundary is None:
         return None
     completed = completed_bars_as_of(rows or [], as_of=as_of, minutes=minutes)
     for row in reversed(completed):
+        if not_before is not None:
+            row_start = _row_ts(row)
+            if row_start is None or row_start < not_before:
+                continue
         h, l = _num(row.get("high")), _num(row.get("low"))
         if h is None or l is None:
             continue
@@ -285,13 +409,23 @@ def freeze_penetration(
     candles: Mapping[str, Any], as_of: Any,
 ) -> dict[str, Any]:
     boundary = _break_boundary(zone, side)
+    not_before = None
+    invalid_zone_timestamp = False
+    if isinstance(zone, Mapping) and zone.get("source_candle_end") not in (None, ""):
+        not_before = _ts(zone.get("source_candle_end"))
+        invalid_zone_timestamp = not_before is None
     results = {}
     for tf, minutes in (("5m", 5), ("15m", 15)):
         rows = candles.get(tf) or candles.get(tf.upper()) or (
             candles.get("15min") if tf == "15m" else []
         )
-        candle = _last_boundary_interaction(
-            rows, boundary=boundary, side=side, as_of=as_of, minutes=minutes
+        candle = None if invalid_zone_timestamp else _last_boundary_interaction(
+            rows,
+            boundary=boundary,
+            side=side,
+            as_of=as_of,
+            minutes=minutes,
+            not_before=not_before,
         )
         results[tf] = measure_boundary_penetration(
             side=side, boundary=boundary, candle=candle, timeframe=tf
@@ -316,30 +450,46 @@ def _nearest_opposing(zones: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
     if not active:
         return None
 
-    def distance(zone: Mapping[str, Any]) -> float:
+    def distance(zone: Mapping[str, Any]) -> Optional[float]:
         value = _num((zone.get("price_position") or {}).get("distance"))
-        return value if value is not None else float("inf")
+        return value
 
-    return min(active, key=distance)
+    ranked = [(distance(zone), zone) for zone in active]
+    ranked = [(value, zone) for value, zone in ranked if value is not None]
+    return min(ranked, key=lambda item: item[0])[1] if ranked else None
 
 
 def freeze_pullback_reclaim_rebreach(
     *, side: str, trigger: Any, candles: Mapping[str, Any],
-    as_of: Any, supplied_lineage: Any,
+    as_of: Any, supplied_lineage: Any, breach_at: Any = None,
 ) -> dict[str, Any]:
     """Completed-close sequence only; supplied lifecycle lineage stays separate."""
     t = _num(trigger)
+    breach_dt = _ts(breach_at) if breach_at not in (None, "") else None
     source_tf, rows = None, []
     for tf, minutes in (("5m", 5), ("15m", 15)):
         raw = candles.get(tf) or candles.get(tf.upper()) or (
             candles.get("15min") if tf == "15m" else []
         )
         completed = completed_bars_as_of(raw, as_of=as_of, minutes=minutes)
+        if breach_at not in (None, "") and breach_dt is None:
+            completed = []
+        elif breach_dt is not None:
+            completed = [
+                row for row in completed
+                if (_row_ts(row) is not None and _row_ts(row) >= breach_dt)
+            ]
         if completed:
             source_tf, rows = tf, completed
             break
     lineage = str(supplied_lineage or "UNKNOWN").upper()
-    if side not in {"CALL", "PUT"} or t is None or not rows:
+    if (
+        side not in {"CALL", "PUT"}
+        or t is None
+        or not rows
+        or breach_at in (None, "")
+        or breach_dt is None
+    ):
         return {
             "status": "MISSING", "source_timeframe": source_tf,
             "pullback_state": "UNKNOWN", "returned_to_pretrigger_side": None,
@@ -446,16 +596,14 @@ def freeze_breach_market_structure(
     candles = dict(ctx.get("candles") or ctx.get("ohlcv") or {})
     side = normalize_signal_side(sig.get("side") or sig.get("direction"))
     side = side if side in {"CALL", "PUT"} else "UNKNOWN"
-    price = _num(
-        sig.get("underlying_price") or sig.get("current_price")
-        or sig.get("current_underlying") or sig.get("breach_price")
-    )
     trigger_obj = sig.get("trigger") if isinstance(sig.get("trigger"), Mapping) else {}
     trigger = _num(
         sig.get("trigger_price") or sig.get("entry_trigger") or trigger_obj.get("entry")
     )
     as_of = data_as_of or sig.get("trigger_crossed_at") or sig.get("breach_at") or sig.get("data_as_of")
     parsed = _ts(as_of)
+    price, price_source = _frozen_breach_price(sig, as_of=as_of)
+    breach_at = sig.get("trigger_crossed_at") or sig.get("breach_at")
     zones = freeze_fvg_zones(
         side=side, price=price, candles=candles, as_of=as_of,
         tolerance=boundary_tolerance,
@@ -466,7 +614,7 @@ def freeze_breach_market_structure(
     )
     pullback = freeze_pullback_reclaim_rebreach(
         side=side, trigger=trigger, candles=candles, as_of=as_of,
-        supplied_lineage=sig.get("breach_lineage"),
+        supplied_lineage=sig.get("breach_lineage"), breach_at=breach_at,
     )
     regime = freeze_regime(sig, ctx)
     vi = volume_imbalance if volume_imbalance is not None else (
@@ -476,10 +624,13 @@ def freeze_breach_market_structure(
         "schema_version": SCHEMA_VERSION, "model_version": MODEL_VERSION,
         "observe_only": True, "affected_eligibility": False,
         "data_as_of": parsed.isoformat() if parsed else None,
-        "side": side, "underlying_price": price, "trigger_price": trigger,
+        "side": side, "underlying_price": price,
+        "underlying_price_source": price_source, "trigger_price": trigger,
         "session_policy": dict(SESSION_POLICY), "fvg_zones": zones,
         "relevant_opposing_fvg": zone, "fvg_penetration": penetration,
-        "volume_imbalance": freeze_volume_imbalance(vi),
+        "volume_imbalance": freeze_volume_imbalance(
+            vi, as_of=parsed, require_as_of=True
+        ),
         "pullback_reclaim_rebreach": pullback, "regime": regime,
         "setup": classify_setup(
             regime=regime, zone=zone, penetration=penetration, pullback=pullback

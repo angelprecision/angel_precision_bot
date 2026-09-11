@@ -5,6 +5,7 @@ from copy import deepcopy
 from ap.intelligence_breach_market_structure import (
     completed_bars_as_of,
     freeze_breach_market_structure,
+    freeze_penetration,
     freeze_volume_imbalance,
     fvg_position,
     measure_boundary_penetration,
@@ -38,6 +39,7 @@ def _signal(**updates) -> dict:
         "ticker": "NOW",
         "side": "PUT",
         "underlying_price": 130.50,
+        "breach_price": 130.50,
         "trigger_price": 130.50,
         "trigger_crossed_at": AS_OF,
         "breach_lineage": "INITIAL_BREACH",
@@ -58,6 +60,19 @@ def test_fvg_position_has_explicit_inside_above_below_boundary_states():
 def test_missing_as_of_cannot_admit_future_candles():
     rows = [_bar("2026-09-11T09:30:00-04:00", 1, 2, 1, 2)]
     assert completed_bars_as_of(rows, as_of=None, minutes=15) == []
+
+
+def test_naive_premarket_postmarket_and_misaligned_bars_are_excluded():
+    rows = [
+        _bar("2026-09-11T09:30:00", 1, 2, 1, 2),
+        _bar("2026-09-11T09:30:00+00:00", 1, 2, 1, 2),
+        _bar("2026-09-11T09:25:00-04:00", 1, 2, 1, 2),
+        _bar("2026-09-11T09:31:00-04:00", 1, 2, 1, 2),
+        _bar("2026-09-11T16:05:00-04:00", 1, 2, 1, 2),
+    ]
+    assert completed_bars_as_of(
+        rows, as_of="2026-09-11T16:30:00-04:00", minutes=15
+    ) == []
 
 
 def test_future_incomplete_4h_candle_cannot_invalidate_frozen_gap():
@@ -108,6 +123,37 @@ def test_now_shape_put_at_bullish_fvg_bottom_freezes_boundary_and_no_weak_break(
     assert frozen["affected_eligibility"] is False
 
 
+def test_breach_price_uses_only_explicit_frozen_evidence():
+    ctx = {"candles": {"4h": _bullish_fvg_4h(), "1h": []}}
+    frozen = freeze_breach_market_structure(
+        _signal(underlying_price=999.0, breach_price=130.50),
+        market_context=ctx,
+    )
+    assert frozen["underlying_price"] == 130.50
+    assert frozen["underlying_price_source"] == "signal.breach_price"
+
+    no_frozen_price = freeze_breach_market_structure(
+        _signal(underlying_price=130.50, breach_price=None),
+        market_context=ctx,
+    )
+    assert no_frozen_price["underlying_price"] is None
+    assert no_frozen_price["relevant_opposing_fvg"] is None
+
+
+def test_future_or_approximate_breach_evidence_is_missing():
+    ctx = {"candles": {"4h": _bullish_fvg_4h(), "1h": []}}
+    future = freeze_breach_market_structure(
+        _signal(
+            breach_price={
+                "price": 130.50,
+                "as_of": "2026-09-11T14:21:00+00:00",
+            }
+        ),
+        market_context=ctx,
+    )
+    assert future["underlying_price"] is None
+
+
 def test_put_strong_15m_body_break_records_50pct_strength_without_gating():
     candle = _bar(
         "2026-09-11T09:45:00-04:00",
@@ -156,7 +202,7 @@ def test_pullback_reclaim_rebreach_is_completed_close_sequence_not_tick_guess():
         _bar("2026-09-11T10:00:00-04:00", 130.6, 130.65, 130.2, 130.3),
     ]
     frozen = freeze_breach_market_structure(
-        _signal(),
+        _signal(trigger_crossed_at="2026-09-11T13:30:00+00:00"),
         market_context={
             "candles": {
                 "4h": _bullish_fvg_4h(),
@@ -164,12 +210,51 @@ def test_pullback_reclaim_rebreach_is_completed_close_sequence_not_tick_guess():
                 "15m": bars_15m,
             }
         },
+        data_as_of=AS_OF,
     )
     state = frozen["pullback_reclaim_rebreach"]
     assert state["source_timeframe"] == "15m"
     assert state["returned_to_pretrigger_side"] is True
     assert state["rebreach_after_pullback"] is True
     assert state["pullback_state"] == "RECLAIMING"
+
+
+def test_pullback_sequence_ignores_candles_before_supplied_breach_time():
+    bars_15m = [
+        _bar("2026-09-11T09:30:00-04:00", 130.7, 130.8, 130.3, 130.4),
+        _bar("2026-09-11T09:45:00-04:00", 130.4, 130.7, 130.3, 130.6),
+        _bar("2026-09-11T10:00:00-04:00", 130.6, 130.65, 130.2, 130.3),
+    ]
+    frozen = freeze_breach_market_structure(
+        _signal(),
+        market_context={"candles": {"4h": [], "1h": [], "15m": bars_15m}},
+        data_as_of=AS_OF,
+    )
+    state = frozen["pullback_reclaim_rebreach"]
+    assert state["status"] == "MISSING"
+    assert state["pullback_state"] == "UNKNOWN"
+
+
+def test_penetration_ignores_interaction_before_fvg_formation():
+    zone = {
+        "zone_id": "fvg_4h_test",
+        "direction": "bullish",
+        "alignment": "opposing",
+        "low": 130.50,
+        "high": 130.70,
+        "source_candle_end": "2026-09-11T14:00:00+00:00",
+    }
+    candle_before_zone = _bar(
+        "2026-09-11T13:30:00+00:00", 130.60, 130.65, 130.25, 130.30
+    )
+    frozen = freeze_penetration(
+        side="PUT",
+        zone=zone,
+        candles={"15m": [candle_before_zone]},
+        as_of="2026-09-11T14:30:00+00:00",
+    )
+    assert frozen["15m"]["status"] == "MISSING"
+    assert frozen["15m"]["strong_break_observed"] is False
 
 
 def test_vi_is_exact_or_missing_never_approximated():
@@ -188,6 +273,50 @@ def test_vi_is_exact_or_missing_never_approximated():
     assert exact["status"] == "AVAILABLE"
     assert exact["imbalance"] == 0.42
     assert exact["approximation_allowed"] is False
+    assert exact["exact"] is True
+    assert exact["pit_timestamp"] == "2026-09-11T14:20:00+00:00"
+
+
+def test_vi_requires_source_timestamp_and_non_approximate_flags():
+    assert freeze_volume_imbalance(
+        {"status": "AVAILABLE", "source": "pit", "imbalance": 0.1},
+        as_of=AS_OF,
+        require_as_of=True,
+    )["status"] == "MISSING"
+    assert freeze_volume_imbalance(
+        {
+            "status": "AVAILABLE",
+            "source": "pit",
+            "imbalance": 0.1,
+            "as_of": "2026-09-11T14:21:00+00:00",
+        },
+        as_of=AS_OF,
+        require_as_of=True,
+    )["status"] == "MISSING"
+    assert freeze_volume_imbalance(
+        {
+            "status": "AVAILABLE",
+            "source": "pit",
+            "imbalance": 0.1,
+            "as_of": AS_OF,
+            "approximation_allowed": "false",
+        },
+        as_of=AS_OF,
+        require_as_of=True,
+    )["status"] == "MISSING"
+
+
+def test_missing_price_does_not_select_an_arbitrary_opposing_zone():
+    frozen = freeze_breach_market_structure(
+        _signal(underlying_price=None, breach_price=None),
+        market_context={"candles": {"4h": _bullish_fvg_4h(), "1h": []}},
+    )
+    assert frozen["fvg_zones"]
+    assert all(
+        zone["price_position"]["status"] == "MISSING"
+        for zone in frozen["fvg_zones"]
+    )
+    assert frozen["relevant_opposing_fvg"] is None
 
 
 def test_regime_is_preserved_only_when_explicit_upstream_truth_exists():
