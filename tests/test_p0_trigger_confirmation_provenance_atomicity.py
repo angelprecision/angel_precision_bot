@@ -533,9 +533,10 @@ class _ScopedPostgres:
     @contextmanager
     def conn(self):
         import psycopg2
+        import psycopg2.extras
 
         connection = psycopg2.connect(self.url)
-        cursor = connection.cursor()
+        cursor = connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         try:
             cursor.execute(f'SET search_path TO "{self.schema}"')
             yield _CursorWrapper(cursor)
