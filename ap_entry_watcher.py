@@ -4133,6 +4133,16 @@ class APEntryWatcher:
         if not isinstance(_plan_metadata, dict):
             _plan_metadata = {}
         _plan_signal_id = str(getattr(plan, "signal_id", "") or "").strip()
+        if _recovery_rearm and not _materialization_resume and not _plan_signal_id:
+            self._last_reject_reason = RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+            log.critical(
+                "[%s] %s local_order_id=%s — refusing recovery rearm; "
+                "durable plan signal_id is missing",
+                str(getattr(plan, "ticker", "") or "?").upper(),
+                RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+                local_order_id or "?",
+            )
+            return False
         _plan_canonical_signal_id = str(
             getattr(plan, "canonical_signal_id", "")
             or _plan_metadata.get("canonical_signal_id")
