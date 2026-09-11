@@ -738,6 +738,13 @@ class ClientRunner(threading.Thread):
         self._deferred_recovery_supervisor_restart_requested = False
         self._deferred_recovery_supervisor_restart_reason = ""
         self._deferred_recovery_supervisor_restart_lock = threading.Lock()
+        # A stale scheduler whose child is still alive cannot be replaced
+        # safely from Python. Escalate that condition to the process/pod
+        # restart authority and permanently block an in-process replacement
+        # for this process lifetime.
+        self._deferred_recovery_process_restart_required = False
+        self._deferred_recovery_process_restart_reason = ""
+        self._deferred_recovery_process_restart_lock = threading.Lock()
         self.failure_reason: str = ""
         self._overnight_reeval_attempt_lock = threading.Lock()
         self._overnight_reeval_state_date = None
@@ -2803,10 +2810,11 @@ class ClientRunner(threading.Thread):
         readiness handshake is therefore the minimum prerequisite for the
         first entry unlock; no initial recovery tick is added here, which
         avoids replaying the same broad recovery boundary immediately after
-        startup recovery.  After that unlock, a dead or stale scheduler
-        requests one controlled replacement of this runner through the
-        existing supervisor. No in-runner replacement is created and no second
-        recovery executor can overlap the old one.
+        startup recovery. After that unlock, a dead scheduler requests one
+        controlled replacement of this runner through the existing supervisor.
+        A stale scheduler whose child is still alive escalates to the
+        process/pod restart authority instead. No in-runner replacement is
+        created and no second recovery executor can overlap the old one.
         Durable CAS in the canonical recovery/execution path remains the
         authority; this thread is only a timer and caller boundary.
         """
@@ -2932,8 +2940,9 @@ class ClientRunner(threading.Thread):
                 # runner shutdown must publish a critical deferred-recovery
                 # health fault. Before the first entry unlock the direct
                 # permission gate turns that fault into a startup hold; after
-                # startup the health path requests one controlled supervisor
-                # replacement and never starts an overlapping child here.
+                # startup a dead child uses the controlled supervisor path,
+                # while a stale live child escalates to process/pod restart;
+                # neither path starts an overlapping child here.
                 _ready_event.clear()
                 if not self.stopping.is_set() and not self.stopped.is_set() and not self.failed.is_set():
                     self._mark_deferred_recovery_scheduler_unhealthy(
@@ -3002,6 +3011,45 @@ class ClientRunner(threading.Thread):
                 _reason.upper(),
             )
 
+    def _request_deferred_recovery_process_restart(self, reason: str) -> bool:
+        """Escalate a stale, still-alive child to process/pod restart.
+
+        Python cannot safely terminate a thread blocked inside the canonical
+        recovery boundary. Stopping the runner still clears entry permission,
+        but the registry must retain its tombstone and the supervisor must not
+        construct a replacement runner while this process still owns the old
+        recovery consumer. The process/pod supervisor is the only authority
+        that can safely remove the stuck child.
+        """
+        _lock = getattr(self, "_deferred_recovery_process_restart_lock", None)
+        if _lock is None:
+            with _registry_lock:
+                _lock = getattr(
+                    self, "_deferred_recovery_process_restart_lock", None
+                )
+                if _lock is None:
+                    _lock = threading.Lock()
+                    self._deferred_recovery_process_restart_lock = _lock
+
+        with _lock:
+            if getattr(self, "_deferred_recovery_process_restart_required", False):
+                return False
+            self._deferred_recovery_process_restart_required = True
+            self._deferred_recovery_process_restart_reason = str(reason or "unknown")
+
+        # Make the money-path hold explicit before asking the runner to stop.
+        self.entries_allowed.clear()
+        logger.critical(
+            "[%s] DEFERRED_RECOVERY_PROCESS_RESTART_REQUIRED reason=%s — "
+            "scheduler child is stale but still alive; no in-process runner "
+            "replacement or second recovery consumer is safe; durable rows "
+            "remain untouched until the process/pod restart authority acts",
+            self.email,
+            reason,
+        )
+        self.stop()
+        return True
+
     def _request_deferred_recovery_supervisor_restart(self, reason: str) -> bool:
         """Stop this runner once so the existing supervisor can replace it.
 
@@ -3050,6 +3098,11 @@ class ClientRunner(threading.Thread):
         a startup recovery hold. Row-level errors remain visible and scoped to
         their rows.
         """
+        # Once a live stale child has escalated to process/pod restart, a late
+        # return from that child must not clear the incident or re-admit the
+        # runner. The external restart is the only supported recovery.
+        if getattr(self, "_deferred_recovery_process_restart_required", False):
+            return
         _health_reasons = getattr(
             self, "deferred_recovery_scheduler_health_reasons", None
         )
@@ -3108,11 +3161,18 @@ class ClientRunner(threading.Thread):
         *,
         startup_required: bool = False,
     ) -> bool:
-        """Check the one scheduler and request one supervised replacement on liveness loss."""
+        """Check the one scheduler and escalate liveness loss safely.
+
+        A dead child can use the existing one-runner supervisor replacement.
+        A stale child that is still alive may be blocked in canonical
+        recovery, so the only safe restart authority is the process or pod
+        supervisor. Never claim that an in-process replacement can heal that
+        condition.
+        """
         _scope = (
             "blocking the initial entry unlock"
             if startup_required
-            else "requesting one controlled supervisor replacement without an overlapping scheduler"
+            else "using the dead-child supervisor path or process/pod restart escalation for a stale live child"
         )
 
         def _fault(reason: str, message: str, *args) -> bool:
@@ -3120,12 +3180,20 @@ class ClientRunner(threading.Thread):
             self._mark_deferred_recovery_scheduler_unhealthy(reason)
             if startup_required:
                 self._enter_degraded_mode(reason, stop_runner=False)
+            elif reason == "deferred_recovery_scheduler_stale":
+                self._request_deferred_recovery_process_restart(reason)
             elif reason in {
                 "deferred_recovery_scheduler_dead",
                 "deferred_recovery_scheduler_not_ready",
-                "deferred_recovery_scheduler_stale",
             }:
                 self._request_deferred_recovery_supervisor_restart(reason)
+            return False
+
+        if getattr(self, "_deferred_recovery_process_restart_required", False):
+            self.entries_allowed.clear()
+            self._mark_deferred_recovery_scheduler_unhealthy(
+                "deferred_recovery_scheduler_stale"
+            )
             return False
 
         _thread = getattr(self, "deferred_recovery_thread", None)
@@ -3350,21 +3418,32 @@ class ClientRunner(threading.Thread):
                     and self.deferred_recovery_thread.is_alive()
                 )
                 _restart_wait = (
-                    getattr(
-                        self,
-                        "_deferred_recovery_supervisor_restart_requested",
-                        False,
+                    getattr(self, "_deferred_recovery_process_restart_required", False)
+                    or (
+                        getattr(
+                            self,
+                            "_deferred_recovery_supervisor_restart_requested",
+                            False,
+                        )
+                        and _deferred_child_alive
                     )
-                    and _deferred_child_alive
                 )
                 if current is self and not _restart_wait:
                     _active_runners.pop(self.email, None)
                 elif current is self and _restart_wait:
-                    logger.warning(
-                        "[%s] retaining stopped runner registry tombstone until "
-                        "deferred scheduler exits before supervisor replacement",
-                        self.email,
-                    )
+                    if getattr(self, "_deferred_recovery_process_restart_required", False):
+                        logger.critical(
+                            "[%s] retaining stopped runner registry tombstone; "
+                            "process/pod restart required before any replacement "
+                            "can be created",
+                            self.email,
+                        )
+                    else:
+                        logger.warning(
+                            "[%s] retaining stopped runner registry tombstone until "
+                            "deferred scheduler exits before supervisor replacement",
+                            self.email,
+                        )
             logger.info("[%s] ClientRunner stopped.", self.email)
 
     def _run_inner(self):
@@ -5506,7 +5585,9 @@ def _fetch_active_members(sb: Client) -> list[dict]:
 
 
 def _deferred_restart_waiting(runner: ClientRunner) -> bool:
-    """True while a stopped runner's old deferred scheduler is still alive."""
+    """True while no in-process replacement is safe for this runner."""
+    if getattr(runner, "_deferred_recovery_process_restart_required", False):
+        return True
     return bool(
         getattr(runner, "_deferred_recovery_supervisor_restart_requested", False)
         and getattr(runner, "deferred_recovery_thread", None)
@@ -5533,11 +5614,23 @@ def _sync_runners(sb: Client):
         for email, runner in list(_active_runners.items()):
             if not runner.is_alive():
                 if _deferred_restart_waiting(runner):
-                    logger.warning(
-                        "[%s] deferred scheduler still exiting; supervisor will "
-                        "delay replacement to prevent overlapping recovery consumers",
-                        email,
-                    )
+                    if getattr(
+                        runner,
+                        "_deferred_recovery_process_restart_required",
+                        False,
+                    ):
+                        logger.critical(
+                            "[%s] deferred scheduler stale/alive escalation is "
+                            "active; process/pod restart required and supervisor "
+                            "will not create a replacement runner",
+                            email,
+                        )
+                    else:
+                        logger.warning(
+                            "[%s] deferred scheduler still exiting; supervisor will "
+                            "delay replacement to prevent overlapping recovery consumers",
+                            email,
+                        )
                     continue
                 logger.warning("Removing dead runner from registry: %s", email)
                 _active_runners.pop(email, None)
@@ -5557,10 +5650,22 @@ def _sync_runners(sb: Client):
                     )
                 continue
             if existing and _deferred_restart_waiting(existing):
-                logger.warning(
-                    "[%s] replacement deferred until the prior scheduler exits",
-                    email,
-                )
+                if getattr(
+                    existing,
+                    "_deferred_recovery_process_restart_required",
+                    False,
+                ):
+                    logger.critical(
+                        "[%s] replacement blocked: stale deferred scheduler "
+                        "requires process/pod restart; no in-process recovery "
+                        "consumer will be created",
+                        email,
+                    )
+                else:
+                    logger.warning(
+                        "[%s] replacement deferred until the prior scheduler exits",
+                        email,
+                    )
                 continue
             if existing and not existing.is_alive():
                 _active_runners.pop(email, None)
@@ -5756,6 +5861,12 @@ def get_runner_status() -> list[dict]:
                 "fill_monitor_alive": getattr(r, "fill_monitor_thread", None) is not None and r.fill_monitor_thread.is_alive(),
                 "equity_alive": getattr(r, "equity_thread", None) is not None and r.equity_thread.is_alive(),
                 "mode": getattr(r, "mode", "PAPER"),
+                "deferred_recovery_process_restart_required": bool(
+                    getattr(r, "_deferred_recovery_process_restart_required", False)
+                ),
+                "deferred_recovery_process_restart_reason": getattr(
+                    r, "_deferred_recovery_process_restart_reason", ""
+                ),
                 "ready_for_entries": (
                     r.is_alive()
                     and r.initialized.is_set()

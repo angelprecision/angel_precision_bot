@@ -161,6 +161,12 @@ def _runner() -> object:
     runner.deferred_recovery_scheduler_healthy = threading.Event()
     runner.deferred_recovery_scheduler_health_reasons = set()
     runner._deferred_recovery_scheduler_startup_gate_open = False
+    runner._deferred_recovery_supervisor_restart_requested = False
+    runner._deferred_recovery_supervisor_restart_reason = ""
+    runner._deferred_recovery_supervisor_restart_lock = threading.Lock()
+    runner._deferred_recovery_process_restart_required = False
+    runner._deferred_recovery_process_restart_reason = ""
+    runner._deferred_recovery_process_restart_lock = threading.Lock()
     runner.deferred_recovery_started_ts = 0.0
     runner.last_deferred_recovery_completed_ts = 0.0
     runner.last_deferred_recovery_success_ts = 0.0
@@ -504,8 +510,8 @@ def test_runtime_scheduler_health_requests_one_supervised_runner_restart():
     }
 
 
-def test_runtime_stale_scheduler_requests_supervised_runner_restart_without_dead_handle():
-    """A live but stale child is restarted once; it is never overlapped."""
+def test_runtime_stale_scheduler_escalates_process_restart_without_dead_handle():
+    """A live but stale child cannot be healed by an in-process replacement."""
     runner = _runner()
     runner.stopping = threading.Event()
     runner.stopped = threading.Event()
@@ -522,10 +528,94 @@ def test_runtime_stale_scheduler_requests_supervised_runner_restart_without_dead
     assert not runner.entries_allowed.is_set()
     assert runner.stopping.is_set()
     assert runner.stopped.is_set()
-    assert runner._deferred_recovery_supervisor_restart_requested is True
+    assert runner._deferred_recovery_supervisor_restart_requested is False
+    assert runner._deferred_recovery_process_restart_required is True
+    assert (
+        runner._deferred_recovery_process_restart_reason
+        == "deferred_recovery_scheduler_stale"
+    )
     assert runner.deferred_recovery_scheduler_health_reasons == {
         "deferred_recovery_scheduler_stale"
     }
+
+
+def test_live_stale_scheduler_escalates_without_second_recovery_consumer(
+    monkeypatch,
+):
+    """A hung canonical tick holds the row and reaches process restart escalation."""
+    runner = _runner()
+    runner.stopped = threading.Event()
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    runner.entries_allowed.set()
+    runner._deferred_recovery_scheduler_startup_gate_open = True
+    runner.broker = MagicMock()
+    runner.core = types.SimpleNamespace(entry_watcher=MagicMock(), exit_eng=MagicMock())
+    runner.order_state_machine = MagicMock()
+    runner.position_manager = MagicMock()
+    runner.master_control = types.SimpleNamespace(mode="LIVE")
+    durable_row = {
+        "local_order_id": "stale-live-retry-1",
+        "client_id": runner.email,
+        "execution_mode": "live",
+        "status": "PENDING_TRIGGER",
+        "materialization_status": "RETRY_PENDING",
+        "materialization_generation": 7,
+        "retry_attempt": 2,
+    }
+    recovery_entered = threading.Event()
+    release_recovery = threading.Event()
+    recovery_calls: list[int] = []
+
+    class _HungRecovery:
+        def __init__(self, **kwargs):
+            assert kwargs["client_id"] == durable_row["client_id"]
+            assert kwargs["master_control"].mode == "LIVE"
+
+        def recover_deferred_lifecycles(self):
+            recovery_calls.append(1)
+            recovery_entered.set()
+            release_recovery.wait(timeout=3)
+            return {"deferred_lifecycles_recovered": 0, "errors": []}
+
+    monkeypatch.setattr(cr, "APStartupRecovery", _HungRecovery)
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "1")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    assert recovery_entered.wait(timeout=2)
+    first_scheduler = runner.deferred_recovery_thread
+    runner.deferred_recovery_started_ts = 10.0
+    runner.last_deferred_recovery_completed_ts = 20.0
+    runner.deferred_recovery_heartbeat_max_sec = 5.0
+
+    assert runner._check_deferred_recovery_scheduler_health(now=100.0) is False
+    assert not runner.entries_allowed.is_set()
+    assert runner.stopping.is_set()
+    assert runner.stopped.is_set()
+    assert runner._deferred_recovery_process_restart_required is True
+    assert runner._deferred_recovery_supervisor_restart_requested is False
+    assert first_scheduler.is_alive()
+
+    # The old child remains the sole consumer while the canonical call is
+    # hung. A later start attempt cannot create a second scheduler or invoke
+    # recovery again, and the durable retry row is untouched.
+    runner._start_deferred_breach_lifecycle_scheduler()
+    assert runner.deferred_recovery_thread is first_scheduler
+    assert recovery_calls == [1]
+    assert durable_row["materialization_status"] == "RETRY_PENDING"
+    runner.broker.submit_order.assert_not_called()
+    runner.broker.submit_entry.assert_not_called()
+
+    release_recovery.set()
+    first_scheduler.join(timeout=2)
+    assert not first_scheduler.is_alive()
+    assert recovery_calls == [1]
+
+    # A late return cannot heal a process-restart escalation or re-open entries.
+    runner.deferred_recovery_scheduler_ready.set()
+    assert runner._check_deferred_recovery_scheduler_health(now=time.time()) is False
+    assert not runner.entries_allowed.is_set()
+    assert runner._deferred_recovery_process_restart_required is True
 
 
 def test_runtime_set_entry_permission_requests_supervised_replacement_after_scheduler_fault():
@@ -614,6 +704,53 @@ def test_supervisor_waits_for_old_deferred_scheduler_before_replacement(monkeypa
     cr._sync_runners(object())
     assert len(created) == 1
     assert cr._active_runners[email] is created[0]
+
+
+def test_supervisor_does_not_replace_process_restart_tombstone(monkeypatch):
+    """A stale-live escalation waits for the external process restart authority."""
+    email = "jasoncosby1@gmail.com"
+    old_runner = _runner()
+    old_runner.email = email
+    old_runner.is_alive = lambda: False
+    old_runner.stopping = threading.Event()
+    old_runner.stopping.set()
+    old_runner._deferred_recovery_process_restart_required = True
+    scheduler_alive = [True]
+    old_runner.deferred_recovery_thread = types.SimpleNamespace(
+        is_alive=lambda: scheduler_alive[0]
+    )
+    monkeypatch.setattr(cr, "_active_runners", {email: old_runner})
+    monkeypatch.setattr(
+        cr,
+        "_fetch_active_members",
+        lambda _sb: [{"email": email}],
+    )
+
+    created: list[object] = []
+
+    class _Replacement:
+        def __init__(self, member):
+            self.email = member["email"]
+            created.append(self)
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return True
+
+    monkeypatch.setattr(cr, "ClientRunner", _Replacement)
+
+    cr._sync_runners(object())
+    assert created == []
+    assert cr._active_runners[email] is old_runner
+
+    # Even if the blocked child later exits, this process-level escalation does
+    # not silently downgrade into an in-process replacement.
+    scheduler_alive[0] = False
+    cr._sync_runners(object())
+    assert created == []
+    assert cr._active_runners[email] is old_runner
 
 
 def _permission_runner() -> object:
