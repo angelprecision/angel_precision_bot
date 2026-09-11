@@ -241,7 +241,7 @@ def test_provenance_with_unexpected_key_is_held(canonical_retry_row):
     retry_dispatch = MagicMock()
     recovery._handle_retryable = retry_dispatch
 
-    assert recovery.recover_one_row(canonical_retry_row) == _RowOutcome.TERMINALIZED
+    assert recovery.recover_one_row(canonical_retry_row) == _RowOutcome.UNRESOLVED
     retry_dispatch.assert_not_called()
 
 
