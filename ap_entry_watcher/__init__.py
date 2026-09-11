@@ -640,6 +640,66 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             )
         with self._watch_admission_gate:
             incoming_key = self._ownership_key(signal)
+            if (signal or {}).get("__recovered_trigger_ready") is True:
+                if incoming_key is None:
+                    return self._block(
+                        signal,
+                        None,
+                        "recovered_trigger_ready_conflict_hold",
+                        "recovered_trigger_ready_conflict_hold:ownership_identity_missing",
+                    )
+                incoming_local_order_id = str(
+                    (signal or {}).get("local_order_id") or ""
+                ).strip()
+                incoming_signal_id = str(
+                    (signal or {}).get("signal_id") or ""
+                ).strip()
+                incoming_canonical_signal_id = str(
+                    (signal or {}).get("canonical_signal_id") or ""
+                ).strip()
+                with self._lock:
+                    incumbents = [
+                        item
+                        for item in self._pending
+                        if (
+                            item.is_active
+                            or getattr(item, "rearm_mode", False)
+                            or getattr(item, "state", None) == WatchState.TRIGGERED
+                            or bool(getattr(item, "_ownership_quarantine", False))
+                        )
+                        and str(getattr(item, "ticker", "") or "").upper().strip()
+                        == ticker
+                        and (
+                            self._ownership_key(item) is None
+                            or self._ownership_key(item) == incoming_key
+                        )
+                    ]
+                for incumbent in incumbents:
+                    existing = self._identity(incumbent)
+                    same_exact_owner = (
+                        self._ownership_key(incumbent) == incoming_key
+                        and existing.local_order_id == incoming_local_order_id
+                        and existing.signal_id == incoming_signal_id
+                        and existing.canonical_signal_id == incoming_canonical_signal_id
+                        and existing.ticker == ticker
+                        and existing.side == side
+                    )
+                    if not same_exact_owner:
+                        return self._block(
+                            signal,
+                            incumbent,
+                            "recovered_trigger_ready_conflict_hold",
+                            "recovered_trigger_ready_conflict_hold:incumbent_owned",
+                        )
+                # Recovered trigger-ready admission is already fenced by the
+                # exact incumbent scan above.  Delegate only to the base
+                # registration path so package-level replacement, pruning,
+                # direction claims, and conflict cancellation cannot touch an
+                # existing watcher on this marker-only path.
+                return super().add_signal(
+                    signal,
+                    registration_provenance_out=registration_provenance_out,
+                )
             if incoming_key is None:
                 # A standalone legacy watcher may still be admitted without a
                 # client/mode key.  Once another same-ticker watcher exists,

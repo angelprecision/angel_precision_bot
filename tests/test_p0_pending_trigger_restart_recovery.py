@@ -1766,44 +1766,46 @@ class TestMaterializationInFlightFence:
         )
         assert summary["materialization_in_flight_count"] == 1
 
-    # ── Negative control 1: trigger_ready with NO materialization → STUCK ─────
+    # ── Negative control 1: ambiguous trigger_ready is held ──────────────────
 
     def test_nc1_trigger_ready_no_mat_meta_is_stuck(self):
-        """trigger_ready + no materialization metadata → STUCK (terminalized)."""
+        """trigger_ready without durable authority → STUCK shape is held."""
         row = _tmo_row(meta={"watcher_audit": {"reason_code": "trigger_ready"},
                               "trigger_price": 151.50})
         rec, osm = self._live_recovery(row)
         outcome = rec.recover_one_row(row)
-        assert outcome == _RowOutcome.TERMINALIZED, f"got {outcome}"
-        assert len(osm.cancel_calls) == 1
+        assert outcome == _RowOutcome.UNRESOLVED, f"got {outcome}"
+        assert len(osm.cancel_calls) == 0
 
     # ── Negative control 2: materialization_in_flight=false not protected ─────
 
     def test_nc2_in_flight_false_not_protected(self):
-        """materialization_in_flight=False → not protected → STUCK."""
+        """materialization_in_flight=False → not protected → held as STUCK."""
         meta = _inflight_meta(in_flight=False)
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
         outcome = rec.recover_one_row(row)
-        assert outcome == _RowOutcome.TERMINALIZED, f"got {outcome}"
+        assert outcome == _RowOutcome.UNRESOLVED, f"got {outcome}"
+        assert len(osm.cancel_calls) == 0
 
     # ── Negative control 3: lifecycle_state missing / wrong ──────────────────
 
     @pytest.mark.parametrize("bad_state", ["", None, "PENDING_TRIGGER", "SUBMITTED"])
     def test_nc3_wrong_lifecycle_state_not_protected(self, bad_state):
-        """lifecycle_state != MATERIALIZING → not protected."""
+        """lifecycle_state != MATERIALIZING → not protected; hold STUCK."""
         meta = _inflight_meta(lifecycle_state=bad_state or "")
         meta["lifecycle_state"] = bad_state  # allow None to reach the check
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
         outcome = rec.recover_one_row(row)
-        assert outcome == _RowOutcome.TERMINALIZED, f"bad_state={bad_state!r} got {outcome}"
+        assert outcome == _RowOutcome.UNRESOLVED, f"bad_state={bad_state!r} got {outcome}"
+        assert len(osm.cancel_calls) == 0
 
     # ── Negative control 4: materialization_status missing ───────────────────
 
     @pytest.mark.parametrize("bad_status", ["", None, "RETRY_PENDING", "COMPLETED"])
     def test_nc4_wrong_mat_status_not_protected(self, bad_status):
-        """materialization_status != RUNNING → not protected."""
+        """materialization_status != RUNNING → not protected; hold STUCK."""
         meta = _inflight_meta(mat_status=bad_status or "RUNNING")
         if bad_status is None:
             meta.pop("materialization_status", None)
@@ -1814,7 +1816,8 @@ class TestMaterializationInFlightFence:
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
         outcome = rec.recover_one_row(row)
-        assert outcome == _RowOutcome.TERMINALIZED, f"bad_status={bad_status!r} got {outcome}"
+        assert outcome == _RowOutcome.UNRESOLVED, f"bad_status={bad_status!r} got {outcome}"
+        assert len(osm.cancel_calls) == 0
 
     # ── Negative control 5: RETRY_PENDING uses existing retry behavior ────────
 
@@ -1840,88 +1843,95 @@ class TestMaterializationInFlightFence:
         "FAILED_TERMINAL",
     ])
     def test_nc6_terminal_outcome_wins(self, terminal_outcome):
-        """Terminal materialization_outcome wins over stale in-flight flags."""
+        """Trigger-ready ambiguity remains held despite stale terminal flags."""
         meta = _inflight_meta(outcome=terminal_outcome)
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
         outcome = rec.recover_one_row(row)
-        # terminal outcome → STUCK_TERMINAL_MATERIALIZATION → terminalized
-        assert outcome == _RowOutcome.TERMINALIZED, (
-            f"terminal_outcome={terminal_outcome!r} should terminate; got {outcome}"
+        assert outcome == _RowOutcome.UNRESOLVED, (
+            f"terminal_outcome={terminal_outcome!r} must remain held; got {outcome}"
         )
+        assert len(osm.cancel_calls) == 0
 
     # ── Negative control 7: owner missing / blank ─────────────────────────────
 
     @pytest.mark.parametrize("bad_owner", ["", None, "   "])
     def test_nc7_owner_missing_not_protected(self, bad_owner):
-        """materialization_owner missing/blank → not protected."""
+        """materialization_owner missing/blank → not protected; hold STUCK."""
         meta = _inflight_meta(owner=bad_owner or "")
         if bad_owner is None:
             meta.pop("materialization_owner", None)
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
         outcome = rec.recover_one_row(row)
-        assert outcome == _RowOutcome.TERMINALIZED, f"bad_owner={bad_owner!r} got {outcome}"
+        assert outcome == _RowOutcome.UNRESOLVED, f"bad_owner={bad_owner!r} got {outcome}"
+        assert len(osm.cancel_calls) == 0
 
     # ── Negative control 8: generation missing / zero / negative / bool ───────
 
     @pytest.mark.parametrize("bad_gen", [0, -1, None, True, False, "abc"])
     def test_nc8_bad_generation_not_protected(self, bad_gen):
-        """Invalid materialization_generation → not protected."""
+        """Invalid materialization_generation → not protected; hold STUCK."""
         meta = _inflight_meta(generation=bad_gen if bad_gen != 0 else 1)
         meta["materialization_generation"] = bad_gen
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
         outcome = rec.recover_one_row(row)
-        assert outcome == _RowOutcome.TERMINALIZED, f"bad_gen={bad_gen!r} got {outcome}"
+        assert outcome == _RowOutcome.UNRESOLVED, f"bad_gen={bad_gen!r} got {outcome}"
+        assert len(osm.cancel_calls) == 0
 
     # ── Negative control 9: lease missing / malformed / naive / expired ───────
 
     def test_nc9a_lease_missing_not_protected(self):
-        """No lease field → not protected."""
+        """No lease field → not protected; hold STUCK."""
         meta = _inflight_meta()
         meta.pop("materialization_lease_until", None)
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
-        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert len(osm.cancel_calls) == 0
 
     def test_nc9b_lease_malformed_not_protected(self):
-        """Unparseable lease → not protected."""
+        """Unparseable lease → not protected; hold STUCK."""
         meta = _inflight_meta()
         meta["materialization_lease_until"] = "not-a-datetime"
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
-        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert len(osm.cancel_calls) == 0
 
     def test_nc9c_lease_naive_not_protected(self):
-        """Timezone-naive lease → not protected."""
+        """Timezone-naive lease → not protected; hold STUCK."""
         from datetime import datetime, timedelta
         naive = (datetime.utcnow() + timedelta(minutes=5)).isoformat()  # no tz
         meta = _inflight_meta()
         meta["materialization_lease_until"] = naive
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
-        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert len(osm.cancel_calls) == 0
 
     def test_nc9d_lease_expired_not_protected(self):
-        """Expired lease (in the past) → not protected."""
+        """Expired lease (in the past) → not protected; hold STUCK."""
         from datetime import datetime, timezone, timedelta
         expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
         meta = _inflight_meta()
         meta["materialization_lease_until"] = expired
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
-        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert len(osm.cancel_calls) == 0
 
     # ── Negative control 10: terminal outcome + stale in-flight ──────────────
 
     def test_nc10_terminal_outcome_plus_stale_inflight_still_terminal(self):
-        """Terminal outcome overrides all in-flight flags."""
+        """Trigger-ready ambiguity stays held with stale in-flight flags."""
         meta = _inflight_meta(outcome="TERMINAL_NO_TRADEABLE_CONTRACT")
         # in_flight=True and all proof fields still present
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
-        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert len(osm.cancel_calls) == 0
 
     # ── Negative control 11: wrong client_id fails closed ─────────────────────
 
@@ -2001,11 +2011,12 @@ class TestMaterializationInFlightFence:
     # ── Negative control 14: stale generation cannot protect newer state ──────
 
     def test_nc14_zero_generation_not_protected(self):
-        """generation=0 is not a positive integer → not protected."""
+        """generation=0 is not a positive integer → not protected; hold STUCK."""
         meta = _inflight_meta(generation=0)
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
-        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert len(osm.cancel_calls) == 0
 
     # ── Negative control 15: broker id / submit evidence stays in broker auth ─
 
