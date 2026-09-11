@@ -19,6 +19,28 @@ BLOCKER FIXES (PR #328 amendment):
   B4: registry proof requires 6-way identity + state + dedup; structured result
   B5: terminalize rereads order and verifies terminal status before counting
   B6: watch() failure → terminalize OR unresolved, never both
+
+── PR #580 — recovery-provenance contract (2026-09-04) ─────────────────
+This module is the sole caller responsible for proving that a watcher
+being reconstructed is the exact durable owner eligible for reattachment.
+It calls ap_entry_watcher.APEntryWatcher.watch(recovery_rearm=True), which:
+
+  1. runs recovery_trigger_evidence_identity_is_proven() to gate on
+     exact 6-way identity (canonical_signal_id, client_id, execution_mode,
+     signal_id, local_order_id, trigger_crossed_at provenance),
+  2. stamps signal_dict["__recovery_rearm"] = True as the private
+     recovery-provenance marker,
+  3. hands the signal_dict to add_signal(), which — and only if the
+     marker is present — invokes _restore_recovered_watcher_lifecycle()
+     to restore in-memory lifecycle ownership via the existing
+     ap_lifecycle API. Ordinary recovery restores NONE -> ADOPTED ->
+     WATCHING; an exact durable TRIGGER_READY row restores the same
+     trigger-ready lifecycle and is dispatched only through the durable
+     attempt-token fence.
+
+Ordinary (non-recovery) admissions do not carry the marker and are
+not touched by the bridge. See:
+  docs/pr_specs/p0_post_outage_trigger_lifecycle_convergence_20260904.md
 """
 
 from __future__ import annotations
@@ -26,10 +48,12 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, Optional
 
 from ap.logger import get_logger
+from ap.order_state_machine import recovery_trigger_dispatch_claim_is_stale
 from ap_entry_watcher import (
     RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
     recovery_trigger_evidence_identity_is_proven,
@@ -39,6 +63,10 @@ from ap.pending_trigger_classifier import (
     classify_pending_trigger_row,
     has_broker_handoff_evidence,
     is_active_materialization_in_flight,
+    _DEC_ZERO,
+    _parse_iso_classifier,
+    _persisted_value_is_absent,
+    _safe_decimal,
 )
 from ap.selector_retry_policy import (
     DeferredMaterializationConfigConflict,
@@ -46,6 +74,207 @@ from ap.selector_retry_policy import (
 )
 
 log = get_logger("ap.pending_trigger_restart_recovery")
+
+
+def is_durable_trigger_ready_row(row: dict) -> bool:
+    """Return true only for a complete, exact durable trigger-ready row.
+
+    The public classifier retains its conservative ``STUCK_TRIGGER_READY``
+    label for ordinary cleanup consumers.  This narrower restart predicate is
+    the #580 exception: process-memory loss is resumable only when the row
+    itself proves identity, trigger evidence, economic geometry, and matching
+    positive generations.  Every populated top-level/meta/metadata alias is
+    an authority; malformed or contradictory values hold.
+    """
+    if not isinstance(row, dict):
+        return False
+    if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+        return False
+    if str(row.get("kind") or "ENTRY").strip().upper() != "ENTRY":
+        return False
+    if any(
+        not _persisted_value_is_absent(row.get(field))
+        for field in ("broker_order_id", "submitted_ts", "filled_ts")
+    ):
+        return False
+
+    sources: list[dict] = [row]
+    for key in ("meta", "metadata"):
+        if key not in row:
+            continue
+        raw = row.get(key)
+        if isinstance(raw, dict):
+            sources.append(raw)
+        elif isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                return False
+            if not isinstance(parsed, dict):
+                return False
+            sources.append(parsed)
+        else:
+            return False
+
+    def _values(aliases: tuple[str, ...]) -> list:
+        return [
+            source.get(alias)
+            for source in sources
+            for alias in aliases
+            if alias in source
+        ]
+
+    def _string(aliases: tuple[str, ...]) -> str | None:
+        values = _values(aliases)
+        if (
+            not values
+            or any(
+                not isinstance(value, str) or not value or value != value.strip()
+                for value in values
+            )
+            or len(set(values)) != 1
+        ):
+            return None
+        return values[0]
+
+    local_order_id = _string(("local_order_id",))
+    signal_id = _string(("signal_id",))
+    canonical_signal_id = _string(("canonical_signal_id",))
+    client_id = _string(("client_id", "client_email"))
+    execution_mode = _string(("execution_mode", "mode"))
+    ticker = _string(("ticker", "symbol"))
+    side = _string(("side", "direction"))
+    if not all((local_order_id, signal_id, canonical_signal_id, client_id, ticker)):
+        return False
+    if (
+        client_id != client_id.lower()
+        or execution_mode not in {"live", "paper"}
+        or ticker != ticker.upper()
+        or side not in {"CALL", "PUT"}
+    ):
+        return False
+
+    def _generation(aliases: tuple[str, ...]) -> int | None:
+        values = _values(aliases)
+        if not values:
+            return None
+        parsed: list[int] = []
+        for value in values:
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, int):
+                item = value
+            elif isinstance(value, str) and value.isascii() and value.isdigit():
+                item = int(value)
+            else:
+                return None
+            if item <= 0:
+                return None
+            parsed.append(item)
+        return parsed[0] if len(set(parsed)) == 1 else None
+
+    materialization_generation = _generation(
+        ("materialization_generation", "generation")
+    )
+    trigger_generation = _generation(("trigger_generation",))
+    if (
+        materialization_generation is None
+        or trigger_generation is None
+        or materialization_generation != trigger_generation
+    ):
+        return False
+
+    audit_reasons: list[object] = []
+    for source in sources:
+        audit = source.get("watcher_audit")
+        if audit is not None:
+            if not isinstance(audit, dict):
+                return False
+            audit_reasons.append(audit.get("reason_code"))
+    if not audit_reasons or any(reason != "trigger_ready" for reason in audit_reasons):
+        return False
+
+    for source in sources:
+        for key in (
+            "watcher_invalidation_reason",
+            "watcher_invalidation_class",
+            "materialization_outcome",
+            "materialization_owner",
+            "materialization_lease_until",
+            "submit_intent_at",
+            "broker_submit_key",
+            "broker_submit_payload_hash",
+            "recovery_submit_owner",
+        ):
+            if not _persisted_value_is_absent(source.get(key)):
+                return False
+        broker_ready = source.get("broker_ready")
+        if broker_ready is not None and broker_ready is not False and not (
+            isinstance(broker_ready, str) and broker_ready.strip().lower() == "false"
+        ):
+            return False
+        in_flight = source.get("materialization_in_flight")
+        if in_flight is not None and not isinstance(in_flight, bool):
+            return False
+        if in_flight is True:
+            return False
+        if str(source.get("lifecycle_state") or "").strip().upper() == "MATERIALIZING":
+            return False
+        if str(source.get("materialization_status") or "").strip().upper() == "RUNNING":
+            return False
+    if any(
+        is_active_materialization_in_flight({**row, "meta": source})
+        for source in sources
+    ):
+        return False
+
+    crossed = _values(("trigger_crossed_at",))
+    if not crossed or any(value is None for value in crossed):
+        return False
+    parsed_crossed = []
+    for value in crossed:
+        parsed = _parse_iso_classifier(value)
+        if parsed is None or parsed.tzinfo is None:
+            return False
+        parsed_crossed.append(parsed.astimezone(timezone.utc))
+    if len(set(parsed_crossed)) != 1:
+        return False
+
+    provenances = _values(("trigger_crossed_at_provenance",))
+    if not provenances or any(not isinstance(value, dict) for value in provenances):
+        return False
+    expected_provenance = {
+        "canonical_signal_id": canonical_signal_id,
+        "client_id": client_id,
+        "execution_mode": execution_mode,
+        "local_order_id": local_order_id,
+    }
+    for provenance in provenances:
+        if {
+            "canonical_signal_id": provenance.get("canonical_signal_id"),
+            "client_id": provenance.get("client_id"),
+            "execution_mode": provenance.get("execution_mode"),
+            "local_order_id": provenance.get("local_order_id"),
+        } != expected_provenance:
+            return False
+
+    def _geometry(aliases: tuple[str, ...]) -> Optional[Decimal]:
+        values = _values(aliases)
+        if not values:
+            return None
+        parsed = [_safe_decimal(value) for value in values]
+        if any(value is None or value <= _DEC_ZERO for value in parsed):
+            return None
+        return parsed[0] if len(set(parsed)) == 1 else None
+
+    return all(
+        _geometry(aliases) is not None
+        for aliases in (
+            ("trigger_price", "entry_trigger", "signal_entry_price", "entry_price"),
+            ("stop_underlying", "stop_price", "stop_level", "scanner_stop"),
+            ("target_underlying", "target_price", "target", "profit_target", "pt1"),
+        )
+    )
 
 
 # ── Per-row outcome constants (Blocker 2) ─────────────────────────────────────
@@ -276,6 +505,12 @@ class PendingTriggerRestartRecovery:
             )
             return _RowOutcome.UNRESOLVED
 
+        if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+            # The caller supplied a durable row that has already converged to
+            # another lifecycle.  It is outside this consumer; do not demand
+            # pending-trigger evidence or perform any cleanup mutation.
+            return _RowOutcome.SKIPPED
+
         def _reject_unproven_trigger_evidence() -> str:
             self._mark_failure(
                 local_oid, RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
@@ -375,12 +610,49 @@ class PendingTriggerRestartRecovery:
             if is_active_materialization_in_flight(row):
                 return _observe_materialization_owner()
 
+        # A durable trigger-ready marker is already a confirmed durable
+        # event.  Do not fetch a fresh quote before the exact identity /
+        # generation branch below: quote truth may be unavailable or may have
+        # moved, but it must not reinterpret the persisted economic setup.
+        _trigger_ready_marker = False
+        _top_level_audit = row.get("watcher_audit")
+        if (
+            isinstance(_top_level_audit, dict)
+            and str(_top_level_audit.get("reason_code") or "").strip()
+            == "trigger_ready"
+        ):
+            _trigger_ready_marker = True
+        for _meta_key in ("meta", "metadata"):
+            if _meta_key not in row:
+                continue
+            _raw_meta = row.get(_meta_key)
+            if isinstance(_raw_meta, str):
+                try:
+                    _raw_meta = json.loads(_raw_meta)
+                except Exception:
+                    _raw_meta = None
+            if isinstance(_raw_meta, dict):
+                _audit = _raw_meta.get("watcher_audit")
+                if (
+                    isinstance(_audit, dict)
+                    and str(_audit.get("reason_code") or "").strip()
+                    == "trigger_ready"
+                ):
+                    _trigger_ready_marker = True
+                    break
+
         # Live quote check.
         live_quote_abt: Optional[bool] = None
         _side    = str(row.get("direction") or row.get("side") or "").strip().upper()
         _symbol  = str(row.get("ticker") or row.get("underlying") or row.get("symbol") or "").strip()
         _trigger = _canonical_underlying_trigger(row)
-        if not _retry_subtype(row) and _symbol and _side and _trigger is not None:
+        if (
+            not _trigger_ready_marker
+            and not _retry_subtype(row)
+            and _symbol
+            and _side
+            and _trigger is not None
+        ):
             try:
                 live_quote_abt = self.quote_check_fn(self.broker, _symbol, _side, _trigger)
             except Exception as _qe:
@@ -464,6 +736,160 @@ class PendingTriggerRestartRecovery:
             # position/proof_trades/queue mutation.
             return _observe_materialization_owner()
 
+        if cls == PTC.NOT_PENDING_TRIGGER:
+            # A row that has already left PENDING_TRIGGER is outside this
+            # recovery consumer.  Do not require trigger provenance for a
+            # lifecycle that is already durably resolved.
+            return _RowOutcome.SKIPPED
+
+        # A durable trigger-ready row is a distinct recovery lifecycle. It is
+        # not an orphan waiting for a new quote and must never be routed through
+        # the ordinary quote classifier or the old convenience terminalizer.
+        # The narrow predicate below is intentionally stricter than the public
+        # STUCK_TRIGGER_READY label: only exact identity/evidence/economics and
+        # coherent positive generations may resume.
+        _trigger_ready_audits = []
+        if "watcher_audit" in row:
+            _trigger_ready_audits.append(row.get("watcher_audit"))
+        for _meta_key in ("meta", "metadata"):
+            if _meta_key not in row:
+                continue
+            _raw_meta = row.get(_meta_key)
+            if isinstance(_raw_meta, str):
+                try:
+                    _raw_meta = json.loads(_raw_meta)
+                except Exception:
+                    _raw_meta = None
+            if isinstance(_raw_meta, dict) and "watcher_audit" in _raw_meta:
+                _trigger_ready_audits.append(_raw_meta.get("watcher_audit"))
+        _durable_trigger_ready = (
+            str(row.get("status") or "").strip().upper() == "PENDING_TRIGGER"
+            and any(
+            isinstance(_audit, dict)
+            and str(_audit.get("reason_code") or "").strip() == "trigger_ready"
+            for _audit in _trigger_ready_audits
+            )
+        )
+        if _durable_trigger_ready:
+            _meta = _extract_meta(row)
+            _terminal_materialization_outcomes = {
+                "TERMINAL_NO_TRADEABLE_CONTRACT",
+                "TERMINAL_QUALITY_REJECT",
+                "TERMINAL_MATERIALIZATION_FAILED",
+                "FAILED_TERMINAL",
+            }
+            _materialization_outcome = str(
+                _meta.get("materialization_outcome")
+                or ((_meta.get("materialization") or {}).get("outcome")
+                    if isinstance(_meta.get("materialization"), dict) else "")
+                or ""
+            ).strip().upper()
+            if _materialization_outcome in _terminal_materialization_outcomes:
+                # Explicit terminal materialization authority still wins over
+                # the historical trigger_ready label.  This is a truthful
+                # terminal boundary, unlike process-memory loss alone.
+                return self._terminalize_with_reason(
+                    local_oid,
+                    row,
+                    f"restart_stuck_terminal_materialization:{_materialization_outcome}",
+                    meta_patch={
+                        "restart_recovery_cls": PTC.STUCK_TERMINAL_MATERIALIZATION,
+                        "materialization_outcome_preserved": _materialization_outcome,
+                    },
+                )
+            if is_durable_trigger_ready_row(row):
+                _dispatch_state = str(
+                    _meta.get("recovery_trigger_dispatch_state") or ""
+                ).strip().upper()
+                _dispatch_generation = _meta.get(
+                    "recovery_trigger_dispatch_trigger_generation"
+                )
+                _current_generation = _meta.get(
+                    "trigger_generation",
+                    row.get("trigger_generation"),
+                )
+                _dispatch_states = {
+                    "CLAIMED", "CALLBACK_STARTED", "CONSUMED",
+                    "COMPLETED", "AMBIGUOUS",
+                }
+                if (
+                    _dispatch_state in _dispatch_states
+                    and str(_dispatch_generation) == str(_current_generation)
+                ):
+                    if _dispatch_state == "CLAIMED":
+                        _claim_stale = recovery_trigger_dispatch_claim_is_stale(
+                            _meta.get("recovery_trigger_dispatch_claimed_at"),
+                            _meta.get("recovery_trigger_dispatch_lease_until"),
+                        )
+                        if _claim_stale is True:
+                            # CLAIMED is before CALLBACK_STARTED.  A stale
+                            # pre-callback claim may be reattached; the OSM
+                            # CAS will atomically replace its attempt token.
+                            log.info(
+                                "RESTART_RECOVERY_STALE_DISPATCH_CLAIM_REARM "
+                                "local=%s generation=%s",
+                                local_oid, _current_generation,
+                            )
+                        elif _claim_stale is None:
+                            self._mark_failure(
+                                local_oid,
+                                "recovery_trigger_dispatch_claim_authority_invalid",
+                            )
+                            return _RowOutcome.UNRESOLVED
+                        else:
+                            self._mark_failure(
+                                local_oid,
+                                "recovery_trigger_dispatch_claim_not_stale",
+                            )
+                            return _RowOutcome.SKIPPED
+                    else:
+                        # CALLBACK_STARTED and terminal states are durable
+                        # proof that this cursor is already in/after the
+                        # callback side-effect boundary. Never replay them.
+                        self._mark_failure(
+                            local_oid,
+                            "recovery_trigger_dispatch_already_recorded",
+                        )
+                        return _RowOutcome.SKIPPED
+                elif (
+                    _dispatch_state in {"CLAIMED", "CALLBACK_STARTED"}
+                    and str(_dispatch_generation) != str(_current_generation)
+                ):
+                    # An active attempt from another generation cannot be
+                    # reinterpreted as the current trigger. Hold before
+                    # watcher admission; only terminal prior generations may
+                    # be superseded by a genuinely new durable cursor.
+                    self._mark_failure(
+                        local_oid,
+                        "recovery_trigger_dispatch_generation_mismatch",
+                    )
+                    return _RowOutcome.UNRESOLVED
+                if watcher_owned is True:
+                    proof = self._verify_registry_ownership(local_oid, row)
+                    if proof and proof.get("dedup_held"):
+                        return _RowOutcome.WATCHER_OWNED
+                return self._rearm_and_verify(
+                    row,
+                    local_oid,
+                    plan_builder_fn=plan_builder_fn,
+                    recovered_trigger_ready=True,
+                )
+
+            # A trigger-ready marker without complete proof is ambiguous. Hold
+            # it for canonical repair/reconciliation; never terminalize merely
+            # because process memory disappeared.
+            self._mark_failure(
+                local_oid,
+                "trigger_ready_identity_or_generation_unproven",
+            )
+            log.critical(
+                "RESTART_RECOVERY_TRIGGER_READY_HOLD local=%s — exact durable "
+                "identity/evidence/economic/generation proof unavailable; "
+                "broker work and terminalization suppressed",
+                local_oid,
+            )
+            return _RowOutcome.UNRESOLVED
+
         # Every path that would classify, terminalize, retry, or rearm an
         # order with confirmed-trigger evidence still requires durable
         # lifecycle identity.  Only the proven already-owned fast path above
@@ -472,10 +898,7 @@ class PendingTriggerRestartRecovery:
         if not _evidence_proven:
             return _reject_unproven_trigger_evidence()
 
-        if cls == PTC.NOT_PENDING_TRIGGER:
-            return _RowOutcome.SKIPPED
-
-        elif cls == PTC.WAITING_VALID:
+        if cls == PTC.WAITING_VALID:
             # Not owned or proof failed: quote check then rearm.
             if live_quote_abt is True:
                 return self._terminalize_with_reason(
@@ -491,15 +914,21 @@ class PendingTriggerRestartRecovery:
             return self._handle_retryable(row, local_oid, live_quote_abt, plan_builder_fn)
 
         elif cls == PTC.STUCK_TRIGGER_READY:
-            _meta = row.get("meta") or {}
-            return self._terminalize_with_reason(
-                local_oid, row,
-                "restart_stuck_trigger_ready_no_broker_proof",
-                meta_patch={
-                    "restart_recovery_cls":        cls,
-                    "restart_recovery_trigger_ts": _meta.get("trigger_crossed_at"),
-                },
+            # A public STUCK_TRIGGER_READY classification is not, by itself,
+            # terminal authority.  The exact durable-resume predicate above
+            # handles proven rows; every other trigger-ready row is ambiguous
+            # and must be held for canonical repair/reconciliation rather than
+            # terminalized merely because process memory disappeared.
+            self._mark_failure(
+                local_oid, "trigger_ready_identity_or_generation_unproven"
             )
+            log.critical(
+                "RESTART_RECOVERY_TRIGGER_READY_HOLD local=%s — trigger-ready "
+                "row lacks complete durable resume proof; terminalization and "
+                "broker work suppressed",
+                local_oid,
+            )
+            return _RowOutcome.UNRESOLVED
 
         elif cls == PTC.STUCK_INVALIDATED:
             _meta = row.get("meta") or {}
@@ -700,7 +1129,14 @@ class PendingTriggerRestartRecovery:
 
     # ── Rearm + post-registration verification ────────────────────────────────
 
-    def _rearm_and_verify(self, row: dict, local_oid: str, *, plan_builder_fn=None) -> str:
+    def _rearm_and_verify(
+        self,
+        row: dict,
+        local_oid: str,
+        *,
+        plan_builder_fn=None,
+        recovered_trigger_ready: bool = False,
+    ) -> str:
         """
         Call watch() once, then verify actual registry ownership.
         watch() returning True is NOT proof.
@@ -730,12 +1166,13 @@ class PendingTriggerRestartRecovery:
                 "created_by_this_call": False,
                 "registration_token": None,
             }
-            armed = bool(
-                watcher.watch(
-                    plan, local_oid, recovery_rearm=True,
-                    registration_provenance_out=_provenance,
-                )
-            )
+            _watch_kwargs = {
+                "recovery_rearm": True,
+                "registration_provenance_out": _provenance,
+            }
+            if recovered_trigger_ready:
+                _watch_kwargs["recovered_trigger_ready"] = True
+            armed = bool(watcher.watch(plan, local_oid, **_watch_kwargs))
         except Exception as exc:
             log.error("RESTART_RECOVERY_WATCH_RAISED local=%s: %s", local_oid, exc, exc_info=True)
             return _RowOutcome.UNRESOLVED
@@ -751,6 +1188,29 @@ class PendingTriggerRestartRecovery:
                     "RESTART_RECOVERY_%s local=%s — row left unchanged",
                     RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
                     local_oid,
+                )
+                return _RowOutcome.UNRESOLVED
+            _reject_reason = str(
+                getattr(watcher, "_last_reject_reason", "") or ""
+            )
+            if recovered_trigger_ready or _reject_reason.startswith(
+                ("recovery_lifecycle_", "recovery_generation_")
+            ):
+                # A recovered TRIGGER_READY row, or a row rejected by the
+                # admission generation/identity fence, is not terminal merely
+                # because this process could not register it.  Terminalizing
+                # here would turn an ambiguous durable authority failure into
+                # a lost trade and would violate the pre-admission HOLD
+                # contract.  Leave the row for canonical reconciliation.
+                self._mark_failure(
+                    local_oid,
+                    _reject_reason or "recovery_lifecycle_admission_hold",
+                )
+                log.critical(
+                    "RESTART_RECOVERY_ADMISSION_HOLD local=%s reason=%s — "
+                    "terminalization and broker work suppressed",
+                    local_oid,
+                    _reject_reason or "recovery_lifecycle_admission_hold",
                 )
                 return _RowOutcome.UNRESOLVED
             log.warning(
@@ -1325,6 +1785,12 @@ class PendingTriggerRestartRecovery:
                     )
                     return None
                 _valid_states = {"PENDING", "REARM", "RETRY"}
+                # A proven durable TRIGGER_READY row is intentionally
+                # reconstructed as an in-memory TRIGGERED watcher.  It is
+                # still watcher-owned for registry/dedup purposes, but it is
+                # dispatched only through the durable attempt-token fence.
+                if _wsig.get("__recovered_trigger_ready"):
+                    _valid_states.add("TRIGGERED")
                 if _w_state.upper() not in _valid_states:
                     log.warning(
                         "RESTART_RECOVERY registry watcher state invalid local=%s state=%s",
@@ -1598,11 +2064,25 @@ def _build_plan(row: dict, plan_builder_fn=None) -> Optional[Any]:
             or meta.get("target_underlying")
             or 0
         )
-        generation = meta.get("materialization_generation")
-        try:
-            generation = int(generation) if generation is not None else None
-        except (TypeError, ValueError):
-            generation = None
+        generation = (
+            meta.get("materialization_generation")
+            if "materialization_generation" in meta
+            else row.get("materialization_generation")
+        )
+        trigger_generation = (
+            meta.get("trigger_generation")
+            if "trigger_generation" in meta
+            else row.get("trigger_generation")
+        )
+        if "materialization_generation" not in meta and "materialization_generation" in row:
+            meta["materialization_generation"] = row.get("materialization_generation")
+        if "trigger_generation" not in meta and "trigger_generation" in row:
+            meta["trigger_generation"] = row.get("trigger_generation")
+        # Preserve the raw authority in metadata. The watcher recovery fence
+        # performs the strict positive-integer parse; coercing here would turn
+        # booleans or fractional/invalid JSON values into a different
+        # generation. Do not add a separate plan attribute: materialization
+        # resume remains owned by its existing #596 plan contract.
         return _RecoveryPlan(
             signal_id=signal_id,
             canonical_signal_id=canonical_signal_id,
@@ -1621,6 +2101,7 @@ def _build_plan(row: dict, plan_builder_fn=None) -> Optional[Any]:
             execution_mode=execution_mode,
             local_order_id=local_order_id,
             materialization_generation=generation,
+            trigger_generation=trigger_generation,
             trigger_crossed_at=(
                 row.get("trigger_crossed_at")
                 or meta.get("trigger_crossed_at")
@@ -1650,7 +2131,10 @@ def _now_iso() -> str:
 
 
 def _extract_meta(row: dict) -> dict:
-    meta = (row or {}).get("meta") or {}
+    row = row or {}
+    meta = row.get("meta")
+    if meta is None:
+        meta = row.get("metadata") or {}
     if isinstance(meta, str):
         try:
             import json

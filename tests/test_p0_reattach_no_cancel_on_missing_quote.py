@@ -18,12 +18,15 @@ _terminalize_recovery_rearm_candidate call.
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
+
+os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 
 import ap_entry_watcher as ew
 
@@ -74,6 +77,11 @@ def _make_watcher_for_reattach(monkeypatch, *, quote_bid=0, quote_ask=0):
     w.broker = SimpleNamespace(session=None)
     w._last_quote_fetch_proof = {}
     w.owner_token = "test-owner"
+    w._test_only_allow_recovery_without_row_lock = True
+    # This fixture is an explicit unit seam without a real OSM/database. The
+    # production canonical handoff classifier remains fail-closed when its
+    # authority is unavailable.
+    w._recovery_has_broker_handoff_evidence = lambda *_a, **_kw: False
     w.core = None
 
     # Spy on the OSM cancel_pending_entry call — must be 0 for the fix.
@@ -86,9 +94,17 @@ def _make_watcher_for_reattach(monkeypatch, *, quote_bid=0, quote_ask=0):
         return {
             "local_order_id":     oid,
             "status":             "PENDING_TRIGGER",
-            "meta":               {"watcher_audit": {}},
+            "signal_id":          "sig-reattach-1",
+            "canonical_signal_id": "sig-reattach-1",
+            "meta":               {
+                "watcher_audit": {},
+                "materialization_generation": 1,
+                "trigger_generation": 1,
+            },
             "client_id":          "jason@example.com",
             "execution_mode":     "live",
+            "ticker":             "SPY",
+            "side":               "CALL",
             "watcher_token":      "test-owner",
             "trigger_generation": 1,
         }
@@ -124,6 +140,8 @@ def _reattach_plan(*, local_order_id="local-existing-1", confirmed=False):
         "late_attachment_policy_eligible":  True,
         "execution_mode":                   "live",
         "client_id":                        "jason@example.com",
+        "watcher_token":                    "test-owner",
+        "trigger_generation":               1,
     }
     if confirmed:
         # Durable first-breach evidence — always present in a real rearmed
@@ -243,11 +261,19 @@ def test_reattach_with_proven_terminal_truth_terminalizes_existing_order_once(
     w, cancel_spy, add_spy = _make_watcher_for_reattach(
         monkeypatch, quote_bid=bid, quote_ask=ask,
     )
+    plan = _reattach_plan(
+        local_order_id="local-existing-terminal", confirmed=True
+    )
+    # The final #580 identity fence now re-proves confirmed-trigger
+    # provenance against the durable row as well as the incoming plan.  Make
+    # this terminal-truth fixture represent the real persisted PENDING_TRIGGER
+    # shape instead of leaving the timestamp only on the recovery plan.
+    durable_row = w.order_state_machine.get_order("local-existing-terminal")
+    durable_row["meta"].update(plan.metadata)
+    w.order_state_machine.get_order = lambda _oid: dict(durable_row)
 
     result = w.watch(
-        _reattach_plan(
-            local_order_id="local-existing-terminal", confirmed=True
-        ),   # real rearmed recovery has trigger_crossed_at + provenance
+        plan,   # real rearmed recovery has trigger_crossed_at + provenance
         local_order_id="local-existing-terminal",
         recovery_rearm=True,
         no_cancel_on_reject=True,

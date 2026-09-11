@@ -2282,18 +2282,30 @@ class APExecutionCore:
         claim = getattr(_osm, "claim_deferred_materialization", None)
         if not callable(claim):
             return _keep("MATERIALIZATION_STATE_WRITE_FAILED")
+        _recovery_dispatch_attempt = str(
+            signal.get("recovery_trigger_dispatch_attempt_id") or ""
+        ).strip()
+        _claim_kwargs = {
+            "owner": owner,
+            "generation": next_generation,
+            "lease_until": (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat(),
+            "trigger_crossed_at": crossed,
+            "trigger_price": float(getattr(watched, "trigger_price", 0) or 0),
+            "observed_underlying_price": observed,
+            "signal_id": _signal,
+            "execution_mode": _mode,
+        }
+        if _recovery_dispatch_attempt:
+            # PR #580: the recovery dispatch claim is already CALLBACK_STARTED
+            # at the trigger-ready generation.  Carry its exact attempt token
+            # into the materialization CAS so OSM advances the generation
+            # family and dispatch marker atomically, rather than leaving the
+            # watcher with an N/N finalizer after the callback reaches N+1.
+            _claim_kwargs["recovery_dispatch_attempt_id"] = (
+                _recovery_dispatch_attempt
+            )
         try:
-            claimed = bool(claim(
-                local_order_id,
-                owner=owner,
-                generation=next_generation,
-                lease_until=(datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat(),
-                trigger_crossed_at=crossed,
-                trigger_price=float(getattr(watched, "trigger_price", 0) or 0),
-                observed_underlying_price=observed,
-                signal_id=_signal,
-                execution_mode=_mode,
-            ))
+            claimed = bool(claim(local_order_id, **_claim_kwargs))
         except Exception as exc:
             log.critical(
                 "[%s] MATERIALIZATION_STATE_WRITE_FAILED order=%s error=%s",
@@ -2301,6 +2313,28 @@ class APExecutionCore:
             )
             claimed = False
         if claimed:
+            if _recovery_dispatch_attempt:
+                _new_generation = next_generation
+                signal["materialization_generation"] = _new_generation
+                signal["trigger_generation"] = _new_generation
+                _signal_metadata = signal.get("metadata")
+                if isinstance(_signal_metadata, dict):
+                    _signal_metadata["materialization_generation"] = _new_generation
+                    _signal_metadata["trigger_generation"] = _new_generation
+                _approved_plan = signal.get("_approved_plan")
+                _plan_metadata = getattr(_approved_plan, "metadata", None)
+                if isinstance(_plan_metadata, dict):
+                    _plan_metadata["materialization_generation"] = _new_generation
+                    _plan_metadata["trigger_generation"] = _new_generation
+                for _field in ("materialization_generation", "trigger_generation"):
+                    try:
+                        setattr(_approved_plan, _field, _new_generation)
+                    except (AttributeError, TypeError) as _plan_generation_exc:
+                        log.debug(
+                            "[%s] recovered plan generation mirror unavailable: %s",
+                            ticker,
+                            _plan_generation_exc,
+                        )
             return _owned({
                 "owner": owner,
                 "generation": next_generation,
@@ -8426,6 +8460,23 @@ class APExecutionCore:
                                     "local_order_id":              str(queue_local_order_id or ""),
                                     "signal_id":                   str(signal_id or ""),
                                 },
+                                **(
+                                    {
+                                        "recovery_dispatch_attempt_id": str(
+                                            sig.get(
+                                                "recovery_trigger_dispatch_attempt_id"
+                                            )
+                                            or ""
+                                        ).strip()
+                                    }
+                                    if str(
+                                        sig.get(
+                                            "recovery_trigger_dispatch_attempt_id"
+                                        )
+                                        or ""
+                                    ).strip()
+                                    else {}
+                                ),
                             ))
                         else:
                             _copyback_write_ok = False

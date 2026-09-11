@@ -1766,44 +1766,46 @@ class TestMaterializationInFlightFence:
         )
         assert summary["materialization_in_flight_count"] == 1
 
-    # ── Negative control 1: trigger_ready with NO materialization → STUCK ─────
+    # ── Negative control 1: trigger_ready without exact proof → HOLD ──────────
 
     def test_nc1_trigger_ready_no_mat_meta_is_stuck(self):
-        """trigger_ready + no materialization metadata → STUCK (terminalized)."""
+        """trigger_ready + no exact durable proof → HOLD, never terminalize."""
         row = _tmo_row(meta={"watcher_audit": {"reason_code": "trigger_ready"},
                               "trigger_price": 151.50})
         rec, osm = self._live_recovery(row)
         outcome = rec.recover_one_row(row)
-        assert outcome == _RowOutcome.TERMINALIZED, f"got {outcome}"
-        assert len(osm.cancel_calls) == 1
+        assert outcome == _RowOutcome.UNRESOLVED, f"got {outcome}"
+        assert len(osm.cancel_calls) == 0
 
-    # ── Negative control 2: materialization_in_flight=false not protected ─────
+    # ── Negative control 2: materialization_in_flight=false → HOLD ────────────
 
     def test_nc2_in_flight_false_not_protected(self):
-        """materialization_in_flight=False → not protected → STUCK."""
+        """materialization_in_flight=False is ambiguous trigger-ready truth."""
         meta = _inflight_meta(in_flight=False)
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
         outcome = rec.recover_one_row(row)
-        assert outcome == _RowOutcome.TERMINALIZED, f"got {outcome}"
+        assert outcome == _RowOutcome.UNRESOLVED, f"got {outcome}"
+        assert len(osm.cancel_calls) == 0
 
     # ── Negative control 3: lifecycle_state missing / wrong ──────────────────
 
     @pytest.mark.parametrize("bad_state", ["", None, "PENDING_TRIGGER", "SUBMITTED"])
     def test_nc3_wrong_lifecycle_state_not_protected(self, bad_state):
-        """lifecycle_state != MATERIALIZING → not protected."""
+        """lifecycle_state != MATERIALIZING → hold, not convenience cleanup."""
         meta = _inflight_meta(lifecycle_state=bad_state or "")
         meta["lifecycle_state"] = bad_state  # allow None to reach the check
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
         outcome = rec.recover_one_row(row)
-        assert outcome == _RowOutcome.TERMINALIZED, f"bad_state={bad_state!r} got {outcome}"
+        assert outcome == _RowOutcome.UNRESOLVED, f"bad_state={bad_state!r} got {outcome}"
+        assert len(osm.cancel_calls) == 0
 
     # ── Negative control 4: materialization_status missing ───────────────────
 
     @pytest.mark.parametrize("bad_status", ["", None, "RETRY_PENDING", "COMPLETED"])
     def test_nc4_wrong_mat_status_not_protected(self, bad_status):
-        """materialization_status != RUNNING → not protected."""
+        """materialization_status != RUNNING → hold, not convenience cleanup."""
         meta = _inflight_meta(mat_status=bad_status or "RUNNING")
         if bad_status is None:
             meta.pop("materialization_status", None)
@@ -1814,7 +1816,8 @@ class TestMaterializationInFlightFence:
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
         outcome = rec.recover_one_row(row)
-        assert outcome == _RowOutcome.TERMINALIZED, f"bad_status={bad_status!r} got {outcome}"
+        assert outcome == _RowOutcome.UNRESOLVED, f"bad_status={bad_status!r} got {outcome}"
+        assert len(osm.cancel_calls) == 0
 
     # ── Negative control 5: RETRY_PENDING uses existing retry behavior ────────
 
@@ -1861,7 +1864,8 @@ class TestMaterializationInFlightFence:
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
         outcome = rec.recover_one_row(row)
-        assert outcome == _RowOutcome.TERMINALIZED, f"bad_owner={bad_owner!r} got {outcome}"
+        assert outcome == _RowOutcome.UNRESOLVED, f"bad_owner={bad_owner!r} got {outcome}"
+        assert len(osm.cancel_calls) == 0
 
     # ── Negative control 8: generation missing / zero / negative / bool ───────
 
@@ -1873,7 +1877,8 @@ class TestMaterializationInFlightFence:
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
         outcome = rec.recover_one_row(row)
-        assert outcome == _RowOutcome.TERMINALIZED, f"bad_gen={bad_gen!r} got {outcome}"
+        assert outcome == _RowOutcome.UNRESOLVED, f"bad_gen={bad_gen!r} got {outcome}"
+        assert len(osm.cancel_calls) == 0
 
     # ── Negative control 9: lease missing / malformed / naive / expired ───────
 
@@ -1883,7 +1888,8 @@ class TestMaterializationInFlightFence:
         meta.pop("materialization_lease_until", None)
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
-        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert len(osm.cancel_calls) == 0
 
     def test_nc9b_lease_malformed_not_protected(self):
         """Unparseable lease → not protected."""
@@ -1891,7 +1897,8 @@ class TestMaterializationInFlightFence:
         meta["materialization_lease_until"] = "not-a-datetime"
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
-        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert len(osm.cancel_calls) == 0
 
     def test_nc9c_lease_naive_not_protected(self):
         """Timezone-naive lease → not protected."""
@@ -1901,7 +1908,8 @@ class TestMaterializationInFlightFence:
         meta["materialization_lease_until"] = naive
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
-        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert len(osm.cancel_calls) == 0
 
     def test_nc9d_lease_expired_not_protected(self):
         """Expired lease (in the past) → not protected."""
@@ -1911,7 +1919,8 @@ class TestMaterializationInFlightFence:
         meta["materialization_lease_until"] = expired
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
-        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert len(osm.cancel_calls) == 0
 
     # ── Negative control 10: terminal outcome + stale in-flight ──────────────
 
@@ -1922,6 +1931,7 @@ class TestMaterializationInFlightFence:
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
         assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+        assert len(osm.cancel_calls) == 1
 
     # ── Negative control 11: wrong client_id fails closed ─────────────────────
 
@@ -2005,7 +2015,8 @@ class TestMaterializationInFlightFence:
         meta = _inflight_meta(generation=0)
         row = _tmo_row(meta=meta)
         rec, osm = self._live_recovery(row)
-        assert rec.recover_one_row(row) == _RowOutcome.TERMINALIZED
+        assert rec.recover_one_row(row) == _RowOutcome.UNRESOLVED
+        assert len(osm.cancel_calls) == 0
 
     # ── Negative control 15: broker id / submit evidence stays in broker auth ─
 

@@ -226,8 +226,14 @@ def emit_decision_event(
     inputs: Optional[dict[str, Any]] = None,
     thresholds: Optional[dict[str, Any]] = None,
     context: Optional[dict[str, Any]] = None,
+    idempotency_key: Optional[str] = None,
+    strict: bool = False,
     log_level: int = logging.INFO,
 ) -> dict[str, Any]:
+    _inputs = dict(inputs) if isinstance(inputs, dict) else {}
+    _idempotency_key = str(idempotency_key or "").strip()
+    if _idempotency_key:
+        _inputs["observability_idempotency_key"] = _idempotency_key
     event = {
         "run_id": run_id,
         "candidate_id": candidate_id,
@@ -246,7 +252,7 @@ def emit_decision_event(
         "strategy_version": strategy_version or os.getenv("AP_STRATEGY_VERSION", "unknown"),
         "config_hash": config_hash or os.getenv("AP_CONFIG_HASH", "unknown"),
         "git_commit": git_commit or get_git_commit(),
-        "inputs": inputs or {},
+        "inputs": _inputs,
         "thresholds": thresholds or {},
         "context": context or {},
     }
@@ -254,6 +260,23 @@ def emit_decision_event(
     try:
         def _insert():
             with conn() as c:
+                if _idempotency_key:
+                    # The recovery marker is the durable source of truth for
+                    # replay.  Serialize only identical replay keys and make
+                    # the append-only decision-event sink idempotent without
+                    # requiring a schema migration or a new broker path.
+                    c.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (_idempotency_key,),
+                    )
+                    existing = c.execute(
+                        "SELECT 1 FROM decision_events "
+                        "WHERE inputs_json->>'observability_idempotency_key'=%s "
+                        "LIMIT 1",
+                        (_idempotency_key,),
+                    ).fetchone()
+                    if existing:
+                        return
                 c.execute(
                     """
                     INSERT INTO decision_events (
@@ -283,6 +306,8 @@ def emit_decision_event(
         run_with_retry(_insert)
     except Exception as e:
         log.debug("emit_decision_event DB insert failed (non-critical): %s", e)
+        if strict:
+            raise
     return event
 
 

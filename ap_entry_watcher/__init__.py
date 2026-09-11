@@ -639,6 +639,16 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 signal, registration_provenance_out=registration_provenance_out,
             )
         with self._watch_admission_gate:
+            # PR #580 amendment: a recovery candidate must not destructively
+            # evict an incumbent before the base watcher has completed its
+            # final durable fence, lifecycle restoration, and registry commit.
+            # Ordinary admissions retain the existing proof-before-cancel
+            # arbitration below; this marker is limited to pre-breach #580
+            # recovery and excludes the separate deferred-retry resume path.
+            recovery_atomic_admission = bool(
+                (signal or {}).get("__recovery_rearm")
+                and not (signal or {}).get("__materialization_resume")
+            )
             incoming_key = self._ownership_key(signal)
             if incoming_key is None:
                 # A standalone legacy watcher may still be admitted without a
@@ -675,8 +685,12 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 if not self._has_durable_confirmed_direction_evidence(item)
                 and self._prunable(signal, item)
             ]
-            if prune and not self._prove_remove_all(
-                signal, prune, "opposite_side_replaced_stale_or_weaker"
+            if (
+                prune
+                and not recovery_atomic_admission
+                and not self._prove_remove_all(
+                    signal, prune, "opposite_side_replaced_stale_or_weaker"
+                )
             ):
                 return False
             opposites = self._opposites(ticker, side, signal)
@@ -713,15 +727,18 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                         signal, best, "opposite_side_conflict",
                         "opposite_side_conflict:existing_watcher_wins",
                     )
-                if not self._prove_remove_all(
-                    signal, protected_opposites, "direction_flip_watcher_cancel"
+                if (
+                    not recovery_atomic_admission
+                    and not self._prove_remove_all(
+                        signal, protected_opposites, "direction_flip_watcher_cancel"
+                    )
                 ):
                     return False
             remaining = [
                 item for item in self._opposites(ticker, side, signal)
                 if not self._is_coarmable_opposite(item)
             ]
-            if remaining:
+            if remaining and not recovery_atomic_admission:
                 return self._block(
                     signal, remaining[0], "conflict_cancel_unproven",
                     "conflict_cancel_unproven:opposite_reappeared_before_admission",
@@ -743,7 +760,12 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                         "same_side_block",
                         "same_side_block:existing_watcher_score_wins",
                     )
-                if not self._prove_remove_all(signal, same_side, "same_side_replace_watcher_cancel"):
+                if (
+                    not recovery_atomic_admission
+                    and not self._prove_remove_all(
+                        signal, same_side, "same_side_replace_watcher_cancel"
+                    )
+                ):
                     return False
             accepted = super().add_signal(
                 signal, registration_provenance_out=registration_provenance_out,
@@ -784,6 +806,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
     def watch(
         self, plan, local_order_id: str, *, recovery_rearm: bool = False,
         no_cancel_on_reject: bool = False, materialization_resume: bool = False,
+        recovered_trigger_ready: bool = False,
         registration_provenance_out: dict | None = None,
     ) -> bool:
         current_call = _CALL_RESULT.get()
@@ -794,6 +817,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 recovery_rearm=recovery_rearm,
                 no_cancel_on_reject=no_cancel_on_reject,
                 materialization_resume=materialization_resume,
+                recovered_trigger_ready=recovered_trigger_ready,
                 registration_provenance_out=registration_provenance_out,
             )
         token = _CALL_RESULT.set(_CallResult(id(self)))
@@ -804,6 +828,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 recovery_rearm=recovery_rearm,
                 no_cancel_on_reject=no_cancel_on_reject,
                 materialization_resume=materialization_resume,
+                recovered_trigger_ready=recovered_trigger_ready,
                 registration_provenance_out=registration_provenance_out,
             )
         finally:
@@ -812,6 +837,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
     def _watch_impl(
         self, plan, local_order_id: str, *, recovery_rearm: bool = False,
         no_cancel_on_reject: bool = False, materialization_resume: bool = False,
+        recovered_trigger_ready: bool = False,
         registration_provenance_out: dict | None = None,
     ) -> bool:
         if registration_provenance_out is not None:
@@ -844,17 +870,24 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             normalized_plan = plan
         except Exception:
             normalized_plan = _SideNormalizedPlan(plan, side)
-        return super().watch(
-            normalized_plan, local_order_id,
-            recovery_rearm=recovery_rearm,
-            no_cancel_on_reject=no_cancel_on_reject,
-            materialization_resume=materialization_resume,
-            registration_provenance_out=registration_provenance_out,
-        )
+        watch_kwargs = {
+            "recovery_rearm": recovery_rearm,
+            "no_cancel_on_reject": no_cancel_on_reject,
+            "materialization_resume": materialization_resume,
+            "registration_provenance_out": registration_provenance_out,
+        }
+        # Preserve the legacy call shape for ordinary callers.  The new flag
+        # is meaningful only for the exact durable TRIGGER_READY recovery
+        # path, and older test/runtime shims must not receive an unsolicited
+        # ``False`` keyword.
+        if recovered_trigger_ready:
+            watch_kwargs["recovered_trigger_ready"] = True
+        return super().watch(normalized_plan, local_order_id, **watch_kwargs)
 
     def watch_with_result(
         self, plan, local_order_id: str, *, recovery_rearm: bool = False,
         no_cancel_on_reject: bool = False, materialization_resume: bool = False,
+        recovered_trigger_ready: bool = False,
     ) -> WatchArmResult:
         call = _CallResult(id(self))
         token = _CALL_RESULT.set(call)
@@ -863,6 +896,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 plan, local_order_id, recovery_rearm=recovery_rearm,
                 no_cancel_on_reject=no_cancel_on_reject,
                 materialization_resume=materialization_resume,
+                recovered_trigger_ready=recovered_trigger_ready,
             ))
             has_after = bool(self.has_order(local_order_id))
             meta = call.conflict_meta
@@ -1009,6 +1043,51 @@ class APEntryWatcher(_BaseAPEntryWatcher):
         opposite is terminalized with cancellation proof.
         """
         completed = list(completed or [])
+        recovery_filtered = []
+        for action, watched in completed:
+            signal = getattr(watched, "signal", {}) or {}
+            if (
+                action != "trigger"
+                or not bool(signal.get("__recovery_rearm"))
+                or signal.get("__materialization_resume") is True
+            ):
+                recovery_filtered.append((action, watched))
+                continue
+            final_ok, final_reason, _row = self._recovery_final_durable_authority(
+                watched
+            )
+            if final_ok:
+                recovery_filtered.append((action, watched))
+                continue
+
+            # A durable owner that wins after admission, a temporary authority
+            # read failure, and an identity conflict have different retry
+            # dispositions. Keep the exact lifecycle/registry pair retained;
+            # never route this through ordinary cleanup (which could invoke a
+            # cancel callback).
+            hold_fn = getattr(self, "_enter_recovery_post_admission_hold", None)
+            if callable(hold_fn):
+                hold_fn(watched, final_reason, _row)
+            else:  # pragma: no cover - compatibility with a legacy shim
+                watched._ownership_quarantine = True
+                watched._quarantine_reason = (
+                    f"recovery_post_admission_hold:{final_reason}"
+                )
+                watched.state = WatchState.PENDING
+                self._record_call_result(
+                    "recovery_post_admission_owner_hold",
+                    final_reason,
+                    local_order_id=signal.get("local_order_id"),
+                    signal_id=signal.get("signal_id"),
+                )
+                self._direction_event_audit(
+                    watched,
+                    "recovery_post_admission_owner_hold",
+                    final_reason,
+                    no_broker_submit=True,
+                    no_broker_cancel=True,
+                )
+        completed = recovery_filtered
         trigger_groups: dict[tuple[str, str, str], list] = {}
         invalid_triggers = []
         retained = []

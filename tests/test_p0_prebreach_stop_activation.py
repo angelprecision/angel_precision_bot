@@ -762,6 +762,7 @@ def _restart_row_with_confirmed_evidence() -> dict:
             "selected_qty": 1,
             "selected_limit": 1.20,
             "materialization_generation": 7,
+            "trigger_generation": 7,
             "trigger_crossed_at": crossed_at,
             "trigger_crossed_at_provenance": provenance,
         },
@@ -800,6 +801,7 @@ def test_restart_plan_json_roundtrip_reaches_watcher_with_active_stop():
         row_after_json["meta"]
     )
     watcher = APEntryWatcher(MagicMock(), order_state_machine=osm, mode="PAPER")
+    watcher._test_only_allow_recovery_without_row_lock = True
     watcher._persist_watcher_audit = lambda *args, **kwargs: None
 
     # Keep the test independent of wall-clock market/session state while
@@ -1743,6 +1745,7 @@ def test_confirmed_call_stop_stays_active_through_preopen_window():
     broker = MagicMock()
     osm = _MockOSM()
     watcher = APEntryWatcher(broker, order_state_machine=osm, mode="PAPER")
+    watcher._test_only_allow_recovery_without_row_lock = True
     watcher._persist_watcher_audit = lambda *args, **kwargs: None
     sig = _spy_call_signal()
     sig["overnight"] = True
@@ -1807,6 +1810,7 @@ def test_confirmed_put_stop_stays_active_through_preopen_window():
     osm._row_meta[persisted_row["local_order_id"]] = dict(row_after_json["meta"])
     broker = MagicMock()
     watcher = APEntryWatcher(broker, order_state_machine=osm, mode="PAPER")
+    watcher._test_only_allow_recovery_without_row_lock = True
     watcher._persist_watcher_audit = lambda *args, **kwargs: None
 
     with patch.object(watcher, "_is_regular_session_now", return_value=False), \

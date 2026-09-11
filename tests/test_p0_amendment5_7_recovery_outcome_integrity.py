@@ -97,16 +97,25 @@ def _recovery_row(lifecycle, *, created_ts=None, contract="DEFERRED:SPY"):
     }
 
 
-def _run(monkeypatch, rows, *, osm, entry_watcher, execution_core=None):
+def _run(
+    monkeypatch,
+    rows,
+    *,
+    osm,
+    entry_watcher,
+    execution_core=None,
+    recovery_client_id="client@example.com",
+    master_mode="PAPER",
+):
     import ap.db as ap_db
     monkeypatch.setattr(ap_db, "conn", lambda: _RecoveryConn(rows))
     monkeypatch.setattr(ap_db, "run_with_retry", lambda fn, *a, **k: fn())
     recovery = APStartupRecovery(
-        client_id="client@example.com",
+        client_id=recovery_client_id,
         broker=object(),
         osm=osm,
         pm=None,
-        master_control=types.SimpleNamespace(mode="PAPER"),
+        master_control=types.SimpleNamespace(mode=master_mode),
         entry_watcher=entry_watcher,
         execution_core=execution_core,
     )
@@ -260,6 +269,89 @@ def test_rearm_success_does_not_retain_ownership(monkeypatch):
     w.watch.assert_called_once()
     osm.update_order_meta.assert_not_called()
     assert result["deferred_lifecycles_recovered"] == 1
+
+
+def test_rtx_live_materialization_cas_miss_retention_failure_is_explicit(monkeypatch):
+    """The exact RTX retry shape has one #596 owner or an auditable hold."""
+    import ap_entry_watcher as ew
+    import ap_lifecycle as lifecycle
+
+    row = _recovery_row("RETRY_WAIT", contract="DEFERRED:RTX")
+    row.update({
+        "local_order_id": "84d9106b-7b67-4d58-b479-e9e65b9eb289",
+        "client_id": "jasoncosby1@gmail.com",
+        "signal_id": "322adca3-c407-491f-b5f5-102c2b0a5701",
+        "symbol": "RTX",
+        "direction": "PUT",
+        "execution_mode": "live",
+        "trigger_price": 198.13,
+        "stop_underlying": 200.0,
+        "target_underlying": 190.0,
+    })
+    row["meta"].update({
+        "lifecycle_state": "RETRY_WAIT",
+        "materialization_status": "RETRY_PENDING",
+        "materialization_generation": 19,
+        "retry_attempt": 13,
+        "next_retry_at": "2099-01-01T00:00:00+00:00",
+        "materialization_next_retry_at": "2099-01-01T00:00:00+00:00",
+        "execution_mode": "live",
+        "contract_deferred": True,
+    })
+
+    osm = _osm(
+        client_id="jasoncosby1@gmail.com",
+        adopt_deferred_retry_watcher=MagicMock(return_value=False),
+        retain_recovery_ownership_if_no_watcher=MagicMock(return_value=False),
+    )
+    osm.cancel_pending_entry = MagicMock()
+    broker = MagicMock()
+    watcher = ew.APEntryWatcher(
+        broker=broker,
+        order_state_machine=osm,
+        require_on_trigger=False,
+        mode="LIVE",
+    )
+    watcher._persist_watcher_audit = lambda *a, **kw: None
+    watcher._validate_local_order_id = MagicMock(return_value=True)
+    watcher._is_live_runtime = MagicMock(return_value=False)
+    watcher._get_quote = lambda _ticker: {
+        "bid": 199.0, "ask": 199.1, "quote_age_ms": 1,
+    }
+    with lifecycle.LEDGER._entry_lock:
+        lifecycle.LEDGER._current_state.clear()
+
+    result = _run(
+        monkeypatch,
+        [row],
+        osm=osm,
+        entry_watcher=watcher,
+        recovery_client_id="jasoncosby1@gmail.com",
+        master_mode="LIVE",
+    )
+
+    osm.adopt_deferred_retry_watcher.assert_called_once_with(
+        row["local_order_id"],
+        watcher_token=watcher.owner_token,
+        generation=19,
+        retry_attempt=13,
+        next_retry_at="2099-01-01T00:00:00+00:00",
+        execution_mode="live",
+    )
+    osm.retain_recovery_ownership_if_no_watcher.assert_called_once_with(
+        row["local_order_id"],
+        recovery_owner="recovery_scheduler:jasoncosby1@gmail.com",
+        reason="watcher_rearm_returned_false",
+        recovery_retention_mode="LIVE",
+    )
+    assert "recovery_retention_write_failed" in result.get("errors", [])
+    assert result["deferred_lifecycles_recovered"] == 0
+    assert watcher._pending == []
+    assert watcher._dedup_set == set()
+    assert lifecycle.LEDGER.current_state(row["signal_id"]) is None
+    assert not broker.mock_calls
+    assert not osm.submit_existing_entry.mock_calls
+    assert not osm.cancel_pending_entry.mock_calls
 
 
 def test_retention_marker_writes_only_recovery_keys(monkeypatch):

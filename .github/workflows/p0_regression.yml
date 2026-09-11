@@ -61,6 +61,8 @@ env:
     tests/test_p0_seam4_e2e_deferred_lifecycle.py
     tests/test_p0_intelligence_postgres.py
     tests/test_p0_pending_trigger_restart_recovery.py
+    tests/test_p0_post_outage_trigger_lifecycle_convergence.py
+    tests/test_p0_pending_trigger_lifecycle_integrity.py
     tests/test_entry_watcher_audit.py
     tests/test_p0_watcher_invalidation_ownership.py
     tests/test_p0_watcher_breach_continuity_bounded_gap.py

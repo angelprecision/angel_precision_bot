@@ -42,6 +42,7 @@ def _row() -> dict:
         "client_id": CLIENT_ID,
         "execution_mode": "live",
         "signal_id": SIGNAL_ID,
+        "canonical_signal_id": SIGNAL_ID,
         "plan_id": "plan-pr323-e2e-1",
         "kind": "ENTRY",
         "status": "PENDING_TRIGGER",
@@ -66,6 +67,7 @@ def _row() -> dict:
             "materialization_generation": 0,
             "broker_ready": False,
             "execution_mode": "live",
+            "canonical_signal_id": SIGNAL_ID,
             "queue_id": 323,
             "entry_cutoff_et": TEST_ENTRY_CUTOFF_ET,
         },
@@ -192,6 +194,38 @@ class _StatefulOSM:
     def update_order_meta(self, local_order_id, patch):
         assert local_order_id == LOCAL_ORDER_ID
         self._merge_meta(patch)
+        return True
+
+    def adopt_deferred_retry_watcher(
+        self,
+        local_order_id,
+        *,
+        watcher_token,
+        generation,
+        retry_attempt,
+        next_retry_at,
+        execution_mode,
+    ):
+        assert local_order_id == LOCAL_ORDER_ID
+        meta = self.row["meta"]
+        if not (
+            self.row["status"] == "PENDING_TRIGGER"
+            and self.row["execution_mode"] == execution_mode
+            and meta.get("lifecycle_state") == "RETRY_WAIT"
+            and meta.get("materialization_status") == "RETRY_PENDING"
+            and int(meta.get("materialization_generation") or 0) == int(generation)
+            and int(meta.get("retry_attempt") or 0) == int(retry_attempt)
+            and meta.get("materialization_next_retry_at") == next_retry_at
+            and not meta.get("watcher_token")
+        ):
+            return False
+        self._merge_meta({
+            "watcher_token": watcher_token,
+            "watcher_generation": int(generation),
+            "watcher_retry_attempt": int(retry_attempt),
+            "watcher_next_retry_at": next_retry_at,
+            "current_owner": watcher_token,
+        })
         return True
 
     def claim_deferred_materialization(self, local_order_id, **kwargs):
@@ -956,6 +990,7 @@ def _build_core(
 
 def _build_watcher(osm: _StatefulOSM, core, *, ticker="SPY"):
     watcher = APEntryWatcher(None, order_state_machine=osm, mode="LIVE")
+    watcher._test_only_allow_recovery_without_row_lock = True
     _orig_watch = watcher.watch
     _quote_calls = {"count": 0}
     _single_quote_calls = {"count": 0}
@@ -964,6 +999,7 @@ def _build_watcher(osm: _StatefulOSM, core, *, ticker="SPY"):
         local_order_id,
         recovery_rearm=kwargs.get("recovery_rearm", False),
         no_cancel_on_reject=kwargs.get("no_cancel_on_reject", False),
+        materialization_resume=kwargs.get("materialization_resume", False),
     )
     watcher.on_trigger = core._on_entry_trigger
     watcher._insert_watcher_audit_row = lambda *a, **k: None

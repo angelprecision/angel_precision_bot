@@ -28,11 +28,14 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 import types
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
@@ -44,11 +47,13 @@ try:
         LEDGER as _EW_LEDGER,
         SignalState as _EW_SS,
         LifecycleOwner as _EW_LO,
+        signal_adopted,
         signal_watching,
         signal_invalidated,
         signal_cancelled,
         signal_expired,
         signal_triggered,
+        signal_error,
     )
     _EW_LIFECYCLE_OK = True
 except Exception:
@@ -106,6 +111,14 @@ ET = ZoneInfo("America/New_York")
 RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN = (
     "RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN"
 )
+
+# Post-admission recovery holds are deliberately separate from the ordinary
+# completion-cleanup quarantine.  A durable owner handoff must never be
+# retried as a watcher callback, while a temporary authority read failure must
+# have a bounded path back to the exact original watcher owner.
+RECOVERY_POST_ADMISSION_BROKER_OWNER = "BROKER_MATERIALIZER_OWNER"
+RECOVERY_POST_ADMISSION_AUTHORITY_RECHECK = "AUTHORITY_RECHECK"
+RECOVERY_POST_ADMISSION_IDENTITY_CONFLICT = "IDENTITY_CONFLICT"
 
 
 def _parse_trigger_crossed_at(raw) -> Optional[datetime]:
@@ -718,6 +731,14 @@ class WatchedSignal:
         # retries cleanup on a bounded schedule.
         self._ownership_quarantine: bool = False
         self._quarantine_reason: str = ""
+        # PR #580 post-admission authority dispositions are separate from the
+        # ordinary cleanup quarantine.  A transient durable read failure gets
+        # a bounded recheck; a proven broker/materializer owner or an identity
+        # conflict is permanently non-executable until canonical recovery.
+        self._recovery_post_admission_disposition: str = ""
+        self.recovery_authority_recheck_attempt: int = 0
+        self.recovery_authority_recheck_next_at: Optional[datetime] = None
+        self.recovery_authority_recheck_deadline: Optional[datetime] = None
         self.cleanup_retry_attempt: int = 0
         self.cleanup_retry_next_at: Optional[datetime] = None
         self.cleanup_retry_deadline: Optional[datetime] = None
@@ -805,6 +826,18 @@ class WatchedSignal:
             self.state == WatchState.PENDING
             and not self.rearm_mode
             and not self._ownership_quarantine
+            # A recovered TRIGGER_READY cursor is callback-once after the
+            # durable attempt crosses CALLBACK_STARTED.  KEEP_WATCHER leaves
+            # the exact watcher in the registry for ownership/diagnostic
+            # continuity, but it must not re-enter quote polling after its
+            # durable callback attempt has been consumed.  A stale
+            # pre-callback CLAIMED attempt may be replaced on restart; a later
+            # durable trigger generation is admitted as a new recovery object.
+            and not bool(
+                (getattr(self, "signal", {}) or {}).get(
+                    "__recovered_trigger_ready"
+                )
+            )
         )
 
     @property
@@ -1622,6 +1655,9 @@ class APEntryWatcher:
         # Real watcher-level duplicate barrier. Cleanup alone is not enough;
         # the key must be initialized and enforced before a signal is armed.
         self._dedup_set: set[str] = set()
+        # Recovery identity/generation quarantines survive a failed admission
+        # attempt so a duplicate discovery cannot create a second active owner.
+        self._recovery_quarantine_ids: set[str] = set()
         self._last_reject_reason: Optional[str] = None
 
     @staticmethod
@@ -2131,14 +2167,72 @@ class APEntryWatcher:
         )
         return True
 
-    def _load_order_row_for_recovery_rearm(self, local_order_id: Optional[str]) -> dict:
+    def _load_order_row_for_recovery_rearm(
+        self,
+        local_order_id: Optional[str],
+        *,
+        execution_mode: Optional[str] = None,
+    ) -> dict:
         """Best-effort OSM row load for recovery rearm classification."""
+        return self._load_order_row_for_recovery_rearm_with_connection(
+            local_order_id,
+            execution_mode=execution_mode,
+        )
+
+    def _load_order_row_for_recovery_rearm_with_connection(
+        self,
+        local_order_id: Optional[str],
+        *,
+        _connection=None,
+        _for_update: bool = False,
+        execution_mode: Optional[str] = None,
+    ) -> dict:
+        """Load one exact ENTRY row, optionally on the admission transaction.
+
+        Ordinary callers retain the existing OSM read path.  The recovery
+        replacement transaction must read and lock every displaced incumbent
+        through the same PostgreSQL connection that owns the candidate fence;
+        otherwise a later incumbent failure can leave an already-committed
+        cancellation behind.
+        """
         oid = str(local_order_id or "").strip()
         if not oid:
             return {}
         osm = getattr(self, "order_state_machine", None)
         if osm is None:
             return {}
+        if _connection is not None:
+            client_id = getattr(osm, "client_id", None)
+            if not isinstance(client_id, str) or not client_id.strip():
+                return {}
+            sql = (
+                "SELECT * FROM orders "
+                "WHERE local_order_id=%s AND client_id=%s AND kind='ENTRY'"
+            )
+            params: list[object] = [oid, client_id]
+            if execution_mode is not None:
+                if not isinstance(execution_mode, str) or execution_mode not in {
+                    "live", "paper",
+                } or execution_mode != execution_mode.strip():
+                    return {}
+                sql += " AND LOWER(TRIM(COALESCE(execution_mode,'')))=%s"
+                params.append(execution_mode)
+            if _for_update:
+                sql += " FOR UPDATE"
+            try:
+                cursor = _connection.execute(sql, tuple(params))
+                fetchone = getattr(cursor, "fetchone", None)
+                if not callable(fetchone):
+                    return {}
+                row = fetchone()
+                return dict(row) if row else {}
+            except Exception as exc:
+                log.warning(
+                    "[%s] recovery rearm transaction row load failed: %s",
+                    oid,
+                    exc,
+                )
+                return {}
         for name in ("get_order", "get", "get_order_by_local_id"):
             fn = getattr(osm, name, None)
             if not callable(fn):
@@ -2160,6 +2254,842 @@ class APEntryWatcher:
             except Exception:
                 continue
         return {}
+
+    @staticmethod
+    def _recovery_identity_matches_durable_row(
+        signal: dict,
+        row: dict,
+        local_order_id: Optional[str],
+    ) -> tuple[bool, str]:
+        """Require one coherent recovery identity on plan and durable row.
+
+        This is the narrow bridge-side fence for PR #580. The upstream
+        recovery proof establishes that a row may be rearmed; this second
+        check makes sure the exact plan handed to ``watch()`` still names that
+        same PENDING_TRIGGER row before the classifier or lifecycle bridge can
+        run. Conflicting top-level/metadata aliases are HOLD, never a
+        best-effort merge.
+        """
+        if not isinstance(row, dict) or not row:
+            return False, "recovery_lifecycle_durable_row_unavailable"
+        if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+            return False, "recovery_lifecycle_durable_row_not_pending_trigger"
+
+        def _metadata_sources(container: dict) -> tuple[list[dict], bool]:
+            sources: list[dict] = []
+            for key in ("metadata", "meta"):
+                if key not in container:
+                    continue
+                raw = container.get(key)
+                if raw is None:
+                    return [], False
+                if isinstance(raw, dict):
+                    sources.append(raw)
+                    continue
+                if isinstance(raw, str):
+                    if not raw.strip():
+                        return [], False
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:
+                        return [], False
+                    if not isinstance(parsed, dict):
+                        return [], False
+                    sources.append(parsed)
+                    continue
+                return [], False
+            return sources, True
+
+        signal_meta, signal_meta_ok = _metadata_sources(signal)
+        row_meta, row_meta_ok = _metadata_sources(row)
+        if not signal_meta_ok or not row_meta_ok:
+            return False, "recovery_lifecycle_malformed_durable_metadata"
+
+        def _coherent(
+            sources: list[dict],
+            aliases: tuple[str, ...],
+            field: str,
+        ) -> tuple[Optional[str], str]:
+            values: list[str] = []
+            for source in sources:
+                for alias in aliases:
+                    if alias not in source:
+                        continue
+                    raw = source.get(alias)
+                    # Durable identity is a typed string contract.  Never
+                    # stringify a numeric/JSON scalar here: JSONB values such
+                    # as 123 and "123" are different authorities and must
+                    # HOLD rather than compare equal after coercion.
+                    if not isinstance(raw, str):
+                        return None, f"recovery_lifecycle_malformed_{field}"
+                    if isinstance(raw, str) and raw != raw.strip():
+                        return None, f"recovery_lifecycle_malformed_{field}"
+                    values.append(raw)
+            if not values or not any(values):
+                return None, f"recovery_lifecycle_missing_{field}"
+            if any(not value for value in values) or len(set(values)) != 1:
+                return None, f"recovery_lifecycle_conflicting_{field}"
+            return values[0], ""
+
+        fields = (
+            ("local_order_id", ("local_order_id",)),
+            ("signal_id", ("signal_id",)),
+            ("canonical_signal_id", ("canonical_signal_id",)),
+            ("client_id", ("client_id", "client_email")),
+            ("execution_mode", ("execution_mode", "mode")),
+            ("ticker", ("ticker", "symbol")),
+            ("side", ("side", "direction")),
+        )
+        signal_sources = [signal, *signal_meta]
+        row_sources = [row, *row_meta]
+        incoming: dict[str, str] = {}
+        durable: dict[str, str] = {}
+        for field, aliases in fields:
+            incoming_value, incoming_error = _coherent(
+                signal_sources, aliases, field,
+            )
+            if incoming_error:
+                return False, incoming_error
+            durable_value, durable_error = _coherent(
+                row_sources, aliases, field,
+            )
+            if durable_error:
+                return False, (
+                    "recovery_lifecycle_durable_"
+                    f"{durable_error.removeprefix('recovery_lifecycle_')}"
+                )
+            incoming[field] = incoming_value or ""
+            durable[field] = durable_value or ""
+
+        requested_local_order_id = str(local_order_id or "").strip()
+        if (
+            not requested_local_order_id
+            or requested_local_order_id != str(local_order_id or "")
+            or incoming["local_order_id"] != requested_local_order_id
+        ):
+            return False, "recovery_lifecycle_identity_mismatch_local_order_id"
+        for field in (
+            "signal_id",
+            "canonical_signal_id",
+            "client_id",
+            "execution_mode",
+            "local_order_id",
+            "ticker",
+            "side",
+        ):
+            if incoming[field] != durable[field]:
+                return False, f"recovery_lifecycle_identity_mismatch_{field}"
+
+        if incoming["execution_mode"] not in {"live", "paper"}:
+            return False, "recovery_lifecycle_invalid_execution_mode"
+        if incoming["side"] not in {"CALL", "PUT"}:
+            return False, "recovery_lifecycle_invalid_side"
+
+        # Generation authorities are a single bound family. Parse the
+        # top-level durable column, metadata, and meta independently on both
+        # the incoming plan and durable row. A row that owns either
+        # materialization_generation or trigger_generation requires both
+        # authorities on both sides, with strict positive-integer equality and
+        # trigger_generation == materialization_generation.
+        incoming_materialization, incoming_materialization_error = (
+            APEntryWatcher._recovery_generation_family_values(
+                signal_sources[0],
+                signal_sources[1:],
+                "materialization_generation",
+                "generation",
+            )
+        )
+        if incoming_materialization_error:
+            return False, incoming_materialization_error
+        durable_materialization, durable_materialization_error = (
+            APEntryWatcher._recovery_generation_family_values(
+                row_sources[0],
+                row_sources[1:],
+                "materialization_generation",
+                "generation",
+            )
+        )
+        if durable_materialization_error:
+            return False, (
+                "recovery_lifecycle_durable_"
+                f"{durable_materialization_error.removeprefix('recovery_lifecycle_')}"
+            )
+        incoming_trigger_generation, incoming_trigger_error = (
+            APEntryWatcher._recovery_generation_family_values(
+                signal_sources[0],
+                signal_sources[1:],
+                "trigger_generation",
+                "trigger_generation",
+            )
+        )
+        if incoming_trigger_error:
+            return False, incoming_trigger_error
+        durable_trigger_generation, durable_trigger_error = (
+            APEntryWatcher._recovery_generation_family_values(
+                row_sources[0],
+                row_sources[1:],
+                "trigger_generation",
+                "trigger_generation",
+            )
+        )
+        if durable_trigger_error:
+            return False, (
+                "recovery_lifecycle_durable_"
+                f"{durable_trigger_error.removeprefix('recovery_lifecycle_')}"
+            )
+
+        any_generation_authority = bool(
+            incoming_materialization
+            or durable_materialization
+            or incoming_trigger_generation
+            or durable_trigger_generation
+        )
+        if signal.get("__recovered_trigger_ready") and not any(
+            (
+                incoming_materialization,
+                durable_materialization,
+                incoming_trigger_generation,
+                durable_trigger_generation,
+            )
+        ):
+            return False, "recovery_lifecycle_trigger_ready_generation_missing"
+        if any_generation_authority:
+            if not incoming_materialization or not durable_materialization:
+                return False, "recovery_lifecycle_generation_authority_mismatch"
+            if not incoming_trigger_generation or not durable_trigger_generation:
+                return False, "recovery_lifecycle_trigger_generation_authority_mismatch"
+            if incoming_materialization[0] != durable_materialization[0]:
+                return False, "recovery_lifecycle_conflicting_generation"
+            if incoming_trigger_generation[0] != durable_trigger_generation[0]:
+                return False, "recovery_lifecycle_conflicting_trigger_generation"
+            if incoming_trigger_generation[0] != incoming_materialization[0]:
+                return False, "recovery_lifecycle_trigger_generation_mismatch"
+            if durable_trigger_generation[0] != durable_materialization[0]:
+                return False, "recovery_lifecycle_durable_trigger_generation_mismatch"
+
+        if signal.get("__recovered_trigger_ready"):
+            def _numeric_authority(
+                sources: list[dict], aliases: tuple[str, ...], field: str,
+            ) -> tuple[Optional[Decimal], str]:
+                values: list[Decimal] = []
+                for source in sources:
+                    for alias in aliases:
+                        if alias not in source:
+                            continue
+                        raw = source.get(alias)
+                        if raw is None or isinstance(raw, bool):
+                            return None, f"recovery_lifecycle_malformed_{field}"
+                        if isinstance(raw, str) and raw != raw.strip():
+                            return None, f"recovery_lifecycle_malformed_{field}"
+                        try:
+                            value = Decimal(str(raw))
+                        except (InvalidOperation, TypeError, ValueError):
+                            return None, f"recovery_lifecycle_malformed_{field}"
+                        if not value.is_finite() or value <= 0:
+                            return None, f"recovery_lifecycle_invalid_{field}"
+                        values.append(value)
+                if not values:
+                    return None, f"recovery_lifecycle_missing_{field}"
+                if any(value != values[0] for value in values[1:]):
+                    return None, f"recovery_lifecycle_conflicting_{field}"
+                return values[0], ""
+
+            economic_fields = (
+                (
+                    "trigger_geometry",
+                    ("trigger_price", "entry_trigger", "signal_entry_price", "entry_price"),
+                ),
+                (
+                    "stop_geometry",
+                    ("stop_underlying", "stop_price", "stop_level", "scanner_stop"),
+                ),
+                (
+                    "target_geometry",
+                    ("target_underlying", "target_price", "target", "profit_target", "pt1"),
+                ),
+            )
+            for _economic_field, _economic_aliases in economic_fields:
+                _incoming_value, _incoming_error = _numeric_authority(
+                    signal_sources, _economic_aliases, _economic_field
+                )
+                if _incoming_error:
+                    return False, _incoming_error
+                _durable_value, _durable_error = _numeric_authority(
+                    row_sources, _economic_aliases, _economic_field
+                )
+                if _durable_error:
+                    return False, (
+                        "recovery_lifecycle_durable_"
+                        f"{_durable_error.removeprefix('recovery_lifecycle_')}"
+                    )
+                if _incoming_value != _durable_value:
+                    return False, f"recovery_lifecycle_{_economic_field}_mismatch"
+
+        # Optional fenced authorities become required on both sides as soon
+        # as either the durable row or the recovery plan claims one.  Absence
+        # is not equality and aliases are never resolved by first-non-empty.
+        optional_authorities = (
+            ("watcher_token", ("watcher_token",)),
+            ("watcher_owner", ("watcher_owner", "current_owner")),
+            ("trigger_cursor", ("trigger_cursor", "trigger_cursor_id")),
+        )
+        for field, aliases in optional_authorities:
+            incoming_present = any(
+                alias in source for source in signal_sources for alias in aliases
+            )
+            durable_present = any(
+                alias in source for source in row_sources for alias in aliases
+            )
+            if not incoming_present and not durable_present:
+                continue
+            incoming_value, incoming_error = _coherent(
+                signal_sources, aliases, field,
+            )
+            if incoming_error:
+                return False, incoming_error
+            durable_value, durable_error = _coherent(
+                row_sources, aliases, field,
+            )
+            if durable_error:
+                return False, (
+                    "recovery_lifecycle_durable_"
+                    f"{durable_error.removeprefix('recovery_lifecycle_')}"
+                )
+            if incoming_value != durable_value:
+                return False, f"recovery_lifecycle_identity_mismatch_{field}"
+
+        def _trigger_evidence(
+            container: dict,
+            sources: list[dict],
+            local_id: str,
+        ) -> tuple[Optional[datetime], Optional[tuple[str, str, str, str]], str]:
+            """Parse confirmed-trigger timestamp and provenance without fallback."""
+            raw_timestamps: list[object] = []
+            raw_provenance: list[object] = []
+            if "trigger_crossed_at" in container:
+                raw_timestamps.append(container.get("trigger_crossed_at"))
+            if "trigger_crossed_at_provenance" in container:
+                raw_provenance.append(container.get("trigger_crossed_at_provenance"))
+            for source in sources:
+                if "trigger_crossed_at" in source:
+                    raw_timestamps.append(source.get("trigger_crossed_at"))
+                if "trigger_crossed_at_provenance" in source:
+                    raw_provenance.append(source.get("trigger_crossed_at_provenance"))
+
+            # ``watch()`` carries an explicit ``None`` placeholder on a
+            # recovery plan when no confirmed breach exists.  That is the
+            # contract's absence-of-proof state; only a populated timestamp
+            # requires provenance validation.
+            if raw_timestamps and all(value is None for value in raw_timestamps):
+                raw_timestamps = []
+
+            if not raw_timestamps:
+                if raw_provenance:
+                    return (
+                        None,
+                        None,
+                        "recovery_lifecycle_trigger_provenance_without_timestamp",
+                    )
+                return None, None, ""
+
+            parsed_timestamps: list[datetime] = []
+            for raw_timestamp in raw_timestamps:
+                parsed = _parse_trigger_crossed_at(raw_timestamp)
+                if parsed is None:
+                    return None, None, "recovery_lifecycle_malformed_trigger_crossed_at"
+                parsed_timestamps.append(parsed.astimezone(timezone.utc))
+            if any(value != parsed_timestamps[0] for value in parsed_timestamps[1:]):
+                return None, None, "recovery_lifecycle_conflicting_trigger_crossed_at"
+
+            if not raw_provenance:
+                return None, None, "recovery_lifecycle_missing_trigger_crossed_at_provenance"
+
+            # Reuse the existing recovery contract after presenting all
+            # metadata aliases as one explicit source.  This keeps the final
+            # row-locked fence aligned with the upstream trigger-evidence
+            # proof instead of maintaining a weaker second definition.
+            merged_metadata: dict = {}
+            for source in sources:
+                merged_metadata.update(source)
+            validation_container = dict(container)
+            validation_container["metadata"] = merged_metadata
+            if not recovery_trigger_evidence_identity_is_proven(
+                validation_container,
+                local_id,
+            ):
+                return None, None, "recovery_lifecycle_trigger_provenance_unproven"
+
+            provenance_keys: list[tuple[str, str, str, str]] = []
+            for provenance in raw_provenance:
+                if not isinstance(provenance, dict):
+                    return None, None, "recovery_lifecycle_malformed_trigger_provenance"
+                provenance_keys.append(
+                    (
+                        str(provenance.get("canonical_signal_id") or "").strip(),
+                        str(provenance.get("client_id") or "").strip().lower(),
+                        str(provenance.get("execution_mode") or "").strip().lower(),
+                        str(provenance.get("local_order_id") or "").strip(),
+                    )
+                )
+            if any(value != provenance_keys[0] for value in provenance_keys[1:]):
+                return None, None, "recovery_lifecycle_conflicting_trigger_provenance"
+            return parsed_timestamps[0], provenance_keys[0], ""
+
+        incoming_trigger, incoming_provenance, incoming_trigger_error = _trigger_evidence(
+            signal,
+            signal_sources,
+            requested_local_order_id,
+        )
+        if incoming_trigger_error:
+            return False, incoming_trigger_error
+        durable_trigger, durable_provenance, durable_trigger_error = _trigger_evidence(
+            row,
+            row_sources,
+            requested_local_order_id,
+        )
+        if durable_trigger_error:
+            return False, durable_trigger_error
+        if (incoming_trigger is None) != (durable_trigger is None):
+            return False, "recovery_lifecycle_trigger_crossed_at_authority_mismatch"
+        if incoming_trigger is not None and incoming_trigger != durable_trigger:
+            return False, "recovery_lifecycle_trigger_crossed_at_mismatch"
+        if incoming_provenance != durable_provenance:
+            return False, "recovery_lifecycle_trigger_provenance_mismatch"
+
+        return True, "recovery_lifecycle_durable_identity_proven"
+
+    @staticmethod
+    def _recovery_strict_metadata_sources(container: dict) -> tuple[list[dict], bool]:
+        """Parse durable metadata aliases without turning bad data into absence."""
+        if not isinstance(container, dict):
+            return [], False
+        sources: list[dict] = []
+        for key in ("metadata", "meta"):
+            if key not in container:
+                continue
+            raw = container.get(key)
+            if isinstance(raw, dict):
+                sources.append(raw)
+                continue
+            if not isinstance(raw, str) or not raw.strip():
+                return [], False
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                return [], False
+            if not isinstance(parsed, dict):
+                return [], False
+            sources.append(parsed)
+        return sources, True
+
+    @staticmethod
+    def _recovery_generation_values(
+        signal: dict,
+        metadata_sources: list[dict],
+    ) -> tuple[list[int], str | None]:
+        """Return strict materialization-generation authorities.
+
+        The top-level column and each independently parsed metadata alias are
+        separate authorities.  They are never collapsed with truthiness or a
+        first-non-empty fallback.  Keep this compatibility wrapper for callers
+        that specifically ask for ``materialization_generation``.
+        """
+        return APEntryWatcher._recovery_generation_family_values(
+            signal,
+            metadata_sources,
+            "materialization_generation",
+            "generation",
+        )
+
+    @staticmethod
+    def _recovery_generation_family_values(
+        signal: dict,
+        metadata_sources: list[dict],
+        field: str,
+        reason_field: str,
+    ) -> tuple[list[int], str | None]:
+        """Parse one durable generation family without coercion.
+
+        Numeric strings are accepted only when they contain ASCII digits and
+        represent a strictly positive integer.  Booleans, floats (including
+        integral floats), fractional strings, signs, whitespace, blank values,
+        malformed scalars, zero, and negative values are all HOLD conditions.
+        Every top-level/metadata authority must agree exactly.
+        """
+        authorities: list[object] = []
+        if field in signal:
+            authorities.append(signal.get(field))
+        for source in metadata_sources:
+            if field in source:
+                authorities.append(source.get(field))
+
+        parsed: list[int] = []
+        for raw in authorities:
+            if isinstance(raw, bool):
+                return [], f"recovery_lifecycle_malformed_{reason_field}"
+            if isinstance(raw, int):
+                parsed_value = raw
+            elif isinstance(raw, str) and re.fullmatch(r"[0-9]+", raw):
+                parsed_value = int(raw)
+            else:
+                return [], f"recovery_lifecycle_malformed_{reason_field}"
+            if parsed_value <= 0:
+                return [], (
+                    f"recovery_lifecycle_zero_{reason_field}"
+                    if parsed_value == 0
+                    else f"recovery_lifecycle_negative_{reason_field}"
+                )
+            parsed.append(parsed_value)
+        if parsed and any(value != parsed[0] for value in parsed[1:]):
+            return [], f"recovery_lifecycle_conflicting_{reason_field}"
+        return parsed, None
+
+    def _recovery_final_durable_authority(
+        self,
+        watched,
+        row: Optional[dict] = None,
+    ) -> tuple[bool, str, dict]:
+        """Prove the exact row still belongs to recovery immediately before commit.
+
+        ``watch()`` performs an earlier recovery read for classification.  That
+        read is intentionally not reused here: conflict arbitration and lifecycle
+        restoration run under ``self._lock``, and this final read is the last
+        durable authority check before either lifecycle or registry ownership is
+        committed.  There is no existing OSM CAS for *watcher admission* (the
+        available CAS methods claim materialization/retry owners), so this is the
+        narrowest compatible fence: exact identity + canonical broker/materializer
+        predicates on a fresh row while the in-process registry lock is held.
+
+        A caller may pass a row only when it was obtained at this same final
+        boundary.  The normal recovery path leaves it unset so the helper always
+        rereads the OSM row.
+        """
+        signal = getattr(watched, "signal", {}) or {}
+        if not isinstance(signal, dict):
+            return False, "recovery_lifecycle_malformed_signal", {}
+
+        if row is None:
+            if getattr(self, "_test_only_allow_recovery_without_row_lock", False):
+                osm = getattr(self, "order_state_machine", None)
+                if osm is None or not any(
+                    callable(getattr(osm, name, None))
+                    for name in ("get_order", "get", "get_order_by_local_id")
+                ):
+                    return True, "recovery_lifecycle_explicit_test_fence_bypass", {}
+                row = self._load_order_row_for_recovery_rearm(
+                    signal.get("local_order_id"),
+                    execution_mode=signal.get("execution_mode"),
+                )
+            else:
+                osm = getattr(self, "order_state_machine", None)
+                if osm is None or not any(
+                    callable(getattr(osm, name, None))
+                    for name in ("get_order", "get", "get_order_by_local_id")
+                ):
+                    return False, "recovery_lifecycle_durable_fence_unavailable", {}
+                row = self._load_order_row_for_recovery_rearm(
+                    signal.get("local_order_id"),
+                    execution_mode=signal.get("execution_mode"),
+                )
+
+        if not isinstance(row, dict) or not row:
+            return False, "recovery_lifecycle_durable_row_unavailable", {}
+        if (
+            "kind" in row
+            and str(row.get("kind") or "").strip().upper() != "ENTRY"
+        ):
+            return False, "recovery_lifecycle_durable_row_not_entry", row
+        local_order_id = str(signal.get("local_order_id") or "").strip()
+        identity_ok, identity_reason = self._recovery_identity_matches_durable_row(
+            signal, row, local_order_id,
+        )
+        if not identity_ok:
+            return False, identity_reason, row
+
+        row_sources, metadata_ok = self._recovery_strict_metadata_sources(row)
+        signal_sources, signal_metadata_ok = self._recovery_strict_metadata_sources(signal)
+        if not metadata_ok or not signal_metadata_ok:
+            return False, "recovery_lifecycle_malformed_durable_metadata", row
+
+        row_generations, row_generation_error = self._recovery_generation_values(
+            row, row_sources,
+        )
+        if row_generation_error:
+            return False, row_generation_error, row
+        signal_generations, signal_generation_error = self._recovery_generation_values(
+            signal, signal_sources,
+        )
+        if signal_generation_error:
+            return False, signal_generation_error, row
+        if bool(row_generations) != bool(signal_generations):
+            return False, "recovery_lifecycle_generation_authority_mismatch", row
+        if row_generations and row_generations[0] != signal_generations[0]:
+            return False, "recovery_lifecycle_conflicting_generation", row
+
+        row_trigger_generations, row_trigger_generation_error = (
+            self._recovery_generation_family_values(
+                row,
+                row_sources,
+                "trigger_generation",
+                "trigger_generation",
+            )
+        )
+        if row_trigger_generation_error:
+            return False, row_trigger_generation_error, row
+        signal_trigger_generations, signal_trigger_generation_error = (
+            self._recovery_generation_family_values(
+                signal,
+                signal_sources,
+                "trigger_generation",
+                "trigger_generation",
+            )
+        )
+        if signal_trigger_generation_error:
+            return False, signal_trigger_generation_error, row
+        if bool(row_trigger_generations) != bool(signal_trigger_generations):
+            return False, "recovery_lifecycle_trigger_generation_authority_mismatch", row
+        if row_trigger_generations and row_trigger_generations[0] != signal_trigger_generations[0]:
+            return False, "recovery_lifecycle_conflicting_trigger_generation", row
+        if row_generations or signal_generations or row_trigger_generations or signal_trigger_generations:
+            if not row_generations or not signal_generations:
+                return False, "recovery_lifecycle_generation_authority_mismatch", row
+            if not row_trigger_generations or not signal_trigger_generations:
+                return False, "recovery_lifecycle_trigger_generation_authority_mismatch", row
+            if row_trigger_generations[0] != row_generations[0]:
+                return False, "recovery_lifecycle_durable_trigger_generation_mismatch", row
+            if signal_trigger_generations[0] != signal_generations[0]:
+                return False, "recovery_lifecycle_trigger_generation_mismatch", row
+        if signal.get("__recovered_trigger_ready") and not (
+            row_generations
+            and signal_generations
+            and row_trigger_generations
+            and signal_trigger_generations
+            and row_generations[0] == row_trigger_generations[0]
+            and signal_generations[0] == signal_trigger_generations[0]
+        ):
+            return False, "recovery_lifecycle_trigger_ready_generation_missing", row
+
+        merged_meta: dict = {}
+        for source in row_sources:
+            for key, value in source.items():
+                if key in merged_meta and merged_meta[key] != value:
+                    return False, "recovery_lifecycle_conflicting_durable_metadata", row
+                merged_meta[key] = value
+
+        # These are existing canonical ownership surfaces.  A partially
+        # written or caller-mismatched recovery owner is unknown authority,
+        # not permission to rearm.  The REARM_WATCHER_REQUIRED contract may
+        # intentionally carry the exact recovery scheduler owner from the
+        # durable row into the candidate plan; that exact pair is compatible
+        # and is not a new competing owner.  Do not resolve either alias by
+        # truthiness or allow one side to fall through to the other.
+        signal_meta: dict = {}
+        for source in signal_sources:
+            for key, value in source.items():
+                if key in signal_meta and signal_meta[key] != value:
+                    return False, "recovery_lifecycle_conflicting_signal_metadata", row
+                signal_meta[key] = value
+        for key in ("recovery_ownership", "recovery_owner"):
+            row_raw = merged_meta.get(key)
+            signal_raw = signal_meta.get(key)
+            row_value = "" if row_raw is None else row_raw
+            signal_value = "" if signal_raw is None else signal_raw
+            if (
+                not isinstance(row_value, str)
+                or not isinstance(signal_value, str)
+                or (row_value and not row_value.strip())
+                or (signal_value and not signal_value.strip())
+            ):
+                return False, "recovery_lifecycle_hold_existing_recovery_owner", row
+            if row_value.strip() != signal_value.strip():
+                return False, "recovery_lifecycle_hold_existing_recovery_owner", row
+        # A false in-flight flag is an explicit non-active state and is safe;
+        # malformed values remain unknown authority. A non-empty owner/lease
+        # is held as active authority when the row has the corresponding
+        # MATERIALIZING/RUNNING shape, while a retained retry owner remains
+        # compatible with the separate RETRY_PENDING contract.
+        _in_flight = merged_meta.get("materialization_in_flight")
+        if _in_flight is not None and not isinstance(_in_flight, bool):
+            return False, "recovery_lifecycle_hold_materialization_authority", row
+        _materialization_active_shape = (
+            _in_flight is True
+            or str(merged_meta.get("lifecycle_state") or "").strip().upper()
+            == "MATERIALIZING"
+            or str(merged_meta.get("materialization_status") or "").strip().upper()
+            == "RUNNING"
+        )
+        if _materialization_active_shape:
+            # Any active shape is competing authority.  It is not safe to
+            # interpret a missing owner/lease as "no owner"; require the
+            # canonical complete proof before allowing this recovery fence to
+            # proceed.  The canonical predicate fails closed for missing,
+            # malformed, stale, or contradictory active metadata.
+            try:
+                from ap.pending_trigger_classifier import (
+                    is_active_materialization_in_flight,
+                )
+
+                _active_row = dict(row)
+                _active_row["meta"] = merged_meta
+                if not is_active_materialization_in_flight(_active_row):
+                    return False, "recovery_lifecycle_hold_materialization_authority", row
+            except Exception:
+                return False, "recovery_lifecycle_hold_materialization_authority", row
+        for key in ("materialization_owner", "materialization_lease_until"):
+            raw = merged_meta.get(key)
+            if raw is not None and not isinstance(raw, str):
+                return False, "recovery_lifecycle_hold_materialization_authority", row
+            if raw is not None and raw.strip() and _materialization_active_shape:
+                return False, "recovery_lifecycle_hold_materialization_authority", row
+
+        if self._recovery_has_broker_handoff_evidence(row, merged_meta):
+            return False, "recovery_lifecycle_hold_broker_handoff_evidence", row
+
+        return True, "recovery_lifecycle_final_durable_authority_proven", row
+
+    @contextmanager
+    def _recovery_admission_row_lock(self, watched):
+        """Serialize the final recovery-admission boundary on the OSM row.
+
+        The existing OSM CAS methods fence materialization, retry, and broker
+        submit owners, but there is no generic watcher-admission CAS.  For the
+        actual PostgreSQL OSM, hold the exact ENTRY row with ``FOR UPDATE``
+        until the caller has completed lifecycle restoration and the in-memory
+        registry commit.  A concurrent owner therefore either commits before
+        this fence (and is observed by the final proof) or waits until this
+        recovery candidate is already committed.  No broker or materializer
+        authority is created here.
+
+        Tests may bypass PostgreSQL only by setting the explicit
+        ``_test_only_allow_recovery_without_row_lock`` seam.  Missing runtime
+        identity never implies test mode.
+        """
+        signal = getattr(watched, "signal", {}) or {}
+        osm = getattr(self, "order_state_machine", None)
+        client_id = getattr(osm, "client_id", None) if osm is not None else None
+        local_order_id = str(signal.get("local_order_id") or "").strip()
+        signal_client_raw = signal.get("client_id")
+        signal_client_id = (
+            signal_client_raw
+            if isinstance(signal_client_raw, str)
+            else ""
+        )
+        signal_mode_raw = signal.get("execution_mode")
+        signal_mode = (
+            signal_mode_raw.strip()
+            if isinstance(signal_mode_raw, str)
+            else ""
+        )
+
+        if getattr(self, "_test_only_allow_recovery_without_row_lock", False):
+            try:
+                yield None, None, None
+            except BaseException as exc:
+                if getattr(exc, "recovery_admission_rollback", False):
+                    self._recovery_admission_abort_reason = str(exc)
+                    return
+                raise
+            return
+
+        if (
+            not isinstance(client_id, str)
+            or not client_id.strip()
+            or not local_order_id
+            or not signal_client_id.strip()
+            or signal_mode not in {"live", "paper"}
+        ):
+            yield None, "recovery_lifecycle_missing_durable_fence_identity", None
+            return
+        if (
+            client_id != client_id.strip()
+            or signal_client_id != signal_client_id.strip()
+            or not isinstance(signal_mode_raw, str)
+            or signal_mode_raw != signal_mode_raw.strip()
+        ):
+            yield None, "recovery_lifecycle_identity_mismatch_client_id", None
+            return
+        if client_id != signal_client_id:
+            yield None, "recovery_lifecycle_identity_mismatch_client_id", None
+            return
+
+        try:
+            from ap.db import conn as _ap_conn  # type: ignore
+        except Exception as exc:
+            log.critical(
+                "[%s] recovery admission durable fence unavailable: %s",
+                getattr(watched, "ticker", "?"),
+                exc,
+            )
+            yield None, "recovery_lifecycle_durable_fence_unavailable", None
+            return
+
+        _db_context = None
+        try:
+            _db_context = _ap_conn()
+            _connection = _db_context.__enter__()
+            _cursor = _connection.execute(
+                "SELECT * FROM orders "
+                "WHERE local_order_id = %s AND client_id = %s "
+                "AND kind = 'ENTRY' "
+                "AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s "
+                "FOR UPDATE",
+                (local_order_id, signal_client_id, signal_mode),
+            )
+            _fetchone = getattr(_cursor, "fetchone", None)
+            if not callable(_fetchone):
+                _db_context.__exit__(None, None, None)
+                yield None, "recovery_lifecycle_durable_fence_unavailable", None
+                return
+            _row = _fetchone()
+            _row = dict(_row) if _row else None
+            if _row is None:
+                _db_context.__exit__(None, None, None)
+                yield None, "recovery_lifecycle_durable_row_unavailable", None
+                return
+        except Exception as exc:
+            if _db_context is not None:
+                try:
+                    _db_context.__exit__(type(exc), exc, exc.__traceback__)
+                except Exception:
+                    pass
+            log.critical(
+                "[%s] recovery admission durable row lock failed local_order_id=%s: %s",
+                getattr(watched, "ticker", "?"),
+                local_order_id,
+                exc,
+            )
+            yield None, "recovery_lifecycle_durable_fence_unavailable", None
+            return
+
+        try:
+            # The transaction remains open, so the row lock remains held while
+            # the caller performs the final proof and commits the watcher.
+            # Keep the connection visible to the commit helper so every
+            # incumbent read/cancellation and its terminal reread stays in
+            # this same transaction until the candidate has converged.
+            yield _row, None, _connection
+        except BaseException as exc:
+            _db_context.__exit__(type(exc), exc, exc.__traceback__)
+            if getattr(exc, "recovery_admission_rollback", False):
+                self._recovery_admission_abort_reason = str(exc)
+                return
+            raise
+        else:
+            try:
+                _db_context.__exit__(None, None, None)
+            except Exception as exc:
+                # A commit failure means the durable candidate/incident
+                # transaction is not proven.  Convert it into the same
+                # fail-closed cleanup path used for incumbent proof failure;
+                # never leak an exception after lifecycle/registry mutation.
+                log.critical(
+                    "[%s] recovery admission transaction commit failed: %s",
+                    getattr(watched, "ticker", "?"),
+                    exc,
+                )
+                self._recovery_admission_abort_reason = (
+                    "recovery_lifecycle_durable_commit_failed"
+                )
 
     def _is_past_entry_cutoff_now(self) -> bool:
         try:
@@ -3044,6 +3974,879 @@ class APEntryWatcher:
         """Return whether legacy same-side arbitration applies."""
         return True
 
+    # ─────────────────────────────────────────────────────────────────────
+    # PR #580 — Recovery lifecycle restoration bridge
+    #
+    # Owns exactly ONE defect class: a durable PENDING_TRIGGER watcher
+    # that survives / reappears after a DB or process outage, with valid
+    # recovery/reattach authority, but whose in-memory ap_lifecycle
+    # ledger has no state for the recovered signal. On confirmed breach
+    # the watcher attempts NONE -> TRIGGER_READY, which is (correctly)
+    # illegal, so _current_state stays NONE, on_trigger fires anyway,
+    # downstream fails, and the WATCHER_TRIGGER_CALLBACK_ATTEMPT loops
+    # (September 4 2026 Jason LIVE PEP replay).
+    #
+    # This bridge restores in-memory lifecycle ownership BEFORE the
+    # watcher becomes behavior-active in the poll loop, using the
+    # existing lifecycle API — NONE -> ADOPTED -> WATCHING. For the
+    # separately proven durable TRIGGER_READY marker, it then replays
+    # the legal WATCHING -> TRIGGER_READY transition without consulting
+    # a replacement quote; ordinary recovery never writes TRIGGER_READY.
+    #
+    # It runs only when signal["__recovery_rearm"] is True — a marker
+    # placed by watch() AFTER recovery_trigger_evidence_identity_is_proven()
+    # has already verified exact durable identity (spec §8 binding rule:
+    # "Do not make an unverified plan capable of requesting lifecycle
+    # restoration"). Ordinary new admissions are untouched.
+    #
+    # It does not add broker submit/cancel authority. It does not add
+    # any durable retry counter. It does not weaken LEGAL_TRANSITIONS.
+    # See docs/pr_specs/p0_post_outage_trigger_lifecycle_convergence_20260904.md
+    # ─────────────────────────────────────────────────────────────────────
+    # ── Broker handoff evidence check (Correction 1 / PR #580 amendment) ────
+    @staticmethod
+    def _recovery_has_broker_handoff_evidence(sig: dict, meta: dict) -> bool:
+        """Return whether canonical durable broker authority has advanced.
+
+        Recovery used to maintain a second handoff vocabulary here. That
+        drifted from ``ap.pending_trigger_classifier`` and incorrectly treated
+        ``watcher_audit.reason_code == 'trigger_ready'`` as broker ownership.
+        Reuse the canonical classifier and materialization proof instead. The
+        classifier's ``NOT_PENDING_TRIGGER`` result is the canonical row-level
+        check for populated ``broker_order_id``/``submitted_ts``; its dedicated
+        predicates own durable submit-intent and active-materializer evidence.
+
+        An unavailable canonical authority is HOLD, not permission to rearm.
+        """
+        if not isinstance(sig, dict) or not isinstance(meta, dict):
+            return True
+
+        _row = dict(sig)
+        # The lifecycle bridge receives a signal-shaped mapping, while the
+        # canonical predicates receive an orders-shaped mapping. Supplying the
+        # known row status and canonical merged meta is an adapter only; it does
+        # not introduce another handoff definition.
+        _row["status"] = "PENDING_TRIGGER"
+        _row["meta"] = meta
+        try:
+            from ap.pending_trigger_classifier import (
+                PendingTriggerClassification as _PTC,
+                classify_pending_trigger_row as _classify_pending_trigger_row,
+                has_broker_handoff_evidence as _has_broker_handoff_evidence,
+                is_active_materialization_in_flight as _is_active_materialization_in_flight,
+            )
+        except Exception:
+            return True
+
+        if _classify_pending_trigger_row(_row) == _PTC.NOT_PENDING_TRIGGER:
+            return True
+        if _has_broker_handoff_evidence(_row):
+            return True
+        return bool(_is_active_materialization_in_flight(_row))
+
+    def _restore_recovered_watcher_lifecycle(
+        self,
+        watched,
+        *,
+        recovered_trigger_ready: bool = False,
+    ) -> tuple[bool, str]:
+        """Restore in-memory lifecycle for a proven-recovery watcher.
+
+        Returns ``(ok, reason_code)``. ``ok=False`` means HOLD — the
+        caller must refuse admission; no watcher is registered, no
+        dedup entry added, no broker state mutated.
+
+        Correction 3 (PR #580 amendment): lifecycle import failure is
+        now HOLD, not soft success. A recovery bridge that cannot read
+        lifecycle state cannot determine whether admission is safe.
+
+        Correction 2: full durable identity is validated before any
+        lifecycle write. No UUID fallback, no mode fallback, no default
+        side. Blank/whitespace/zero/negative values are refused.
+
+        Correction 1: broker handoff evidence is checked from the
+        signal dict / metadata before any lifecycle mutation.
+        """
+        # Correction 3: lifecycle module unavailable → HOLD, not soft pass.
+        # A recovery bridge that cannot read lifecycle state cannot determine
+        # whether admission is safe. Ordinary (non-recovery) admissions are
+        # unaffected — they do not call this function.
+        if not _EW_LIFECYCLE_OK:
+            return False, "recovery_lifecycle_unavailable_hold"
+
+        # ── Full durable identity validation (Correction 2) ──────────────
+        #
+        # All identity fields come from the signal dict column values.
+        # No metadata fallback is used for required fields; a blank column
+        # value is a data-integrity failure → HOLD. execution_mode is
+        # NOT lowercased: the durable row always stores it lowercase
+        # ("live"/"paper"); any other form means the row is corrupt.
+        sig = getattr(watched, "signal", {}) or {}
+        if not isinstance(sig, dict):
+            return False, "recovery_lifecycle_malformed_signal"
+        _recovered_trigger_ready = bool(
+            recovered_trigger_ready or sig.get("__recovered_trigger_ready")
+        )
+
+        # Parse both durable metadata aliases independently. An explicit
+        # malformed alias is not absence, and conflicting aliases are not
+        # resolved by truthiness or last-writer order.
+        _meta_sources: list[dict] = []
+        for _meta_key in ("metadata", "meta"):
+            if _meta_key not in sig:
+                continue
+            _raw_meta = sig.get(_meta_key)
+            if isinstance(_raw_meta, dict):
+                _meta_sources.append(_raw_meta)
+                continue
+            if not isinstance(_raw_meta, str) or not _raw_meta.strip():
+                return False, "recovery_lifecycle_malformed_durable_metadata"
+            try:
+                _parsed_meta = json.loads(_raw_meta)
+            except Exception:
+                return False, "recovery_lifecycle_malformed_durable_metadata"
+            if not isinstance(_parsed_meta, dict):
+                return False, "recovery_lifecycle_malformed_durable_metadata"
+            _meta_sources.append(_parsed_meta)
+
+        meta: dict = {}
+        for _meta_source in _meta_sources:
+            for _meta_key, _meta_value in _meta_source.items():
+                if _meta_key in meta and meta[_meta_key] != _meta_value:
+                    return False, "recovery_lifecycle_conflicting_durable_metadata"
+                meta[_meta_key] = _meta_value
+
+        def _required_identity_string(field: str) -> Optional[str]:
+            raw = sig.get(field)
+            if not isinstance(raw, str) or not raw or raw != raw.strip():
+                return None
+            return raw
+
+        # Recovery identity is a typed durable contract.  Do not stringify a
+        # JSON scalar, fall back to a WatchedSignal-normalized attribute, or
+        # silently case-normalize an execution mode/side before the final row
+        # proof.  The ordinary constructor may retain its legacy normalization;
+        # this bridge must not.
+        signal_id = _required_identity_string("signal_id")
+        ticker = _required_identity_string("ticker")
+        canonical_signal_id = _required_identity_string("canonical_signal_id")
+        client_id = _required_identity_string("client_id")
+        execution_mode = _required_identity_string("execution_mode")
+        local_order_id = _required_identity_string("local_order_id")
+        side = _required_identity_string("side")
+
+        # Required non-empty column fields — no UUID fallback, no mode fallback,
+        # no default side. Any gap is HOLD.
+        if not signal_id or not ticker:
+            return False, "recovery_lifecycle_missing_signal_identity"
+        if ticker != ticker.upper():
+            return False, "recovery_lifecycle_invalid_ticker"
+        if not client_id:
+            return False, "recovery_lifecycle_missing_client_id"
+        if execution_mode not in ("live", "paper"):
+            return False, "recovery_lifecycle_invalid_execution_mode"
+        if not local_order_id:
+            return False, "recovery_lifecycle_missing_local_order_id"
+        if not canonical_signal_id:
+            return False, "recovery_lifecycle_missing_canonical_signal_id"
+        if side not in ("CALL", "PUT"):
+            return False, "recovery_lifecycle_invalid_side"
+        watched_side = getattr(watched, "side", None)
+        if not isinstance(watched_side, str) or watched_side != side:
+            return False, "recovery_lifecycle_invalid_side"
+        watched_ticker = getattr(watched, "ticker", None)
+        if not isinstance(watched_ticker, str) or watched_ticker != ticker:
+            return False, "recovery_lifecycle_invalid_ticker"
+
+        # Materialization generation is an optional recovery authority in this
+        # contract, but every populated source must be strict and coherent.
+        # Never use ``or``: explicit zero/blank/False is data, not absence.
+        _parsed_generations, _generation_error = self._recovery_generation_values(
+            sig, _meta_sources,
+        )
+        if _generation_error:
+            return False, _generation_error
+
+        _trigger_generations, _trigger_generation_error = (
+            self._recovery_generation_family_values(
+                sig,
+                _meta_sources,
+                "trigger_generation",
+                "trigger_generation",
+            )
+        )
+        if _trigger_generation_error:
+            return False, _trigger_generation_error
+        if _recovered_trigger_ready and not (
+            _parsed_generations
+            and _trigger_generations
+            and _parsed_generations[0] == _trigger_generations[0]
+        ):
+            return False, "recovery_lifecycle_trigger_ready_generation_missing"
+        if _parsed_generations or _trigger_generations:
+            if not _parsed_generations:
+                return False, "recovery_lifecycle_generation_authority_mismatch"
+            if not _trigger_generations:
+                return False, "recovery_lifecycle_trigger_generation_authority_mismatch"
+            if _trigger_generations[0] != _parsed_generations[0]:
+                return False, "recovery_lifecycle_trigger_generation_mismatch"
+
+        # ── Broker handoff evidence check (Correction 1) ──────────────────
+        #
+        # If any durable evidence proves the broker already owns or has
+        # touched this order, recovery must HOLD immediately — before any
+        # lifecycle write, before any watcher registration, before any
+        # callback. The broker-intent reconciler (when available) is the
+        # only authority that may resolve such ambiguity.
+        if self._recovery_has_broker_handoff_evidence(sig, meta):
+            return False, "recovery_lifecycle_hold_broker_handoff_evidence"
+
+        try:
+            current = _EW_LEDGER.current_state(signal_id)
+        except Exception:
+            # Never crash the watcher on a lifecycle read failure. HOLD
+            # is the safe choice: we cannot prove admission is legal.
+            return False, "recovery_lifecycle_read_failed"
+
+        if _recovered_trigger_ready:
+            # The durable trigger evidence is the authority for this restart;
+            # do not wait for a new quote and do not reinterpret the setup.
+            if not recovery_trigger_evidence_identity_is_proven(
+                sig, local_order_id
+            ):
+                return False, "recovery_lifecycle_trigger_provenance_unproven"
+            if current in {
+                _EW_SS.POSITION_OPENED,
+                _EW_SS.POSITION_RESEEDED,
+                _EW_SS.RECOVERED_POSITION,
+                _EW_SS.INVALIDATED,
+                _EW_SS.EXPIRED,
+                _EW_SS.CANCELLED,
+                _EW_SS.REJECTED,
+                _EW_SS.REMOVED,
+                _EW_SS.ERROR,
+                _EW_SS.ENTRY_SUBMITTED,
+                _EW_SS.LOADED_BY_OSM,
+                _EW_SS.REVALIDATING,
+                _EW_SS.EVALUATING,
+                _EW_SS.REGISTERED,
+            }:
+                return False, f"recovery_lifecycle_hold_state_{current.value}"
+            try:
+                if current is None:
+                    signal_adopted(
+                        signal_id,
+                        ticker,
+                        _EW_LO.RECOVERY,
+                        reason="restart_recovery_loaded_trigger_ready_signal",
+                    )
+                    current = _EW_LEDGER.current_state(signal_id)
+                if current == _EW_SS.ADOPTED:
+                    # Keep the canonical recovery sequence intact even when
+                    # the durable trigger was already confirmed before the
+                    # process died: NONE -> ADOPTED -> WATCHING ->
+                    # TRIGGER_READY.  Do not skip WATCHING merely because the
+                    # final durable state is trigger-ready.
+                    signal_watching(
+                        signal_id,
+                        ticker,
+                        _EW_LO.WATCHER,
+                        reason="restored_watching_before_durable_trigger_ready",
+                    )
+                    current = _EW_LEDGER.current_state(signal_id)
+                if current == _EW_SS.WATCHING:
+                    signal_triggered(
+                        signal_id,
+                        ticker,
+                        _EW_LO.WATCHER,
+                        reason="restored_durable_trigger_ready_after_restart",
+                        materialization_generation=_parsed_generations[0],
+                        trigger_generation=_trigger_generations[0],
+                    )
+                elif current != _EW_SS.TRIGGER_READY:
+                    return False, f"recovery_lifecycle_hold_unexpected_state_{current.value}"
+            except Exception:
+                _repaired = self._record_recovery_lifecycle_failure(
+                    signal_id,
+                    ticker,
+                    "recovery_lifecycle_trigger_ready_restore_raised",
+                )
+                if not _repaired:
+                    return False, "recovery_lifecycle_quarantine_unrepaired"
+                return False, "recovery_lifecycle_trigger_ready_restore_raised"
+            if _EW_LEDGER.current_state(signal_id) != _EW_SS.TRIGGER_READY:
+                return False, "recovery_lifecycle_trigger_ready_not_applied"
+            watched.state = WatchState.TRIGGERED
+            watched.triggered_at = datetime.now(timezone.utc)
+            watched.trigger_price = watched.entry_trigger
+            watched.breach_count = max(
+                int(getattr(watched, "breach_count", 0) or 0),
+                int(getattr(watched, "MOMENTUM_POLLS_REQUIRED", 2) or 2),
+            )
+            return True, "recovery_lifecycle_trigger_ready_resumed"
+
+        # ── Terminal / superseded / incompatible states — HOLD ────────
+        #
+        # §6: contradictory or terminal in-memory state (POSITION_OPENED,
+        # POSITION_RESEEDED, REMOVED, INVALIDATED, EXPIRED, REJECTED,
+        # CANCELLED, ERROR) — do not register a second behavior-active
+        # watcher; do not invoke callback; do not broker submit/cancel.
+        #
+        # §16 broker-ready negative control: if a downstream owner
+        # already holds authority (ENTRY_SUBMITTED means execution has
+        # taken over from the watcher), do NOT re-fire the watcher
+        # callback. Route to the existing recovery owner instead.
+        #
+        # LOADED_BY_OSM and REVALIDATING both represent another owner
+        # already actively working the signal — HOLD out of respect for
+        # that ownership.
+        _TERMINAL_OR_SUPERSEDED = {
+            _EW_SS.POSITION_OPENED,
+            _EW_SS.POSITION_RESEEDED,
+            _EW_SS.RECOVERED_POSITION,
+            _EW_SS.INVALIDATED,
+            _EW_SS.EXPIRED,
+            _EW_SS.CANCELLED,
+            _EW_SS.REJECTED,
+            _EW_SS.REMOVED,
+            _EW_SS.ERROR,
+            _EW_SS.ENTRY_SUBMITTED,
+            _EW_SS.TRIGGER_READY,      # a prior owner already advanced past WATCHING
+            _EW_SS.LOADED_BY_OSM,
+            _EW_SS.REVALIDATING,
+            _EW_SS.EVALUATING,
+            _EW_SS.REGISTERED,
+        }
+        if current in _TERMINAL_OR_SUPERSEDED:
+            return False, f"recovery_lifecycle_hold_state_{current.value}"
+
+        # ── Idempotent: already WATCHING ──────────────────────────────
+        if current == _EW_SS.WATCHING:
+            return True, "recovery_lifecycle_idempotent_watching"
+
+        # ── ADOPTED → WATCHING (single legal transition) ──────────────
+        if current == _EW_SS.ADOPTED:
+            try:
+                signal_watching(
+                    signal_id, ticker, _EW_LO.WATCHER,
+                    reason="restored_to_watching_after_restart",
+                )
+            except Exception:
+                _repaired = self._record_recovery_lifecycle_failure(
+                    signal_id,
+                    ticker,
+                    "recovery_lifecycle_adopted_to_watching_raised",
+                )
+                if not _repaired:
+                    return False, "recovery_lifecycle_quarantine_unrepaired"
+                return False, "recovery_lifecycle_adopted_to_watching_raised"
+            if _EW_LEDGER.current_state(signal_id) != _EW_SS.WATCHING:
+                _repaired = self._record_recovery_lifecycle_failure(
+                    signal_id,
+                    ticker,
+                    "recovery_lifecycle_adopted_to_watching_not_applied",
+                )
+                if not _repaired:
+                    return False, "recovery_lifecycle_quarantine_unrepaired"
+                return False, "recovery_lifecycle_adopted_to_watching_not_applied"
+            return True, "recovery_lifecycle_adopted_to_watching"
+
+        # ── NONE → ADOPTED → WATCHING (full restoration) ──────────────
+        if current is None:
+            try:
+                signal_adopted(
+                    signal_id, ticker,
+                    reason="restart_recovery_loaded_existing_signal",
+                )
+            except Exception:
+                _repaired = self._record_recovery_lifecycle_failure(
+                    signal_id,
+                    ticker,
+                    "recovery_lifecycle_adopt_raised",
+                )
+                if not _repaired:
+                    return False, "recovery_lifecycle_quarantine_unrepaired"
+                return False, "recovery_lifecycle_adopt_raised"
+            if _EW_LEDGER.current_state(signal_id) != _EW_SS.ADOPTED:
+                _repaired = self._record_recovery_lifecycle_failure(
+                    signal_id,
+                    ticker,
+                    "recovery_lifecycle_adopt_not_applied",
+                )
+                if not _repaired:
+                    return False, "recovery_lifecycle_quarantine_unrepaired"
+                return False, "recovery_lifecycle_adopt_not_applied"
+            try:
+                signal_watching(
+                    signal_id, ticker, _EW_LO.WATCHER,
+                    reason="restored_to_watching_after_restart",
+                )
+            except Exception:
+                _repaired = self._record_recovery_lifecycle_failure(
+                    signal_id,
+                    ticker,
+                    "recovery_lifecycle_watching_raised",
+                )
+                if not _repaired:
+                    return False, "recovery_lifecycle_quarantine_unrepaired"
+                return False, "recovery_lifecycle_watching_raised"
+            if _EW_LEDGER.current_state(signal_id) != _EW_SS.WATCHING:
+                _repaired = self._record_recovery_lifecycle_failure(
+                    signal_id,
+                    ticker,
+                    "recovery_lifecycle_watching_not_applied",
+                )
+                if not _repaired:
+                    return False, "recovery_lifecycle_quarantine_unrepaired"
+                return False, "recovery_lifecycle_watching_not_applied"
+            return True, "recovery_lifecycle_none_to_watching"
+
+        # ── PERSISTED / CREATED / anything else new ───────────────────
+        #
+        # PERSISTED and CREATED both legitimately allow WATCHING per
+        # LEGAL_TRANSITIONS, but a recovery-rearm admission observing
+        # either is unexpected — the recovery classifier normally
+        # reattaches to the durable row, not a mid-arm state. Refuse
+        # rather than silently coerce the state machine.
+        return False, f"recovery_lifecycle_hold_unexpected_state_{current.value}"
+
+    @staticmethod
+    def _record_recovery_lifecycle_failure(
+        signal_id: str,
+        ticker: str,
+        failure_reason: str,
+    ) -> bool:
+        """Close a recovery transition failure through the canonical ledger.
+
+        ``SignalLifecycleLedger`` is append-only, so the safe repair for a
+        failed ``ADOPTED -> WATCHING`` attempt is the already-legal
+        ``ADOPTED/WATCHING -> ERROR`` transition.  This makes a half-restore
+        explicit and prevents a later recovery pass from mistaking ADOPTED
+        for a valid behavior-active owner.  No private ledger state is edited.
+        """
+        if not _EW_LIFECYCLE_OK:
+            return False
+        try:
+            current = _EW_LEDGER.current_state(str(signal_id))
+        except Exception:
+            return False
+        if current == _EW_SS.ERROR:
+            return True
+        if current not in {_EW_SS.ADOPTED, _EW_SS.WATCHING}:
+            # If adoption itself never landed, there is no orphaned ADOPTED
+            # authority to repair.  In particular, do not manufacture an
+            # illegal NONE -> ERROR transition.
+            return False
+        try:
+            signal_error(
+                signal_id,
+                ticker,
+                _EW_LO.RECOVERY,
+                reason=f"recovery_restore_failed:{failure_reason}",
+            )
+        except Exception:
+            return False
+        try:
+            return _EW_LEDGER.current_state(str(signal_id)) == _EW_SS.ERROR
+        except Exception:
+            return False
+
+    def _commit_recovery_candidate(
+        self,
+        watched,
+        dedup_key: str,
+        deferred_conflicts: list,
+        registration_provenance_out: Optional[dict],
+    ) -> bool:
+        """Atomically admit one recovery candidate under the final fence.
+
+        Conflict arbitration only stages incumbent losers.  This helper owns
+        the final durable proof, lifecycle restoration, candidate registry
+        insertion, and only then the exact incumbent cleanup.  The PostgreSQL
+        row lock remains held across all of those steps.
+        """
+        signal = getattr(watched, "signal", {}) or {}
+
+        def _quarantine_candidate(reason: str) -> None:
+            """Retain a non-executable owner when lifecycle repair is unproven."""
+            watched._ownership_quarantine = True
+            watched._quarantine_reason = reason
+            _quarantine_ids = getattr(self, "_recovery_quarantine_ids", None)
+            if _quarantine_ids is None:
+                _quarantine_ids = set()
+                self._recovery_quarantine_ids = _quarantine_ids
+            _quarantine_ids.add(str(signal.get("signal_id") or ""))
+            _registered = watched in self._pending
+            if not _registered:
+                try:
+                    self._pending.append(watched)
+                    _registered = True
+                except Exception:
+                    # Registry failure is itself part of the quarantine. Keep
+                    # the explicit quarantine id so a retry cannot treat this
+                    # signal as a valid active watcher.
+                    log.critical(
+                        "[%s] recovery quarantine registry insertion failed "
+                        "signal_id=%s",
+                        watched.ticker,
+                        signal.get("signal_id"),
+                    )
+            if dedup_key and _registered:
+                try:
+                    self._dedup_set.add(dedup_key)
+                except Exception:
+                    log.critical(
+                        "[%s] recovery quarantine dedup insertion failed "
+                        "signal_id=%s",
+                        watched.ticker,
+                        signal.get("signal_id"),
+                    )
+            log.critical(
+                "[%s] RECOVERY_LIFECYCLE_QUARANTINE signal_id=%s "
+                "local_order_id=%s reason=%s",
+                watched.ticker,
+                signal.get("signal_id"),
+                signal.get("local_order_id"),
+                reason,
+            )
+
+        def _rollback_candidate(reason: str) -> bool:
+            self._pending = [
+                existing for existing in self._pending if existing is not watched
+            ]
+            if dedup_key:
+                self._dedup_set.discard(dedup_key)
+            repaired = self._record_recovery_lifecycle_failure(
+                str(signal.get("signal_id") or ""),
+                str(getattr(watched, "ticker", "") or ""),
+                reason,
+            )
+            if not repaired:
+                _quarantine_candidate(reason)
+            return repaired
+
+        def _hold(reason: str) -> bool:
+            # The caller's ``watch()`` path persists this audit after the
+            # admission context exits.  Keeping the write out of the
+            # PostgreSQL ``FOR UPDATE`` scope prevents a second connection
+            # from attempting to update the row while this connection still
+            # owns its lock.
+            self._last_reject_reason = reason
+            log.critical(
+                "[%s] RECOVERY_LIFECYCLE_HOLD signal_id=%s "
+                "local_order_id=%s reason=%s",
+                watched.ticker,
+                signal.get("signal_id"),
+                signal.get("local_order_id"),
+                reason,
+            )
+            if registration_provenance_out is not None:
+                registration_provenance_out["created_by_this_call"] = False
+                registration_provenance_out["registration_token"] = None
+            return False
+
+        class _RecoveryDurableRollback(RuntimeError):
+            """Abort the admission transaction before any incumbent commit."""
+
+            recovery_admission_rollback = True
+
+            def __init__(self, reason: str):
+                super().__init__(reason)
+                self.reason = reason
+
+        _terminal_proven: list[tuple[object, str, dict]] = []
+        _deferred_ledger_rows: list[dict] = []
+        _deferred_transition_events: list[dict] = []
+        self._recovery_admission_abort_reason = None
+
+        # A fresh row is read while the exact durable row lock is held.  A
+        # double-read is deliberately not substituted for this boundary: the
+        # row lock is what prevents a competing owner from committing between
+        # proof and registry/lifecycle commit.
+        with self._recovery_admission_row_lock(watched) as (
+            _locked_row,
+            _lock_error,
+            _admission_connection,
+        ):
+            if _lock_error:
+                return _hold(_lock_error)
+            if _locked_row is None:
+                _final_ok, _final_reason, _final_row = (
+                    self._recovery_final_durable_authority(watched)
+                )
+            else:
+                _final_ok, _final_reason, _final_row = (
+                    self._recovery_final_durable_authority(
+                        watched,
+                        row=_locked_row,
+                    )
+                )
+            if not _final_ok:
+                return _hold(_final_reason)
+
+            _rlok, _rlreason = self._restore_recovered_watcher_lifecycle(
+                watched,
+                recovered_trigger_ready=bool(
+                    signal.get("__recovered_trigger_ready")
+                ),
+            )
+            if not _rlok:
+                if _rlreason == "recovery_lifecycle_quarantine_unrepaired":
+                    _quarantine_candidate(_rlreason)
+                return _hold(_rlreason)
+
+            # Treat the registry insertion as part of the same recovery
+            # commit.  If an unexpected registry/provenance failure occurs
+            # after lifecycle restoration, remove only this candidate's
+            # partial bookkeeping and close WATCHING through the canonical
+            # lifecycle API; never return HOLD with a false WATCHING owner.
+            try:
+                if dedup_key:
+                    self._dedup_set.add(dedup_key)
+                self._pending.append(watched)
+
+                if registration_provenance_out is not None:
+                    registration_provenance_out["created_by_this_call"] = True
+                    registration_provenance_out["registration_token"] = (
+                        watched._registration_token
+                    )
+            except Exception:
+                _rollback_candidate("recovery_lifecycle_registry_commit_failed")
+                return _hold("recovery_lifecycle_registry_commit_failed")
+
+            # Destructive incumbent bookkeeping is delayed until the candidate
+            # has both legal lifecycle ownership and a committed registry slot.
+            # Every displaced durable row is read, locked, cancelled, and
+            # terminally reread on the same PostgreSQL transaction.  A later
+            # failure raises through the row-lock context so every prior
+            # incumbent UPDATE rolls back with the candidate admission.
+            if deferred_conflicts:
+                _deferred_incumbents = []
+                for incumbent, *_details in deferred_conflicts:
+                    if incumbent not in _deferred_incumbents:
+                        _deferred_incumbents.append(incumbent)
+                _deferred_incumbents.sort(
+                    key=lambda incumbent: str(
+                        (getattr(incumbent, "signal", {}) or {}).get(
+                            "local_order_id"
+                        )
+                        or ""
+                    )
+                )
+                osm = getattr(self, "order_state_machine", None)
+                cancel_pending = getattr(osm, "cancel_pending_entry", None)
+                for incumbent in _deferred_incumbents:
+                    if incumbent not in self._pending:
+                        continue
+                    incumbent_signal = getattr(incumbent, "signal", {}) or {}
+                    incumbent_oid = str(
+                        incumbent_signal.get("local_order_id") or ""
+                    ).strip()
+                    incumbent_token = str(
+                        getattr(incumbent, "_registration_token", "") or ""
+                    )
+                    if not incumbent_oid or not callable(cancel_pending):
+                        raise _RecoveryDurableRollback(
+                            "recovery_incumbent_cancellation_unavailable"
+                        )
+
+                    incumbent_row = self._load_order_row_for_recovery_rearm_with_connection(
+                        incumbent_oid,
+                        _connection=_admission_connection,
+                        _for_update=_admission_connection is not None,
+                        execution_mode=incumbent_signal.get("execution_mode"),
+                    )
+                    incumbent_identity_ok, _ = (
+                        self._recovery_identity_matches_durable_row(
+                            incumbent_signal, incumbent_row, incumbent_oid,
+                        )
+                    )
+                    if not incumbent_identity_ok:
+                        raise _RecoveryDurableRollback(
+                            "recovery_incumbent_identity_unproven"
+                        )
+                    try:
+                        if _admission_connection is not None:
+                            cancel_ok = bool(cancel_pending(
+                                incumbent_oid,
+                                reason="recovery_watcher_replacement_converged",
+                                _connection=_admission_connection,
+                                _defer_side_effects=True,
+                            ))
+                        else:
+                            # The explicit unit seam is intentionally allowed
+                            # to use a test double without a database.  The
+                            # production path can only reach here with the
+                            # PostgreSQL admission connection above.
+                            cancel_ok = bool(cancel_pending(
+                                incumbent_oid,
+                                reason="recovery_watcher_replacement_converged",
+                            ))
+                    except Exception:
+                        raise _RecoveryDurableRollback(
+                            "recovery_incumbent_cancellation_raised"
+                        )
+                    if not cancel_ok:
+                        raise _RecoveryDurableRollback(
+                            "recovery_incumbent_cancellation_failed"
+                        )
+
+                    terminal_row = self._load_order_row_for_recovery_rearm_with_connection(
+                        incumbent_oid,
+                        _connection=_admission_connection,
+                        execution_mode=incumbent_signal.get("execution_mode"),
+                    )
+                    terminal_status = str(
+                        terminal_row.get("status") or ""
+                    ).strip().upper()
+                    identity_probe = dict(terminal_row)
+                    identity_probe["status"] = "PENDING_TRIGGER"
+                    terminal_identity_ok, _ = (
+                        self._recovery_identity_matches_durable_row(
+                            incumbent_signal, identity_probe, incumbent_oid,
+                        )
+                    )
+                    if (
+                        terminal_status not in {
+                            "CANCELED", "EXPIRED", "REJECTED", "ERROR",
+                        }
+                        or not terminal_identity_ok
+                    ):
+                        raise _RecoveryDurableRollback(
+                            "recovery_incumbent_terminal_proof_unproven"
+                        )
+                    _terminal_proven.append(
+                        (incumbent, incumbent_token, incumbent_row)
+                    )
+                    _deferred_transition_events.append({
+                        "local_order_id": incumbent_oid,
+                        "old_status": str(incumbent_row.get("status") or "PENDING_TRIGGER"),
+                        "new_status": terminal_status,
+                        "order": dict(incumbent_row),
+                        "decision": "TERMINAL",
+                        "last_error": "recovery_watcher_replacement_converged",
+                        "broker_order_id": incumbent_row.get("broker_order_id"),
+                    })
+                    if _admission_connection is not None:
+                        _deferred_ledger_rows.append({
+                            "current": incumbent_row,
+                            "new_status": terminal_status,
+                            "last_error": "recovery_watcher_replacement_converged",
+                        })
+
+                for incumbent, incumbent_token, _incumbent_row in _terminal_proven:
+                    # The outer registry lock prevents normal concurrent
+                    # replacement, but retain an exact token/object fence so a
+                    # future refactor cannot remove a newly registered object
+                    # that merely shares logical identity.
+                    if (
+                        incumbent not in self._pending
+                        or str(getattr(incumbent, "_registration_token", "") or "")
+                        != incumbent_token
+                    ):
+                        raise _RecoveryDurableRollback(
+                            "recovery_incumbent_registration_changed"
+                        )
+
+        _admission_abort_reason = getattr(
+            self,
+            "_recovery_admission_abort_reason",
+            None,
+        )
+        self._recovery_admission_abort_reason = None
+        if _admission_abort_reason:
+            _rollback_candidate(_admission_abort_reason)
+            return _hold(_admission_abort_reason)
+
+        # The admission context has committed here.  Only now may the
+        # incumbent's process-local ownership be released.  The transactional
+        # cancellation wrote a durable replay marker, so a sink/process
+        # failure remains recoverable on the next startup.  Rollback paths
+        # return above and therefore never create that marker.
+        osm = getattr(self, "order_state_machine", None)
+        replay_observability = getattr(
+            osm, "replay_deferred_transition_observability", None
+        )
+        if (
+            callable(replay_observability)
+            and getattr(
+                osm,
+                "_supports_deferred_transition_observability_replay",
+                False,
+            ) is True
+        ):
+            try:
+                replay_observability(
+                    local_order_ids=[
+                        event["local_order_id"]
+                        for event in _deferred_transition_events
+                    ]
+                )
+            except Exception as exc:
+                log.debug(
+                    "[%s] deferred recovery observability replay failed: %s",
+                    watched.ticker,
+                    exc,
+                )
+        else:
+            # Keep the explicit unit-test seam compatible with lightweight
+            # OSM doubles that predate the durable replay method.
+            emit_transition = getattr(osm, "_emit_transition_event", None)
+            if callable(emit_transition):
+                for transition_event in _deferred_transition_events:
+                    try:
+                        emit_transition(**transition_event)
+                    except Exception as exc:
+                        log.debug(
+                            "[%s] deferred recovery transition event failed: %s",
+                            watched.ticker,
+                            exc,
+                        )
+
+            notify_ledger = getattr(osm, "_notify_opportunity_ledger", None)
+            if callable(notify_ledger):
+                for ledger_row in _deferred_ledger_rows:
+                    try:
+                        notify_ledger(
+                            current=ledger_row["current"],
+                            new_status=ledger_row["new_status"],
+                            last_error=ledger_row["last_error"],
+                        )
+                    except Exception as exc:
+                        log.debug(
+                            "[%s] deferred recovery cancellation ledger notify failed: %s",
+                            watched.ticker,
+                            exc,
+                        )
+
+        for incumbent, incumbent_token, _incumbent_row in _terminal_proven:
+            # The outer registry lock prevents normal concurrent replacement,
+            # but retain an exact token/object fence before touching memory.
+            if (
+                incumbent not in self._pending
+                or str(getattr(incumbent, "_registration_token", "") or "")
+                != incumbent_token
+            ):
+                _rollback_candidate("recovery_incumbent_registration_changed")
+                return _hold("recovery_incumbent_registration_changed")
+            incumbent.state = WatchState.CANCELLED
+            incumbent._release_dedup_key()
+            log.info(
+                "[%s] RECOVERY_CONFLICT_COMMITTED — replaced incumbent "
+                "only after candidate lifecycle/registry commit | "
+                "incumbent_signal_id=%s incumbent_local_order_id=%s",
+                watched.ticker,
+                incumbent.signal.get("signal_id"),
+                incumbent.signal.get("local_order_id"),
+            )
+        terminal_objects = {id(item) for item, _token, _row in _terminal_proven}
+        self._pending = [
+            existing for existing in self._pending
+            if id(existing) not in terminal_objects
+        ]
+        self._recovery_admission_abort_reason = None
+        return True
+
     def add_signal(
         self, signal: dict, *, registration_provenance_out: Optional[dict] = None,
     ) -> bool:
@@ -3056,6 +4859,49 @@ class APEntryWatcher:
         if registration_provenance_out is not None:
             registration_provenance_out["created_by_this_call"] = False
             registration_provenance_out["registration_token"] = None
+
+        # Recovery admission must not reach WatchedSignal's ordinary
+        # UUID/side-normalizing constructor with incomplete identity.  Those
+        # defaults are valid for legacy ordinary admissions, but would turn a
+        # malformed durable recovery plan into a different identity.
+        _strict_recovery_signal = bool(
+            isinstance(signal, dict)
+            and signal.get("__recovery_rearm")
+            and not signal.get("__materialization_resume")
+        )
+        if _strict_recovery_signal:
+            _required_recovery_fields = (
+                "signal_id",
+                "canonical_signal_id",
+                "client_id",
+                "execution_mode",
+                "ticker",
+                "side",
+                "local_order_id",
+            )
+            for _field in _required_recovery_fields:
+                _raw_value = signal.get(_field)
+                if not isinstance(_raw_value, str):
+                    self._last_reject_reason = (
+                        f"recovery_lifecycle_malformed_{_field}"
+                    )
+                    return False
+                if not _raw_value or _raw_value != _raw_value.strip():
+                    self._last_reject_reason = (
+                        f"recovery_lifecycle_missing_{_field}"
+                    )
+                    return False
+            if signal["ticker"] != signal["ticker"].upper():
+                self._last_reject_reason = "recovery_lifecycle_invalid_ticker"
+                return False
+            if signal["side"] not in {"CALL", "PUT"}:
+                self._last_reject_reason = "recovery_lifecycle_invalid_side"
+                return False
+            if signal["execution_mode"] not in {"live", "paper"}:
+                self._last_reject_reason = (
+                    "recovery_lifecycle_invalid_execution_mode"
+                )
+                return False
 
         now_et = datetime.now(ET)
         post_session = (
@@ -3107,26 +4953,102 @@ class APEntryWatcher:
             )
 
         with self._lock:
-            if dedup_key and dedup_key in self._dedup_set:
-                log.info(
-                    "[%s] DEDUP_BLOCK — signal_id=%s is already armed in watcher",
-                    watched.ticker,
-                    dedup_key,
+            _recovery_admission = bool(
+                (getattr(watched, "signal", {}) or {}).get("__recovery_rearm")
+            )
+            _recovery_atomic_admission = bool(
+                _recovery_admission
+                and not (getattr(watched, "signal", {}) or {}).get(
+                    "__materialization_resume"
                 )
-                _dedup_audit = self._build_watcher_audit_payload(
-                    watched,
-                    trigger_type="add_signal_block",
-                    reason_code="dedup_block",
-                    raw_reason=f"signal_id_{dedup_key}_already_armed",
-                    extra={"dedup_key": dedup_key, "persisted": False},
+            )
+            # Recovery replacement is transactional with respect to the
+            # in-memory registry.  Conflict arbitration may identify losers,
+            # but it must not cancel/release/remove them until the candidate
+            # has passed the final durable fence, lifecycle restoration, and
+            # its own registry commit below.
+            _deferred_recovery_conflicts = []
+
+            _quarantine_ids = getattr(self, "_recovery_quarantine_ids", set())
+            if (
+                _recovery_atomic_admission
+                and str(watched.signal.get("signal_id") or "") in _quarantine_ids
+            ):
+                self._last_reject_reason = (
+                    "recovery_lifecycle_quarantine_unrepaired"
                 )
-                log.info(
-                    "[watcher_audit] dedup_block | local_order_id=%s | %s",
-                    watched.signal.get("local_order_id"),
-                    json.dumps(_dedup_audit, default=str),
-                )
-                self._last_reject_reason = "dedup_block"
                 return False
+
+            if dedup_key and dedup_key in self._dedup_set:
+                # KEEP_WATCHER consumes the current recovered trigger cursor,
+                # but the durable row may later advance to a genuinely new
+                # trigger generation.  Retire only that exact, already
+                # consumed recovered object so the new generation can be
+                # admitted.  Never release a live/unknown incumbent merely to
+                # get past a dedup block.
+                if _recovery_atomic_admission:
+                    _candidate_trigger_generation = signal.get("trigger_generation")
+                    for _existing in tuple(self._pending):
+                        _existing_signal = getattr(_existing, "signal", {}) or {}
+                        if not (
+                            _existing_signal.get("__recovered_trigger_ready")
+                            and _existing_signal.get("__recovery_trigger_consumed")
+                            and str(_existing_signal.get("signal_id") or "")
+                            == str(signal.get("signal_id") or "")
+                        ):
+                            continue
+                        _existing_trigger_generation = _existing_signal.get(
+                            "trigger_generation"
+                        )
+                        try:
+                            _old_generation = int(_existing_trigger_generation)
+                            _new_generation = int(_candidate_trigger_generation)
+                        except (TypeError, ValueError):
+                            continue
+                        if (
+                            _old_generation <= 0
+                            or _new_generation <= 0
+                            or _old_generation == _new_generation
+                        ):
+                            continue
+                        self._pending = [
+                            _pending_watcher
+                            for _pending_watcher in self._pending
+                            if _pending_watcher is not _existing
+                        ]
+                        _existing._release_dedup_key()
+                        log.info(
+                            "[%s] RECOVERY_TRIGGER_GENERATION_ADVANCED — retired "
+                            "consumed cursor generation=%s for new generation=%s",
+                            watched.ticker,
+                            _old_generation,
+                            _new_generation,
+                        )
+                        break
+                if dedup_key not in self._dedup_set:
+                    # The consumed incumbent was retired above; continue with
+                    # the normal candidate admission transaction.
+                    pass
+                else:
+                    log.info(
+                        "[%s] DEDUP_BLOCK — signal_id=%s is already armed in watcher",
+                        watched.ticker,
+                        dedup_key,
+                    )
+                    _dedup_audit = self._build_watcher_audit_payload(
+                        watched,
+                        trigger_type="add_signal_block",
+                        reason_code="dedup_block",
+                        raw_reason=f"signal_id_{dedup_key}_already_armed",
+                        extra={"dedup_key": dedup_key, "persisted": False},
+                    )
+                    log.info(
+                        "[watcher_audit] dedup_block | local_order_id=%s | %s",
+                        watched.signal.get("local_order_id"),
+                        json.dumps(_dedup_audit, default=str),
+                    )
+                    self._last_reject_reason = "dedup_block"
+                    return False
 
             # Conflict detection must include rearm_mode signals.
             # A DISARMED_WAITING_FOR_RECLAIM signal is still a live position attempt
@@ -3211,7 +5133,16 @@ class APEntryWatcher:
                             WatchState.EXPIRED,
                             WatchState.INVALIDATED,
                         )
-                        if _was_terminal:
+                        if _recovery_atomic_admission:
+                            # A recovery candidate has not committed yet.  Do
+                            # not touch incumbent state, dedup, _pending, OSM,
+                            # or its audit row while the candidate can still
+                            # HOLD at the lifecycle/final-authority boundary.
+                            _deferred_recovery_conflicts.append(
+                                (_opp, "stale_or_weaker_opposite", _why, _age, _was_terminal)
+                            )
+                            _action = "deferred_recovery_replacement"
+                        elif _was_terminal:
                             # Already in a terminal state — no OSM call
                             # needed; just make sure it is not still in
                             # _pending (defensive: poll-loop usually purges
@@ -3268,7 +5199,7 @@ class APEntryWatcher:
                         # Best-effort audit stamp onto the cancelled opposite's
                         # order row so the post-mortem can reconstruct WHY a
                         # stale row was cancelled by an opposite signal.
-                        if _action != "ignored_terminal":
+                        if _action != "ignored_terminal" and not _recovery_admission:
                             try:
                                 _opp_audit_replaced = self._build_watcher_audit_payload(
                                     _opp,
@@ -3339,35 +5270,41 @@ class APEntryWatcher:
                     if _new_tier > _opp_tier:
                         _new_score = _opp_score + 0.01  # tip the scales for the > check below
                 if _new_score > best_opp.score:
-                    for w in opposite_side:
-                        w.state = WatchState.CANCELLED
-                        w._release_dedup_key()
-                        log.info(
-                            "[%s] SAFE_MODE_DIRECTION_FLIP — cancelling %s score=%.1f "
-                            "for stronger %s score=%.1f",
-                            watched.ticker,
-                            w.side,
-                            w.score,
-                            watched.side,
-                            watched.score,
+                    if _recovery_atomic_admission:
+                        _deferred_recovery_conflicts.extend(
+                            (w, "opposite_direction_replaced", "stronger_recovery_candidate", 0.0, False)
+                            for w in opposite_side
                         )
-                        _local_oid = w.signal.get("local_order_id")
-                        _skip_cancel_dir_flip = bool(signal.get("__recovery_rearm"))
-                        if _local_oid and self.order_state_machine and hasattr(self.order_state_machine, "cancel_pending_entry") and not _skip_cancel_dir_flip:
-                            try:
-                                _cancel_ok = self.order_state_machine.cancel_pending_entry(
-                                    _local_oid, reason="direction_flip_watcher_cancel"
-                                )
-                                if not _cancel_ok:
-                                    log.error(
-                                        "[%s] direction_flip: cancel_pending_entry returned False "
-                                        "for local_order_id=%s — OSM row may be stuck in "
-                                        "PENDING_TRIGGER. Investigate immediately.",
-                                        w.ticker, _local_oid,
+                    else:
+                        for w in opposite_side:
+                            w.state = WatchState.CANCELLED
+                            w._release_dedup_key()
+                            log.info(
+                                "[%s] SAFE_MODE_DIRECTION_FLIP — cancelling %s score=%.1f "
+                                "for stronger %s score=%.1f",
+                                watched.ticker,
+                                w.side,
+                                w.score,
+                                watched.side,
+                                watched.score,
+                            )
+                            _local_oid = w.signal.get("local_order_id")
+                            _skip_cancel_dir_flip = bool(signal.get("__recovery_rearm"))
+                            if _local_oid and self.order_state_machine and hasattr(self.order_state_machine, "cancel_pending_entry") and not _skip_cancel_dir_flip:
+                                try:
+                                    _cancel_ok = self.order_state_machine.cancel_pending_entry(
+                                        _local_oid, reason="direction_flip_watcher_cancel"
                                     )
-                            except Exception as _exc:
-                                log.warning("[%s] OSM cancel failed for direction_flip: %s", w.ticker, _exc)
-                    self._pending = [w for w in self._pending if w not in opposite_side]
+                                    if not _cancel_ok:
+                                        log.error(
+                                            "[%s] direction_flip: cancel_pending_entry returned False "
+                                            "for local_order_id=%s — OSM row may be stuck in "
+                                            "PENDING_TRIGGER. Investigate immediately.",
+                                            w.ticker, _local_oid,
+                                        )
+                                except Exception as _exc:
+                                    log.warning("[%s] OSM cancel failed for direction_flip: %s", w.ticker, _exc)
+                        self._pending = [w for w in self._pending if w not in opposite_side]
                 else:
                     # P0 PR — structured opposite_side_conflict audit.
                     # The block is the SAFE choice; we preserve the legacy
@@ -3450,33 +5387,39 @@ class APEntryWatcher:
             if same_side:
                 best_same = max(same_side, key=lambda w: w.score)
                 if watched.score > best_same.score:
-                    for w in same_side:
-                        w.state = WatchState.CANCELLED
-                        w._release_dedup_key()
-                        log.info(
-                            "[%s] SAME_SIDE_REPLACE — cancelling %s score=%.1f "
-                            "for stronger same-side score=%.1f",
-                            watched.ticker,
-                            w.side,
-                            w.score,
-                            watched.score,
+                    if _recovery_atomic_admission:
+                        _deferred_recovery_conflicts.extend(
+                            (w, "same_side_replaced", "stronger_recovery_candidate", 0.0, False)
+                            for w in same_side
                         )
-                        _local_oid = w.signal.get("local_order_id")
-                        if _local_oid and self.order_state_machine and hasattr(self.order_state_machine, "cancel_pending_entry") and not bool(signal.get("__recovery_rearm")):
-                            try:
-                                _cancel_ok = self.order_state_machine.cancel_pending_entry(
-                                    _local_oid, reason="same_side_replace_watcher_cancel"
-                                )
-                                if not _cancel_ok:
-                                    log.error(
-                                        "[%s] same_side_replace: cancel_pending_entry returned False "
-                                        "for local_order_id=%s — OSM row may be stuck in "
-                                        "PENDING_TRIGGER. Investigate immediately.",
-                                        w.ticker, _local_oid,
+                    else:
+                        for w in same_side:
+                            w.state = WatchState.CANCELLED
+                            w._release_dedup_key()
+                            log.info(
+                                "[%s] SAME_SIDE_REPLACE — cancelling %s score=%.1f "
+                                "for stronger same-side score=%.1f",
+                                watched.ticker,
+                                w.side,
+                                w.score,
+                                watched.score,
+                            )
+                            _local_oid = w.signal.get("local_order_id")
+                            if _local_oid and self.order_state_machine and hasattr(self.order_state_machine, "cancel_pending_entry") and not bool(signal.get("__recovery_rearm")):
+                                try:
+                                    _cancel_ok = self.order_state_machine.cancel_pending_entry(
+                                        _local_oid, reason="same_side_replace_watcher_cancel"
                                     )
-                            except Exception as _exc:
-                                log.warning("[%s] OSM cancel failed for same_side_replace: %s", w.ticker, _exc)
-                    self._pending = [w for w in self._pending if w not in same_side]
+                                    if not _cancel_ok:
+                                        log.error(
+                                            "[%s] same_side_replace: cancel_pending_entry returned False "
+                                            "for local_order_id=%s — OSM row may be stuck in "
+                                            "PENDING_TRIGGER. Investigate immediately.",
+                                            w.ticker, _local_oid,
+                                        )
+                                except Exception as _exc:
+                                    log.warning("[%s] OSM cancel failed for same_side_replace: %s", w.ticker, _exc)
+                        self._pending = [w for w in self._pending if w not in same_side]
                 else:
                     _ss_audit = self._build_watcher_audit_payload(
                         watched,
@@ -3509,22 +5452,55 @@ class APEntryWatcher:
                     )
                     return False
 
-            if dedup_key:
-                self._dedup_set.add(dedup_key)
+            # ── PR #580 amendment: recovery lifecycle restoration bridge ─────
+            # Recovery admission owns a single commit boundary: final durable
+            # authority proof, legal lifecycle restoration, candidate registry
+            # insertion, then staged incumbent cleanup.  Ordinary admissions
+            # retain the existing conflict/registration behavior unchanged.
+            if _recovery_atomic_admission:
+                if not self._commit_recovery_candidate(
+                    watched,
+                    dedup_key,
+                    _deferred_recovery_conflicts,
+                    registration_provenance_out,
+                ):
+                    return False
+            else:
+                # Preserve the existing deferred-materialization resume
+                # lifecycle path. It is a separate #596 owner: a successful
+                # adoption may register the watcher, but must not enter the
+                # #580 lifecycle-restoration transaction.
+                if (
+                    _recovery_admission
+                    and not bool(
+                        (getattr(watched, "signal", {}) or {}).get(
+                            "__materialization_resume"
+                        )
+                    )
+                ):
+                    _rlok, _rlreason = self._restore_recovered_watcher_lifecycle(
+                        watched
+                    )
+                    if not _rlok:
+                        self._last_reject_reason = _rlreason
+                        return False
+                if dedup_key:
+                    self._dedup_set.add(dedup_key)
 
-            self._pending.append(watched)
-            # PR #421 final amendment (P0-1): this is the exact, sole
-            # point a new WatchedSignal registration is committed to the
-            # registry. Provenance must be set here, from the object this
-            # call itself just created and inserted — never rediscovered
-            # afterward by scanning _pending for a logical-identity match,
-            # which cannot distinguish "I created this" from "I merely
-            # observed this."
-            if registration_provenance_out is not None:
-                registration_provenance_out["created_by_this_call"] = True
-                registration_provenance_out["registration_token"] = (
-                    watched._registration_token
-                )
+                self._pending.append(watched)
+
+                # PR #421 final amendment (P0-1): this is the exact, sole
+                # point a new WatchedSignal registration is committed to the
+                # registry. Provenance must be set here, from the object this
+                # call itself just created and inserted — never rediscovered
+                # afterward by scanning _pending for a logical-identity match,
+                # which cannot distinguish "I created this" from "I merely
+                # observed this."
+                if registration_provenance_out is not None:
+                    registration_provenance_out["created_by_this_call"] = True
+                    registration_provenance_out["registration_token"] = (
+                        watched._registration_token
+                    )
 
             # P0-W2: consume rearm marker placed by watch() arm-time path.
             # The marker is a private key in watched.signal (which IS signal_dict
@@ -3588,6 +5564,7 @@ class APEntryWatcher:
         recovery_rearm: bool = False,
         no_cancel_on_reject: bool = False,
         materialization_resume: bool = False,
+        recovered_trigger_ready: bool = False,
         registration_provenance_out: Optional[dict] = None,
     ) -> bool:
         """Plan-aware entrypoint called by queue/execution orchestration.
@@ -3630,33 +5607,118 @@ class APEntryWatcher:
         # can suppress its own cancel_pending_entry calls.
         _recovery_rearm    = bool(recovery_rearm)
         _materialization_resume = bool(materialization_resume)
+        _recovered_trigger_ready = bool(recovered_trigger_ready)
+        if _recovered_trigger_ready and not _recovery_rearm:
+            self._last_reject_reason = (
+                "recovery_trigger_ready_requires_recovery_rearm"
+            )
+            return False
+        _strict_recovery_admission = (
+            _recovery_rearm and not _materialization_resume
+        )
         _no_cancel_on_reject = bool(no_cancel_on_reject or recovery_rearm)
-        _plan_metadata = getattr(plan, "metadata", None) or {}
+        _raw_plan_metadata = getattr(plan, "metadata", None)
+        if _strict_recovery_admission and not isinstance(
+            _raw_plan_metadata, dict
+        ):
+            self._last_reject_reason = "recovery_lifecycle_malformed_plan_metadata"
+            return False
+        _plan_metadata = _raw_plan_metadata or {}
         if not isinstance(_plan_metadata, dict):
             _plan_metadata = {}
-        _plan_signal_id = str(getattr(plan, "signal_id", "") or "").strip()
-        _plan_canonical_signal_id = str(
-            getattr(plan, "canonical_signal_id", "")
-            or _plan_metadata.get("canonical_signal_id")
-            or ""
-        ).strip()
-        if not _plan_canonical_signal_id:
+        _plan_signal_raw = getattr(plan, "signal_id", "")
+        _plan_signal_id = (
+            _plan_signal_raw
+            if isinstance(_plan_signal_raw, str)
+            else str(_plan_signal_raw or "")
+        )
+        if _strict_recovery_admission:
+            _plan_canonical_signal_id = getattr(
+                plan, "canonical_signal_id", None
+            )
+        else:
+            _plan_canonical_signal_id = (
+                getattr(plan, "canonical_signal_id", "")
+                or _plan_metadata.get("canonical_signal_id")
+                or ""
+            )
+        _plan_canonical_signal_id = (
+            _plan_canonical_signal_id
+            if isinstance(_plan_canonical_signal_id, str)
+            else str(_plan_canonical_signal_id or "")
+        )
+        if not _plan_canonical_signal_id and not _strict_recovery_admission:
             _plan_canonical_signal_id = build_canonical_signal_id(
                 _plan_signal_id, _plan_metadata
             )
-        _plan_materialization_generation = getattr(
-            plan, "materialization_generation", None
+        _plan_has_generation = hasattr(plan, "materialization_generation")
+        _plan_materialization_generation = (
+            getattr(plan, "materialization_generation", None)
+            if _plan_has_generation else None
         )
-        if _plan_materialization_generation is None:
+        if (
+            _strict_recovery_admission
+            and _plan_materialization_generation is None
+            and "materialization_generation" in _plan_metadata
+        ):
+            # A recovery plan may carry the owned generation in its durable
+            # metadata rather than as an object attribute. Preserve that
+            # explicit authority; never leave a synthetic ``None`` column in
+            # the candidate signal (which would be malformed data).
             _plan_materialization_generation = _plan_metadata.get(
                 "materialization_generation"
             )
+        if (
+            not _strict_recovery_admission
+            and _plan_materialization_generation is None
+        ):
+            _plan_materialization_generation = _plan_metadata.get(
+                "materialization_generation"
+            )
+        _plan_generation_present = (
+            (_plan_has_generation and _plan_materialization_generation is not None)
+            or "materialization_generation" in _plan_metadata
+        )
+
+        if _strict_recovery_admission:
+            _plan_client_id = getattr(plan, "client_id", None)
+            _plan_execution_mode = getattr(plan, "execution_mode", None)
+            _plan_side = getattr(plan, "side", None)
+            _plan_watcher_token = getattr(plan, "watcher_token", None)
+            _plan_trigger_generation = getattr(plan, "trigger_generation", None)
+            if (
+                _plan_trigger_generation is None
+                and "trigger_generation" in _plan_metadata
+            ):
+                _plan_trigger_generation = _plan_metadata.get("trigger_generation")
+        else:
+            _plan_client_id = (
+                getattr(plan, "client_id", "")
+                or _plan_metadata.get("client_id")
+                or ""
+            )
+            _plan_execution_mode = str(
+                getattr(plan, "execution_mode", "")
+                or _plan_metadata.get("execution_mode")
+                or self.mode
+            ).lower()
+            _plan_side = getattr(plan, "side", "CALL")
+            _plan_watcher_token = self.owner_token
+            # Ordinary/pre-breach plans do not own a trigger generation until
+            # the explicit durable trigger-confirmation transition. Never
+            # invent one at arm time; recovered trigger-ready plans are always
+            # strict and carry an already durable generation pair.
+            _plan_trigger_generation = _plan_metadata.get("trigger_generation")
 
         signal_dict = {
-            "signal_id": _plan_signal_id or str(uuid.uuid4()),
+            "signal_id": (
+                _plan_signal_id
+                if _strict_recovery_admission
+                else _plan_signal_id or str(uuid.uuid4())
+            ),
             "canonical_signal_id": _plan_canonical_signal_id,
             "ticker": getattr(plan, "ticker", ""),
-            "side": getattr(plan, "side", "CALL"),
+            "side": _plan_side,
             "score": getattr(plan, "score", 65.0),
             "grade": getattr(plan, "tier", "B"),
             "entry_price": getattr(plan, "trigger_price", None),
@@ -3677,20 +5739,8 @@ class APEntryWatcher:
             "local_order_id": local_order_id,
             "metadata": dict(_plan_metadata),
             "materialization_generation": _plan_materialization_generation,
-            "client_id": str(
-                getattr(plan, "client_id", "")
-                or _plan_metadata.get("client_id")
-                or ""
-            ),
-            "execution_mode": str(
-                getattr(plan, "execution_mode", "")
-                or _plan_metadata.get("execution_mode")
-                or self.mode
-            ).lower(),
-            "watcher_token": self.owner_token,
-            "trigger_generation": int(
-                _plan_materialization_generation or 1
-            ),
+            "client_id": _plan_client_id,
+            "execution_mode": _plan_execution_mode,
             "deferred_retry_not_before": (
                 _plan_metadata.get("next_retry_at")
                 or _plan_metadata.get("materialization_next_retry_at")
@@ -3726,6 +5776,26 @@ class APEntryWatcher:
                 "pt1": getattr(plan, "target_underlying", None),
             },
         }
+        # A missing plan/metadata generation is absence, not an explicit
+        # malformed authority.  Keep the key only when one source actually
+        # supplied it so the recovery bridge can distinguish missing from
+        # blank/zero/invalid populated data.
+        if not _plan_generation_present:
+            signal_dict.pop("materialization_generation", None)
+        if _plan_watcher_token is not None:
+            signal_dict["watcher_token"] = _plan_watcher_token
+        if _plan_trigger_generation is not None:
+            signal_dict["trigger_generation"] = _plan_trigger_generation
+        if _strict_recovery_admission:
+            for _authority_field in (
+                "watcher_owner",
+                "current_owner",
+                "trigger_cursor",
+                "trigger_cursor_id",
+            ):
+                _authority_value = getattr(plan, _authority_field, None)
+                if _authority_value is not None:
+                    signal_dict[_authority_field] = _authority_value
 
         if _recovery_rearm or _materialization_resume:
             if not recovery_trigger_evidence_identity_is_proven(
@@ -3761,6 +5831,61 @@ class APEntryWatcher:
             signal_dict["__recovery_rearm"] = True
         if _materialization_resume:
             signal_dict["__materialization_resume"] = True
+        if _recovered_trigger_ready:
+            signal_dict["__recovered_trigger_ready"] = True
+
+        # PR #580: recovery lifecycle restoration may run only after the
+        # exact plan identity has been rechecked against the durable
+        # PENDING_TRIGGER row. This is deliberately before the shared
+        # classifier and before add_signal() can register behavior.
+        _recovery_row = {}
+        if (
+            _recovery_rearm
+            and not _materialization_resume
+        ):
+            _recovery_row = self._load_order_row_for_recovery_rearm(
+                local_order_id,
+                execution_mode=signal_dict.get("execution_mode"),
+            )
+            _identity_ok, _identity_reason = self._recovery_identity_matches_durable_row(
+                signal_dict, _recovery_row, local_order_id,
+            )
+            if not _identity_ok:
+                self._last_reject_reason = _identity_reason
+                log.critical(
+                    "[%s] RECOVERY_REARM_IDENTITY_HOLD local_order_id=%s reason=%s",
+                    ticker, local_order_id, _identity_reason,
+                )
+                try:
+                    self._persist_watcher_audit(local_order_id, {
+                        "reason_code": _identity_reason,
+                        "trigger_type": "recovery_rearm_identity_gate",
+                        "classification": "HOLD",
+                        "no_broker_mutation": True,
+                    })
+                except Exception:
+                    pass
+                return False
+            _row_meta = {}
+            for _row_meta_key in ("meta", "metadata"):
+                _raw_row_meta = _recovery_row.get(_row_meta_key)
+                if isinstance(_raw_row_meta, str):
+                    try:
+                        _raw_row_meta = json.loads(_raw_row_meta)
+                    except Exception:
+                        _raw_row_meta = {}
+                if isinstance(_raw_row_meta, dict):
+                    _row_meta.update(_raw_row_meta)
+            if self._recovery_has_broker_handoff_evidence(_recovery_row, _row_meta):
+                self._last_reject_reason = (
+                    "recovery_lifecycle_hold_broker_handoff_evidence"
+                )
+                log.critical(
+                    "[%s] RECOVERY_REARM_BROKER_HANDOFF_HOLD local_order_id=%s",
+                    ticker, local_order_id,
+                )
+                return False
+
         if _recovery_rearm and _materialization_resume:
             _plan_meta_for_adopt = getattr(plan, "metadata", None) or {}
             _adopt_fn = getattr(
@@ -3773,6 +5898,9 @@ class APEntryWatcher:
                 or _plan_meta_for_adopt.get("next_retry_at")
             )
             if not callable(_adopt_fn):
+                self._last_reject_reason = (
+                    "recovery_materialization_adoption_unavailable"
+                )
                 log.critical(
                     "[%s] RECOVERY_REARM_WATCHER_ADOPT_UNAVAILABLE local_order_id=%s",
                     ticker, local_order_id,
@@ -3788,12 +5916,18 @@ class APEntryWatcher:
                     execution_mode=str(signal_dict.get("execution_mode") or ""),
                 ))
             except Exception as _adopt_exc:
+                self._last_reject_reason = (
+                    "recovery_materialization_adoption_raised"
+                )
                 log.critical(
                     "[%s] RECOVERY_REARM_WATCHER_ADOPT_RAISED local_order_id=%s error=%s",
                     ticker, local_order_id, _adopt_exc,
                 )
                 return False
             if not _adopt_ok:
+                self._last_reject_reason = (
+                    "recovery_materialization_adoption_cas_miss"
+                )
                 log.critical(
                     "[%s] RECOVERY_REARM_WATCHER_ADOPT_CAS_MISS local_order_id=%s "
                     "generation=%s attempt=%s",
@@ -3803,14 +5937,17 @@ class APEntryWatcher:
                 )
                 return False
 
-        if _recovery_rearm and not _materialization_resume:
+        if (
+            _recovery_rearm
+            and not _materialization_resume
+            and not _recovered_trigger_ready
+        ):
             try:
                 from ap.pending_trigger_classifier import (
                     PendingTriggerClassification,
                     classify_pending_trigger_row,
                     is_safe_to_recovery_rearm,
                 )
-                _recovery_row = self._load_order_row_for_recovery_rearm(local_order_id)
                 _watcher_owned = self.has_order(local_order_id)
                 _past_entry_cutoff = self._is_past_entry_cutoff_now()
                 _already_through = None
@@ -4017,7 +6154,12 @@ class APEntryWatcher:
             or signal_dict.get("entry_option_price", 0)
             or 0
         )
-        if _signal_option_price > 0 and not post_session and not pre_market:
+        if (
+            _signal_option_price > 0
+            and not post_session
+            and not pre_market
+            and not _recovered_trigger_ready
+        ):
             try:
                 _opt_quote = self._get_option_quote(
                     str(signal_dict.get("contract_symbol", "")
@@ -4063,7 +6205,7 @@ class APEntryWatcher:
                 float(trigger or 0),
                 side,
             )
-        elif trigger and trigger > 0:
+        elif trigger and trigger > 0 and not _recovered_trigger_ready:
             try:
                 quote = self._get_quote(ticker)
                 quote_age_ms = self._coerce_quote_age_ms(quote.get("quote_age_ms"))
@@ -4300,6 +6442,7 @@ class APEntryWatcher:
             and trigger
             and float(trigger or 0) > 0
             and not _materialization_resume
+            and not _recovered_trigger_ready
         ):
             try:
                 _bug_c_quote = self._get_quote(ticker) or {}
@@ -4592,7 +6735,9 @@ class APEntryWatcher:
         finally:
             signal_dict.pop("__watcher_rearm_pending", None)
             signal_dict.pop("__watcher_rearm_reason", None)
-            signal_dict.pop("__recovery_rearm", None)
+            # WatchedSignal retains this exact signal mapping.  Keep the
+            # recovery marker through dispatch so the poll-time final durable
+            # claim is reached; only the arm-time rearm markers are consumed.
         if not ok:
             # add_signal already logged the audit for locked-path blocks (dedup/opposite/same-side).
             # Attempt a best-effort DB persist here using the full signal context available in watch().
@@ -4806,6 +6951,10 @@ class APEntryWatcher:
             return
 
         self._revalidate_overnight_at_open()
+        # PR #580: post-admission durable authority rechecks are distinct from
+        # ordinary completion cleanup retries. They never invoke broker/order
+        # callbacks and must run before a watcher can be considered active.
+        self._retry_recovery_authority_rechecks()
         self._poll_active_signals(open_protect_active=open_protect_active)
         self._check_rearm_signals()
         self._retry_quarantined_cleanup()  # PR #324: retry FAILED cleanup owners
@@ -5437,6 +7586,288 @@ class APEntryWatcher:
         if to_remove:
             log.info("[WATCHER] Overnight revalidation: %d watchers dispatched", len(to_remove))
 
+    def _claim_recovery_trigger_dispatch(self, watched) -> tuple[bool, str, dict]:
+        """Take the final durable identity/generation claim before callback."""
+        signal = getattr(watched, "signal", {}) or {}
+        if not isinstance(signal, dict):
+            return False, "recovery_lifecycle_malformed_signal", {}
+
+        # Explicit unit seam only. Production recovery must use the OSM claim
+        # CAS; a missing/non-string client never implies a test double.
+        if getattr(self, "_test_only_allow_recovery_without_row_lock", False):
+            try:
+                ok, reason, row = self._recovery_final_durable_authority(watched)
+                return bool(ok), str(reason), row if isinstance(row, dict) else {}
+            except Exception as exc:
+                return False, f"recovery_lifecycle_read_failed:{type(exc).__name__}", {}
+
+        required = (
+            "local_order_id",
+            "signal_id",
+            "canonical_signal_id",
+            "client_id",
+            "execution_mode",
+            "ticker",
+            "side",
+        )
+        if any(
+            not isinstance(signal.get(field), str)
+            or not signal.get(field)
+            or signal.get(field) != signal.get(field).strip()
+            for field in required
+        ):
+            return False, "recovery_lifecycle_missing_durable_fence_identity", {}
+        metadata_sources, metadata_ok = self._recovery_strict_metadata_sources(signal)
+        if not metadata_ok:
+            return False, "recovery_lifecycle_malformed_durable_metadata", {}
+        materialization, materialization_error = self._recovery_generation_family_values(
+            signal,
+            metadata_sources,
+            "materialization_generation",
+            "generation",
+        )
+        if materialization_error:
+            return False, materialization_error, {}
+        trigger_generation, trigger_generation_error = self._recovery_generation_family_values(
+            signal,
+            metadata_sources,
+            "trigger_generation",
+            "trigger_generation",
+        )
+        if trigger_generation_error:
+            return False, trigger_generation_error, {}
+        if (
+            not materialization
+            or not trigger_generation
+            or materialization[0] != trigger_generation[0]
+        ):
+            return False, "recovery_lifecycle_trigger_generation_authority_mismatch", {}
+
+        def _candidate_authority(aliases: tuple[str, ...]) -> Optional[str]:
+            values: list[str] = []
+            for source in (signal, *metadata_sources):
+                for alias in aliases:
+                    if alias not in source:
+                        continue
+                    raw = source.get(alias)
+                    if not isinstance(raw, str) or not raw or raw != raw.strip():
+                        return None
+                    values.append(raw)
+            if not values:
+                return None
+            if len(set(values)) != 1:
+                return None
+            return values[0]
+
+        watcher_token = _candidate_authority(("watcher_token",))
+        watcher_owner = _candidate_authority(("watcher_owner", "current_owner"))
+        trigger_cursor = _candidate_authority(("trigger_cursor", "trigger_cursor_id"))
+
+        claim_owner = signal.get("watcher_token")
+        if not isinstance(claim_owner, str) or not claim_owner.strip():
+            claim_owner = f"recovery:{signal['local_order_id']}:{signal['signal_id']}"
+        # The logical recovery owner is stable by design; it is not a callback
+        # uniqueness key.  Each process-shaped dispatch attempt receives a new
+        # token before entering the durable claim CAS.
+        dispatch_attempt_id = uuid.uuid4().hex
+        signal["__recovery_dispatch_attempt_id"] = dispatch_attempt_id
+        claim_fn = getattr(
+            getattr(self, "order_state_machine", None),
+            "claim_recovery_trigger_dispatch",
+            None,
+        )
+        _osm = getattr(self, "order_state_machine", None)
+        # A bare Mock exposes every attribute as a callable and would turn a
+        # missing production CAS into a truthy test-double result.  The real
+        # path must be implemented by the OSM type itself; tests that need a
+        # helper seam use the explicit no-row-lock flag above.
+        if (
+            not callable(claim_fn)
+            or getattr(type(_osm), "claim_recovery_trigger_dispatch", None)
+            is None
+        ):
+            return False, "recovery_lifecycle_durable_claim_unavailable", {}
+        try:
+            claimed = bool(
+                claim_fn(
+                    local_order_id=signal["local_order_id"],
+                    signal_id=signal["signal_id"],
+                    canonical_signal_id=signal["canonical_signal_id"],
+                    client_id=signal["client_id"],
+                    execution_mode=signal["execution_mode"],
+                    ticker=signal["ticker"],
+                    side=signal["side"],
+                    materialization_generation=materialization[0],
+                    trigger_generation=trigger_generation[0],
+                    claim_owner=claim_owner,
+                    dispatch_attempt_id=dispatch_attempt_id,
+                    watcher_token=watcher_token,
+                    watcher_owner=watcher_owner,
+                    trigger_cursor=trigger_cursor,
+                )
+            )
+        except Exception as exc:
+            return False, f"recovery_lifecycle_durable_claim_failed:{type(exc).__name__}", {}
+        if not claimed:
+            return False, "recovery_lifecycle_durable_claim_cas_miss", {}
+        signal["recovery_trigger_dispatch_attempt_id"] = dispatch_attempt_id
+        return True, "recovery_lifecycle_trigger_dispatch_claimed", {}
+
+    def _recovery_dispatch_transition_kwargs(self, watched) -> dict | None:
+        signal = getattr(watched, "signal", {}) or {}
+        if not isinstance(signal, dict):
+            return None
+        attempt_id = str(
+            signal.get("recovery_trigger_dispatch_attempt_id")
+            or signal.get("__recovery_dispatch_attempt_id")
+            or ""
+        ).strip()
+        if not attempt_id:
+            return None
+        sources, ok = self._recovery_strict_metadata_sources(signal)
+        if not ok:
+            return None
+        materialization, materialization_error = self._recovery_generation_family_values(
+            signal, sources, "materialization_generation", "generation"
+        )
+        trigger_generation, trigger_error = self._recovery_generation_family_values(
+            signal, sources, "trigger_generation", "trigger_generation"
+        )
+        if (
+            materialization_error
+            or trigger_error
+            or not materialization
+            or not trigger_generation
+            or materialization[0] != trigger_generation[0]
+        ):
+            return None
+        required = {
+            field: signal.get(field)
+            for field in (
+                "local_order_id", "signal_id", "canonical_signal_id",
+                "client_id", "execution_mode", "ticker", "side",
+            )
+        }
+        if any(
+            not isinstance(value, str) or not value or value != value.strip()
+            for value in required.values()
+        ):
+            return None
+        return {
+            **required,
+            "materialization_generation": materialization[0],
+            "trigger_generation": trigger_generation[0],
+            "dispatch_attempt_id": attempt_id,
+        }
+
+    def _ensure_recovery_trigger_generation(self, watched) -> tuple[bool, str]:
+        """Make legacy pre-breach recovery dispatchable at the trigger edge.
+
+        A recovered TRIGGER_READY watcher never uses this path: its exact
+        positive generation pair is required during admission.  A legacy
+        pre-breach watcher may have no generation at all; once its in-memory
+        breach is confirmed, the real OSM atomically assigns the first pair
+        while holding the exact pending row.  Any partial, malformed, or
+        conflicting authority is held instead of repaired by inference.
+        """
+        signal = getattr(watched, "signal", {}) or {}
+        if not isinstance(signal, dict):
+            return False, "recovery_generation_malformed_signal"
+        sources, ok = self._recovery_strict_metadata_sources(signal)
+        if not ok:
+            return False, "recovery_generation_malformed_metadata"
+        materialization, materialization_error = self._recovery_generation_family_values(
+            signal, sources, "materialization_generation", "generation"
+        )
+        trigger_generation, trigger_error = self._recovery_generation_family_values(
+            signal, sources, "trigger_generation", "trigger_generation"
+        )
+        if materialization_error or trigger_error:
+            return False, materialization_error or trigger_error
+        if materialization or trigger_generation:
+            if (
+                materialization
+                and trigger_generation
+                and materialization[0] == trigger_generation[0]
+            ):
+                return True, "recovery_generation_already_present"
+            return False, "recovery_generation_authority_incomplete"
+
+        osm = getattr(self, "order_state_machine", None)
+        fn = getattr(osm, "ensure_recovery_trigger_generation", None)
+        if not callable(fn) or getattr(type(osm), "ensure_recovery_trigger_generation", None) is None:
+            return False, "recovery_generation_assignment_unavailable"
+        required = (
+            "local_order_id", "signal_id", "canonical_signal_id", "client_id",
+            "execution_mode", "ticker", "side",
+        )
+        if any(
+            not isinstance(signal.get(field), str)
+            or not signal.get(field)
+            or signal.get(field) != signal.get(field).strip()
+            for field in required
+        ):
+            return False, "recovery_generation_identity_invalid"
+        try:
+            result = fn(
+                local_order_id=signal["local_order_id"],
+                signal_id=signal["signal_id"],
+                canonical_signal_id=signal["canonical_signal_id"],
+                client_id=signal["client_id"],
+                execution_mode=signal["execution_mode"],
+                ticker=signal["ticker"],
+                side=signal["side"],
+            )
+        except Exception as exc:
+            return False, f"recovery_generation_assignment_failed:{type(exc).__name__}"
+        if isinstance(result, tuple) and len(result) >= 2:
+            assigned, generation = bool(result[0]), result[1]
+            reason = str(result[2] if len(result) > 2 else "")
+        elif isinstance(result, dict):
+            assigned = bool(result.get("ok"))
+            generation = result.get("generation")
+            reason = str(result.get("reason") or "")
+        else:
+            assigned, generation, reason = bool(result), None, ""
+        if not assigned:
+            return False, reason or "recovery_generation_assignment_rejected"
+        try:
+            generation = int(generation)
+        except (TypeError, ValueError):
+            return False, "recovery_generation_assignment_malformed"
+        if generation <= 0:
+            return False, "recovery_generation_assignment_malformed"
+        metadata = signal.get("metadata")
+        if not isinstance(metadata, dict):
+            return False, "recovery_generation_malformed_metadata"
+        metadata["materialization_generation"] = generation
+        metadata["trigger_generation"] = generation
+        signal["materialization_generation"] = generation
+        signal["trigger_generation"] = generation
+        return True, reason or "recovery_generation_assigned"
+
+    def _start_recovery_trigger_dispatch(self, watched) -> bool:
+        kwargs = self._recovery_dispatch_transition_kwargs(watched)
+        osm = getattr(self, "order_state_machine", None)
+        fn = getattr(osm, "start_recovery_trigger_dispatch", None)
+        if not callable(fn) or getattr(type(osm), "start_recovery_trigger_dispatch", None) is None:
+            return bool(getattr(self, "_test_only_allow_recovery_without_row_lock", False))
+        try:
+            return bool(fn(**(kwargs or {})))
+        except Exception:
+            return False
+
+    def _finish_recovery_trigger_dispatch(self, watched, *, outcome: str) -> bool:
+        kwargs = self._recovery_dispatch_transition_kwargs(watched)
+        osm = getattr(self, "order_state_machine", None)
+        fn = getattr(osm, "finish_recovery_trigger_dispatch", None)
+        if not callable(fn) or getattr(type(osm), "finish_recovery_trigger_dispatch", None) is None:
+            return bool(getattr(self, "_test_only_allow_recovery_without_row_lock", False))
+        try:
+            return bool(fn(outcome=outcome, **(kwargs or {})))
+        except Exception:
+            return False
+
     def _before_trigger_dispatch(self, completed):
         """Hook for a watcher implementation to arbitrate trigger batches."""
         return completed
@@ -5608,18 +8039,32 @@ class APEntryWatcher:
             # this: no other code path in _poll_active_signals can trigger an
             # overnight watcher whose revalidation is still pending.
             active = [w for w in self._pending if w.is_active and not w.overnight]
+            recovered_ready = [
+                w
+                for w in self._pending
+                if bool((getattr(w, "signal", {}) or {}).get("__recovered_trigger_ready"))
+                and getattr(w, "state", None) == WatchState.TRIGGERED
+                and not bool(
+                    (getattr(w, "signal", {}) or {}).get(
+                        "__recovery_trigger_consumed"
+                    )
+                )
+                and not getattr(w, "_ownership_quarantine", False)
+            ]
 
-        if not active:
+        if not active and not recovered_ready:
             return
 
-        tickers = list({w.ticker for w in active})
-        try:
-            quotes = self._fetch_quotes(tickers)
-        except Exception as exc:
-            log.warning("Quote fetch failed: %s", exc)
-            return
+        quotes = {}
+        if active:
+            tickers = list({w.ticker for w in active})
+            try:
+                quotes = self._fetch_quotes(tickers)
+            except Exception as exc:
+                log.warning("Quote fetch failed: %s", exc)
+                return
 
-        completed = []
+        completed = [("trigger", w) for w in recovered_ready]
         with self._lock:
             for w in active:
                 _retry_not_before = getattr(w, "deferred_retry_not_before", None)
@@ -5684,6 +8129,69 @@ class APEntryWatcher:
             _sig_id = str(w.signal.get("signal_id", ""))
             _ticker = str(w.ticker or "")
             if action == "trigger":
+                # Recovery rearm has one final durable claim immediately
+                # before any trigger lifecycle/audit write or callback. This
+                # closes the read-then-dispatch TOCTOU window: a competing
+                # broker/materializer owner that wins after _before_trigger_dispatch
+                # suppresses this candidate without invoking execution work.
+                _trigger_signal = getattr(w, "signal", {}) or {}
+                _is_recovered_trigger_ready = bool(
+                    _trigger_signal.get("__recovered_trigger_ready")
+                )
+                if (
+                    bool(_trigger_signal.get("__recovery_rearm"))
+                    and not bool(_trigger_signal.get("__materialization_resume"))
+                ):
+                    if not _is_recovered_trigger_ready:
+                        _generation_ok, _generation_reason = (
+                            self._ensure_recovery_trigger_generation(w)
+                        )
+                        if not _generation_ok:
+                            _hold_fn = getattr(
+                                self, "_enter_recovery_post_admission_hold", None
+                            )
+                            if callable(_hold_fn):
+                                _hold_fn(w, _generation_reason, {})
+                            else:  # pragma: no cover - legacy watcher fallback
+                                w._ownership_quarantine = True
+                                w._quarantine_reason = (
+                                    f"recovery_generation_hold:{_generation_reason}"
+                                )
+                                w.state = WatchState.PENDING
+                            continue
+                    _claim_ok, _claim_reason, _claim_row = (
+                        self._claim_recovery_trigger_dispatch(w)
+                    )
+                    if not _claim_ok:
+                        _hold_fn = getattr(
+                            self, "_enter_recovery_post_admission_hold", None
+                        )
+                        if callable(_hold_fn):
+                            _hold_fn(w, _claim_reason, _claim_row)
+                        else:  # pragma: no cover - legacy watcher fallback
+                            w._ownership_quarantine = True
+                            w._quarantine_reason = (
+                                f"recovery_post_admission_hold:{_claim_reason}"
+                            )
+                            w.state = WatchState.PENDING
+                        continue
+                    if not self._start_recovery_trigger_dispatch(w):
+                        _hold_fn = getattr(
+                            self, "_enter_recovery_post_admission_hold", None
+                        )
+                        if callable(_hold_fn):
+                            _hold_fn(
+                                w,
+                                "recovery_lifecycle_dispatch_start_cas_miss",
+                                {},
+                            )
+                        else:  # pragma: no cover - legacy watcher fallback
+                            w._ownership_quarantine = True
+                            w._quarantine_reason = (
+                                "recovery_dispatch_start_cas_miss"
+                            )
+                            w.state = WatchState.PENDING
+                        continue
                 # Signal breached — record TRIGGER_READY before firing callback.
                 _trigger_audit = self._build_watcher_audit_payload(
                     w,
@@ -5756,6 +8264,19 @@ class APEntryWatcher:
                         self._is_live_runtime()
                         and not _ts_pre_write_ok
                     ):
+                        if _is_recovered_trigger_ready:
+                            # The durable attempt is already CALLBACK_STARTED.
+                            # A timestamp/audit persistence outage before the
+                            # callback begins is therefore a post-claim hold,
+                            # not a normal watcher retry.  Keep the claim
+                            # unreplayed and let a later reconciliation inspect
+                            # the durable attempt state.
+                            self._enter_recovery_post_admission_hold(
+                                w,
+                                "recovery_dispatch_callback_prepersistence_failed",
+                                {},
+                            )
+                            continue
                         # Database truth is unavailable.  Keep the watcher as the
                         # active owner and never enter selector/broker work.
                         with self._lock:
@@ -5776,6 +8297,74 @@ class APEntryWatcher:
                         _callback_disposition, _callback_next_retry = (
                             self._resolve_trigger_callback_disposition(w, _callback_result)
                         )
+                        if _is_recovered_trigger_ready:
+                            # A recovered TRIGGER_READY row has a durable
+                            # attempt-token cursor.  The callback result may retain
+                            # the watcher for a future *distinct* generation,
+                            # but it can never make this same cursor callable
+                            # again.  Persist the outcome before changing
+                            # in-memory state; a process death after callback
+                            # return but before cleanup therefore still leaves
+                            # a durable replay fence.
+                            _recovery_outcome = (
+                                "CONSUMED"
+                                if _callback_disposition
+                                in {
+                                    "RETRY_WAIT",
+                                    "KEEP_WATCHER",
+                                    "RECONCILE_BROKER_INTENT",
+                                }
+                                else "COMPLETED"
+                            )
+                            if _callback_disposition == "UNKNOWN":
+                                _recovery_outcome = "AMBIGUOUS"
+                            if not self._finish_recovery_trigger_dispatch(
+                                w, outcome=_recovery_outcome
+                            ):
+                                self._enter_recovery_post_admission_hold(
+                                    w,
+                                    "recovery_dispatch_callback_outcome_cas_miss",
+                                    {},
+                                )
+                                log.critical(
+                                    "WATCHER_RECOVERY_CALLBACK_OUTCOME_HOLD "
+                                    "ticker=%s signal_id=%s outcome=%s — durable "
+                                    "callback completion was not confirmed; no retry",
+                                    w.ticker,
+                                    _sig_id or "?",
+                                    _recovery_outcome,
+                                )
+                                continue
+                            if _callback_disposition == "UNKNOWN":
+                                self._enter_recovery_post_admission_hold(
+                                    w,
+                                    "recovery_dispatch_callback_outcome_ambiguous",
+                                    {},
+                                )
+                                continue
+                            _trigger_signal["__recovery_trigger_consumed"] = True
+                            if _callback_disposition in {
+                                "RETRY_WAIT",
+                                "KEEP_WATCHER",
+                                "RECONCILE_BROKER_INTENT",
+                            }:
+                                # KEEP_WATCHER is an ownership/registry
+                                # disposition, not permission to replay the
+                                # same durable trigger.  Retain the object but
+                                # make it inert until a later recovery object
+                                # proves a new trigger generation.
+                                with self._lock:
+                                    w.state = WatchState.PENDING
+                                    w.deferred_retry_not_before = None
+                                log.info(
+                                    "WATCHER_RECOVERY_TRIGGER_CONSUMED "
+                                    "ticker=%s signal_id=%s disposition=%s "
+                                    "same_cursor_replay=false",
+                                    w.ticker,
+                                    _sig_id or "?",
+                                    _callback_disposition,
+                                )
+                                continue
                         if _callback_disposition in {"RETRY_WAIT", "KEEP_WATCHER", "RECONCILE_BROKER_INTENT"}:
                             with self._lock:
                                 w.state = WatchState.PENDING
@@ -5863,6 +8452,34 @@ class APEntryWatcher:
                         except Exception:
                             pass
                     except Exception as exc:
+                        if _is_recovered_trigger_ready:
+                            # Once callback execution has begun, an exception
+                            # (including a downstream timeout) is ambiguous.
+                            # Mark the durable attempt AMBIGUOUS when possible
+                            # and quarantine this exact watcher.  Never use the
+                            # ordinary three-retry loop: a fresh process must
+                            # observe the durable state rather than blindly
+                            # invoke the callback a second time.
+                            _finished_ambiguous = self._finish_recovery_trigger_dispatch(
+                                w, outcome="AMBIGUOUS"
+                            )
+                            self._enter_recovery_post_admission_hold(
+                                w,
+                                "recovery_dispatch_callback_raised"
+                                if _finished_ambiguous
+                                else "recovery_dispatch_callback_ambiguous_unrecorded",
+                                {},
+                            )
+                            log.critical(
+                                "WATCHER_RECOVERY_CALLBACK_AMBIGUOUS "
+                                "ticker=%s signal_id=%s durable_ambiguous=%s "
+                                "callback_exception=%s — retry suppressed",
+                                w.ticker,
+                                _sig_id or "?",
+                                _finished_ambiguous,
+                                type(exc).__name__,
+                            )
+                            continue
                         _trigger_attempts += 1
                         w._trigger_attempts = _trigger_attempts
                         log.error(
@@ -6520,6 +9137,182 @@ class APEntryWatcher:
                 "watcher remains quarantined.",
                 w.ticker,
             )
+
+    @staticmethod
+    def _classify_recovery_post_admission_hold(
+        reason: str,
+        row: Optional[dict] = None,
+    ) -> str:
+        """Classify a post-admission authority failure without inference.
+
+        A proven broker/materializer owner is permanently non-executable; a
+        temporary inability to read the exact row gets a bounded recheck; all
+        identity/generation contradictions become an explicit quarantine.
+        """
+        reason_text = str(reason or "").strip().lower()
+        if "broker_handoff_evidence" in reason_text or "materialization_authority" in reason_text:
+            return RECOVERY_POST_ADMISSION_BROKER_OWNER
+        if isinstance(row, dict) and row:
+            try:
+                meta = row.get("meta") or row.get("metadata") or {}
+                if isinstance(meta, str):
+                    meta = json.loads(meta)
+                if isinstance(meta, dict) and APEntryWatcher._recovery_has_broker_handoff_evidence(
+                    row, meta
+                ):
+                    return RECOVERY_POST_ADMISSION_BROKER_OWNER
+            except Exception:
+                # A malformed authority is not proof of broker ownership.
+                pass
+        transient_markers = (
+            "row_unavailable",
+            "fence_unavailable",
+            "read_failed",
+            "database",
+            "connection",
+            "lock_failed",
+            "claim_failed",
+            "temporarily",
+        )
+        if any(marker in reason_text for marker in transient_markers):
+            return RECOVERY_POST_ADMISSION_AUTHORITY_RECHECK
+        return RECOVERY_POST_ADMISSION_IDENTITY_CONFLICT
+
+    @staticmethod
+    def _recovery_post_admission_seconds(env_name: str, default: float) -> float:
+        try:
+            value = float(os.getenv(env_name, str(default)))
+        except (TypeError, ValueError):
+            value = default
+        return max(0.1, value)
+
+    def _enter_recovery_post_admission_hold(
+        self,
+        watched,
+        reason: str,
+        row: Optional[dict] = None,
+    ) -> str:
+        """Retain a recovered watcher with an auditable disposition.
+
+        This path never invokes cleanup callbacks and never changes ordinary
+        ``cleanup_retry_*`` state.  Only the exact candidate remains retained;
+        a transient authority read gets a bounded recheck and permanent owner
+        or identity conflicts cannot become executable again.
+        """
+        disposition = self._classify_recovery_post_admission_hold(reason, row)
+        now = datetime.now(timezone.utc)
+        watched._ownership_quarantine = True
+        watched._quarantine_reason = f"recovery_post_admission_hold:{reason}"
+        watched._recovery_post_admission_disposition = disposition
+        watched.state = WatchState.PENDING
+
+        if disposition == RECOVERY_POST_ADMISSION_AUTHORITY_RECHECK:
+            deadline = getattr(watched, "recovery_authority_recheck_deadline", None)
+            if deadline is None:
+                deadline = now + timedelta(
+                    seconds=self._recovery_post_admission_seconds(
+                        "WATCHER_RECOVERY_AUTHORITY_RECHECK_DEADLINE_SECONDS", 600
+                    )
+                )
+            watched.recovery_authority_recheck_deadline = deadline
+            watched.recovery_authority_recheck_attempt = int(
+                getattr(watched, "recovery_authority_recheck_attempt", 0) or 0
+            ) + 1
+            watched.recovery_authority_recheck_next_at = now + timedelta(
+                seconds=self._recovery_post_admission_seconds(
+                    "WATCHER_RECOVERY_AUTHORITY_RECHECK_DELAY_SECONDS", 5
+                )
+            )
+        else:
+            watched.recovery_authority_recheck_next_at = None
+            if disposition == RECOVERY_POST_ADMISSION_IDENTITY_CONFLICT:
+                quarantine_ids = getattr(self, "_recovery_quarantine_ids", None)
+                if quarantine_ids is None:
+                    quarantine_ids = set()
+                    self._recovery_quarantine_ids = quarantine_ids
+                signal_id = str(
+                    (getattr(watched, "signal", {}) or {}).get("signal_id") or ""
+                ).strip()
+                if signal_id:
+                    quarantine_ids.add(signal_id)
+
+        recorder = getattr(self, "_record_call_result", None)
+        if callable(recorder):
+            try:
+                recorder(
+                    "recovery_post_admission_hold",
+                    reason,
+                    disposition=disposition,
+                    local_order_id=(getattr(watched, "signal", {}) or {}).get("local_order_id"),
+                    signal_id=(getattr(watched, "signal", {}) or {}).get("signal_id"),
+                )
+            except Exception:
+                pass
+        auditor = getattr(self, "_direction_event_audit", None)
+        if callable(auditor):
+            try:
+                auditor(
+                    watched,
+                    "recovery_post_admission_hold",
+                    reason,
+                    disposition=disposition,
+                    no_broker_submit=True,
+                    no_broker_cancel=True,
+                )
+            except Exception:
+                pass
+        log.critical(
+            "[%s] RECOVERY_POST_ADMISSION_HOLD local_order_id=%s disposition=%s reason=%s",
+            getattr(watched, "ticker", "?"),
+            (getattr(watched, "signal", {}) or {}).get("local_order_id"),
+            disposition,
+            reason,
+        )
+        return disposition
+
+    def _retry_recovery_authority_rechecks(self) -> None:
+        """Boundedly recheck only temporary post-admission authority failures."""
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            candidates = [
+                watcher
+                for watcher in self._pending
+                if getattr(watcher, "_recovery_post_admission_disposition", "")
+                == RECOVERY_POST_ADMISSION_AUTHORITY_RECHECK
+                and getattr(watcher, "recovery_authority_recheck_next_at", None) is not None
+                and now >= watcher.recovery_authority_recheck_next_at
+            ]
+
+        for watched in candidates:
+            deadline = getattr(watched, "recovery_authority_recheck_deadline", None)
+            if deadline is not None and now >= deadline:
+                self._enter_recovery_post_admission_hold(
+                    watched,
+                    "recovery_lifecycle_authority_recheck_deadline_exhausted",
+                )
+                continue
+            try:
+                ok, reason, row = self._recovery_final_durable_authority(watched)
+            except Exception as exc:
+                ok, reason, row = (
+                    False,
+                    f"recovery_lifecycle_read_failed:{type(exc).__name__}",
+                    {},
+                )
+            if ok:
+                watched._ownership_quarantine = False
+                watched._quarantine_reason = ""
+                watched._recovery_post_admission_disposition = ""
+                watched.recovery_authority_recheck_next_at = None
+                watched.recovery_authority_recheck_deadline = None
+                watched.recovery_authority_recheck_attempt = 0
+                log.info(
+                    "[%s] RECOVERY_POST_ADMISSION_AUTHORITY_RESTORED local_order_id=%s",
+                    getattr(watched, "ticker", "?"),
+                    (getattr(watched, "signal", {}) or {}).get("local_order_id"),
+                )
+                continue
+            self._enter_recovery_post_admission_hold(watched, reason, row)
 
     def _retry_quarantined_cleanup(self) -> None:
         """Attempt to retry cleanup for quarantined watchers.

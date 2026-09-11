@@ -1,0 +1,844 @@
+# P0 — Converge trigger-ready watcher lifecycle after DB/readiness outage
+
+## STATUS
+
+**AMENDED IN PLACE — DRAFT / MERGE CANDIDATE. DO NOT MERGE OR DEPLOY.**
+
+Live PR base: `59eb1882dc84d6bb33475b4bdd0225486a2309fc`
+Latest code/test head before this attestation:
+`f1ee8cf56fa3e6cf54962bb5b9efee4542d6b6b8`
+PR state: **Draft / open / MERGE CANDIDATE**. The final branch head including this
+attestation is recorded in the PR body; no merge, deploy, close, or replacement
+PR was performed.
+Audited committed main for this PR: `59eb1882dc84d6bb33475b4bdd0225486a2309fc`
+Original head before amendment: `dd41efaac6db81e3762e87a05c8c90276019fe08`
+Head before this rebase: `442f37c16c4dbff0b2fcc9b02ff35d7d9d88f84b`
+Prior amended head before live-base rebase: `bb7d2084f014ff216a7915873e34f5bbd92bf4be`
+Amendment applied: 2026-09-10
+
+Latest code amendment commit (before this documentation attestation):
+`f1ee8cf56fa3e6cf54962bb5b9efee4542d6b6b8`. The final branch SHA, including
+this specification update, is recorded in the PR body after the documentation
+commit.
+
+Dependencies (§STATUS binding order):
+- PR #568 (deferred selector/materialization retry authority) remains a separate
+  ownership boundary; #580 does not copy or modify its retry-owner code.
+- PR #569 (fresh market truth / late watcher recovery) is intentionally out of
+  scope and remains untouched.
+- PR #596 (deferred materialization retry ownership) is intentionally out of
+  scope and remains untouched.
+
+## CURRENT VERIFICATION ATTESTATION — 2026-09-10
+
+This section supersedes older audit snapshots below. The PR branch is based on
+the live committed GitHub `main` at
+`59eb1882dc84d6bb33475b4bdd0225486a2309fc`. The code/test commit immediately
+before this attestation is `f1ee8cf56fa3e6cf54962bb5b9efee4542d6b6b8`; the
+final documentation commit SHA is recorded in the PR body. The PR remains
+Draft/open and must not be merged, deployed, or closed during this audit.
+
+The scope is PR #580 only. PRs #596 and #569 are intentionally out of scope
+for this clearance pass: their code, ownership, and status are not changed or
+used as a gate.
+
+### Accepted recovery ownership contract
+
+The recovery dispatch marker uses a unique `recovery_trigger_dispatch_attempt_id`
+as the callback-attempt fence. The deterministic recovery owner identifies the
+lifecycle only; it is not a uniqueness key. The first blank claim for a
+generation wins. A `CLAIMED` marker is reclaimable only after its bounded
+60-second `recovery_trigger_dispatch_lease_until` expires (older markers fall
+back to `claimed_at` plus the same interval); a fresh claim cannot be stolen.
+The reclaimer installs a new attempt token in the same row-lock/CAS boundary,
+so the abandoned process cannot later cross the start fence. `CALLBACK_STARTED`,
+`CONSUMED`, `COMPLETED`, and `AMBIGUOUS` remain non-reclaimable for that same
+generation. Handoff, materialization ownership, or newer-generation evidence
+always blocks reclaim.
+
+### `KEEP_WATCHER` / `RETRY_WAIT`
+
+For a recovered trigger-ready cursor, these dispositions consume the current
+durable cursor and make the watcher inert. The same cursor cannot callback on
+the next poll or after restart. Only a genuinely new durable trigger
+generation/cursor can create one new callback attempt.
+
+### Unproven trigger-ready rows
+
+Incomplete, malformed, conflicting, stale, or unavailable authority remains a
+HOLD and is never convenience-terminalized. The existing critical
+`RESTART_RECOVERY_TRIGGER_READY_HOLD` / identity-generation hold logging is
+the operator signal; these paths have zero selector, callback, broker,
+position, proof-trade, or queue authority. Reconciliation of the exact durable
+identity and generation is required before any retry.
+
+### Transactional incumbent observability
+
+Incumbent cancellation remains inside the existing PostgreSQL transaction with
+non-rollback-safe effects deferred. After commit, the existing transition
+event is replayed first and `_notify_opportunity_ledger(...)` second. Rollback
+replays neither. The transition sink is append-only and the opportunity ledger
+is monotonic, so duplicate post-commit delivery is harmless and cannot reach
+the broker. No new broker behavior, outbox, retry system, or state machine is
+introduced.
+
+### Latest audit corrections — strict trigger authority and post-admission liveness
+
+The latest audit identified two remaining production blockers and one
+observability gap. They are corrected in the code commit above without
+changing the PR's ownership boundary.
+
+- `trigger_generation` is now parsed independently from every top-level,
+  `metadata`, and `meta` authority with the same strict positive-integer
+  contract as `materialization_generation`. Zero, negative, boolean, float,
+  fractional-string, blank, malformed, one-sided, and conflicting authorities
+  HOLD. A populated trigger generation must equal the materialization
+  generation on both the recovery candidate and the durable row. The final
+  row identity fence, lifecycle bridge, and OSM dispatch claim all apply this
+  binding; no generation is coerced while building a restart plan.
+- The package poll path now performs an OSM-backed exact identity/mode/
+  generation claim CAS immediately before any recovery `TRIGGER_READY` audit,
+  lifecycle write, timestamp write, or callback. A missing OSM claim method,
+  row-lock capability, exact row, or claim proof fails closed. A recovery
+  claim CAS cannot be satisfied by a bare test mock; the only bypass is the
+  explicit `_test_only_allow_recovery_without_row_lock` unit seam.
+- Post-admission HOLDs have explicit dispositions. Proven broker/materializer
+  ownership is permanently non-executable; transient durable read/claim
+  failure receives a bounded authority recheck and can restore the exact
+  original watcher; identity/generation conflict is an auditable quarantine.
+  None of these paths invokes a callback, selector, broker submit/cancel/
+  replace, position, proof-trade, or queue mutation.
+- The final OSM claim parses both metadata aliases independently and rejects
+  malformed or conflicting identity/generation authorities. Its mode-scoped
+  `FOR UPDATE` transaction installs a logical recovery owner plus a unique
+  dispatch-attempt token; the owner string is never callback uniqueness proof.
+  Top-level-only generation schemas remain supported because the Python proof
+  is performed while the row lock is held.
+- The real deferred LIVE callback now carries the exact recovery dispatch
+  attempt into the materialization CAS. The atomic callback-side transition
+  advances the durable generation family from `N` to `N+1`, mirrors the new
+  generation into the signal/approved plan, and lets the finalizer close the
+  same durable dispatch attempt rather than losing a successful submit at an
+  `N/N` CAS.
+- Successful candidate-first replacement still cancels and terminally rereads
+  only the exact displaced incumbent before releasing its registration and
+  dedup key. Canonical transition events and opportunity-ledger notifications
+  are replayed only after the transaction commits; rollback emits neither.
+- `materialization_resume=True` remains outside this transaction and lifecycle
+  bridge. Restart plan construction preserves raw generation values for the
+  #580 strict fence, while the existing #596 retry lease/generation/attempt
+  adoption CAS remains the sole materializer authority and is not changed.
+
+Focused local evidence for this amendment:
+
+- the non-PostgreSQL lifecycle-integrity run: `156 passed, 29 skipped`;
+- the fresh PostgreSQL exact-head and pull-request merge-ref jobs below passed
+  the stale-claim startup, race, and authority-negative controls;
+- the local disposable PostgreSQL server is environmental evidence only; the
+  GitHub PostgreSQL jobs are the authoritative CI rerun.
+
+The exact-head/merge-ref P0 workflow for code/test head
+`f1ee8cf56fa3e6cf54962bb5b9efee4542d6b6b8` is run `34551538740`:
+
+- exact-head `p0-tests`, job `103115305724`: **PASS**;
+- pull-request merge-ref `p0-merge-ref-tests`, job `103115305400`: **PASS**;
+- the separate `p0-rollback-failfirst` guard, job `103115305644`, also passed,
+  but its pre-#579 historical base is not used as #580 clearance evidence.
+
+The historical implementation/gate notes below are retained for audit
+history. Current clearance depends on the live base/head and fresh checks
+above, not on their superseded SHA or count claims.
+
+## AMEND PR #580 IN PLACE — Corrections applied 2026-09-09
+
+The September 8/9 amendment applies the remaining recovery-admission and
+replacement-convergence corrections surgically. Scope boundary unchanged:
+PR #580 owns only recovered durable `PENDING_TRIGGER` watcher admission and
+its lifecycle/registry convergence.
+
+### Current amendment closure
+
+- Complete plan-to-row identity proof now covers local order, signal and
+  canonical signal IDs, exact client/mode, ticker, side, generation
+  authorities, watcher owner/token, and trigger generation/cursor authorities.
+  Missing, malformed, blank, conflicting, or whitespace-normalized identity
+  is HOLD. Recovery does not fabricate UUIDs, default side, or fall back to
+  `self.mode`.
+- Every generation authority (durable column, metadata/meta, and candidate)
+  is parsed independently as a strict positive integer. Zero, negative,
+  boolean, fractional, malformed, blank, row-only, candidate-only, and
+  conflicting values fail closed.
+- Production recovery requires exact OSM client identity, local order
+  identity, PostgreSQL connection, `FOR UPDATE` row lock, and an exact row.
+  Missing/non-string/blank identity or any lock/read failure is HOLD. The
+  explicit `_test_only_allow_recovery_without_row_lock` seam is test-only.
+- The lock remains held through final durable proof, canonical broker/
+  materializer handoff proof, lifecycle restoration, candidate registry/dedup
+  and per-call provenance commit. Candidate rollback is failure-atomic; an
+  unrepaired lifecycle transition is an explicit quarantine that blocks a
+  duplicate recovery attempt. Every displaced incumbent row is also locked,
+  cancelled, and terminally reread on this same transaction; a later
+  incumbent/proof failure rolls back every earlier durable cancellation.
+- A replacement candidate becomes durable watcher owner first. The exact
+  displaced incumbent is then identity-reread, cancelled through the existing
+  `cancel_pending_entry` authority, reread as terminal, and only then removed
+  from `_pending` and dedup. Cancellation failure/exception/identity drift
+  preserves the incumbent byte-for-byte and returns HOLD.
+- The final identity fence re-proves populated `trigger_crossed_at` values and
+  their four-field provenance against both the recovery plan and locked durable
+  row. Missing, malformed, conflicting, or one-sided timestamp/provenance is
+  HOLD.
+- A post-lock broker/materializer owner is reread before trigger dispatch;
+  the recovered callback is suppressed and no second economic attempt or
+  invented broker cancel is made.
+- `materialization_resume=True` remains on the existing #596 adoption-CAS
+  path and never enters the #580 transaction or lifecycle bridge.
+
+### Correction 1 — Canonical broker handoff must block recovery before watcher admission
+
+`_restore_recovered_watcher_lifecycle()` now adapts the existing canonical
+`ap.pending_trigger_classifier` authorities before any lifecycle write:
+`classify_pending_trigger_row()` owns populated row-level
+`broker_order_id`/`submitted_ts`, `has_broker_handoff_evidence()` owns durable
+submit-intent markers, and `is_active_materialization_in_flight()` owns the
+complete current materializer proof. Any canonical evidence → HOLD; an
+unavailable canonical authority also → HOLD. The bridge no longer maintains a
+second broker-handoff vocabulary.
+
+`watcher_audit.reason_code == "trigger_ready"` is deliberately not broker
+evidence. It proves watcher breach confirmation only. At this lifecycle-bridge
+boundary, a PENDING_TRIGGER row with that audit label but no canonical
+broker/materialization handoff evidence remains eligible for restoration. The
+shared due-retry classifier precedence remains untouched for its separate P0
+owner (#596).
+
+### Correction 2 — Recovery identity must fail closed
+
+`_restore_recovered_watcher_lifecycle()` now validates the full durable
+identity from column values only — no metadata fallback for blank columns,
+no UUID fabrication, no mode fallback, no default side. Validated:
+`signal_id`, `ticker`, `client_id`, `execution_mode` (exactly `"live"` or
+`"paper"`, case-sensitive, no normalization), `local_order_id`,
+`canonical_signal_id`, and `side` (exactly `"CALL"` or `"PUT"`). Metadata
+aliases are parsed independently; malformed or conflicting aliases → HOLD.
+
+Materialization generation is parsed independently from every populated
+signal/metadata authority. Each populated value must be a strict positive
+Python integer, and multiple populated values must agree exactly. Explicit
+zero, negative, boolean, string, float, malformed, or blank values never fall
+through to another source. A genuinely absent source may fall back to one
+valid source under the existing optional-generation contract.
+
+### Correction 6 — Recheck the exact durable row before recovery classification
+
+`watch(recovery_rearm=True)` now reloads the exact durable row and requires
+`status=PENDING_TRIGGER` plus one coherent
+`local_order_id`/`signal_id`/`canonical_signal_id`/`client_id`/
+`execution_mode` identity across the incoming plan, row columns, and row
+metadata. Conflicting or mismatched aliases, unavailable rows, and durable
+broker-handoff evidence HOLD before the shared classifier or watcher
+registration. This closes the plan-to-row identity gap without changing
+ordinary admissions or retry/terminal classifier precedence.
+
+### Correction 7 — Incumbent replacement is one durable transaction
+
+The recovery bridge now passes the held PostgreSQL connection through the
+existing OSM `cancel_pending_entry()`/`transition()` authority. Every displaced
+incumbent is selected with `FOR UPDATE`, cancelled with transition
+observability deferred, and terminally reread before any process-local state is
+released. Incumbents are processed in deterministic local-order order. If a
+later cancellation, terminal reread, or registration-token proof fails, the
+admission context rolls back all prior incumbent updates; the candidate is
+closed through the canonical lifecycle failure path and the incumbent registry,
+dedup, and durable rows remain intact. Public OSM callers retain their existing
+connection and ledger behavior.
+
+The final fence also applies the existing `trigger_crossed_at` parser and
+provenance contract independently to the incoming plan and durable row, then
+requires exact timestamp/provenance agreement.
+
+### Correction 3 — Lifecycle import failure must fail closed
+
+`_EW_LIFECYCLE_OK == False` path changed from soft success
+`(True, "recovery_lifecycle_module_unavailable_soft_ok")` to HOLD
+`(False, "recovery_lifecycle_unavailable_hold")`. A bridge that cannot
+read lifecycle state cannot determine whether admission is safe.
+
+### Correction 4 — Lifecycle restoration is now atomic (validate before register)
+
+The recovery lifecycle validation block in `add_signal()` now runs
+**before** `_pending.append()` and `_dedup_set.add()`. Preferred order:
+1. validate identity, 2. validate broker handoff, 3. restore lifecycle,
+4. register watcher. A HOLD now leaves the registry completely clean with
+no rollback needed.
+
+### Correction 5 — Retry ownership preserved
+
+No changes made to `#568`/`#569` selector or materializer retry counters.
+`WATCHING → TRIGGER_READY` remains legal per existing `LEGAL_TRANSITIONS`.
+Recovery never creates a second broker submission attempt.
+
+### Follow-up amendment — materialization-resume ownership boundary
+
+Code/test commit (replayed onto current `main`): `a9f95926`.
+
+The real production `watch()` → `add_signal()` path now treats
+`__materialization_resume=True` as an explicit #596 ownership boundary:
+
+- the existing `adopt_deferred_retry_watcher()` CAS remains the sole durable
+  retry-owner decision;
+- a successful CAS may register at most one watcher, but it does not invoke
+  `_restore_recovered_watcher_lifecycle()` or synthesize a parallel #580
+  `ap_lifecycle.WATCHING` owner;
+- an unavailable, raised, or false CAS returns a deterministic rejection
+  reason, leaves `_pending`, dedup, callback, and lifecycle state untouched,
+  and lets the existing recovery retention path decide the durable outcome;
+- the ordinary `recovery_rearm=True, materialization_resume=False` path keeps
+  the #580 lifecycle bridge unchanged.
+
+The September 8 Jason LIVE RTX replay is covered with the exact local order
+`84d9106b-7b67-4d58-b479-e9e65b9eb289`, signal
+`322adca3-c407-491f-b5f5-102c2b0a5701`, `PUT` trigger `198.13`, generation 19,
+and retry attempt 13. CAS-miss and retention-write-failure evidence proves no
+false watcher owner, no false lifecycle owner, no callback, and no broker or
+order mutation.
+
+## Implementation summary (current amendment)
+
+Production files changed:
+- `ap_entry_watcher.py` — 308 insertions / 57 deletions in this follow-up
+  (in addition to the prior amendment). Changed recovery
+  identity/generation/final-authority helpers, row-lock fence, lifecycle
+  repair, candidate commit/replacement convergence, strict recovery `watch()`
+  construction, and `add_signal()`'s recovery-only constructor guard.
+- `ap/order_state_machine.py` — 129 insertions / 79 deletions in this
+  follow-up. Added only the private transaction-aware seam used by recovery
+  replacement; public cancellation/transition behavior is unchanged.
+- `ap_entry_watcher/__init__.py` — 36 insertions. Changed the package poll
+  dispatch seam to reread durable ownership after the admission lock.
+
+Test/CI files changed:
+- `.github/workflows/p0_regression.yml` — 1 insertion / 1 deletion; exact-head
+  and merge-ref jobs run the complete lifecycle-integrity file plus the
+  canonical P0 inventory with PostgreSQL enabled.
+- `tests/test_p0_pending_trigger_lifecycle_integrity.py` — 224 insertions in
+  this follow-up; complete identity/generation/OSM-fence/lifecycle failure,
+  replacement convergence, materialization-resume isolation, and real
+  PostgreSQL lock-race coverage, including multi-incumbent rollback and
+  terminal-reread failure.
+- `tests/test_p0_amendment5_7_recovery_outcome_integrity.py` — `95 insertions /
+  3 deletions` in the follow-up; exact RTX CAS-miss retention-failure replay.
+- `tests/test_p0_post_outage_trigger_lifecycle_convergence.py` — 4 insertions;
+  explicit test-only fence seam for the September 8 Jason LIVE replay.
+- `tests/test_p0_reattach_no_cancel_on_missing_quote.py` — 11 insertions /
+  3 deletions in this follow-up;
+  explicit test-only fence seam and complete identity fixture.
+- `tests/test_p0_prebreach_stop_activation.py` — 3 insertions; existing
+  production-shaped recovery fixtures explicitly opt into the test-only
+  no-PostgreSQL seam.
+- `tests/test_p0_seam4_e2e_deferred_lifecycle.py` — 34 insertions; preserves
+  the #596 materialization-resume argument and adoption-CAS in the harness.
+- `tests/test_p0_watcher_conflict_cancellation_proof.py` — 1 insertion;
+  explicit test-only fence seam.
+
+`ap/pending_trigger_restart_recovery.py` and `ap_recovery.py` only preserve raw
+generation values so the #580 fence can reject corruption; their #596
+materialization retry lease, generation, attempt, and adoption-CAS authority
+remain unchanged. The OSM change is limited to the private transaction-aware
+recovery cancellation seam and final recovery dispatch claim described above.
+
+Files NOT touched (§4/§5 binding):
+- `ap_lifecycle.py`, `ap/order_monitor.py`, `ap/preopen_readiness.py`,
+  `ap_overnight_reeval.py`,
+  `ap/selector_retry_policy.py`, `ap_execution_core.py`,
+  `ap/exposure_gate.py`, contract selector, scanner, sizing, scoring,
+  exit engine, reconciler, broker adapters, proof_trades, queue,
+  schema. Zero new broker submit/cancel authority. No durable retry
+  counter added.
+
+Follow-up local status: focused amendment class `85 passed, 1 skipped`; complete
+`tests/test_p0_pending_trigger_lifecycle_integrity.py` plus the amendment 5/7
+recovery-outcome file `140 passed, 1 skipped`; adjacent deferred-materialization
+and watcher suites `292 passed, 1 skipped`; exact follow-up boundary tests `4
+passed`. The local PostgreSQL lock-race test is skipped when
+`INTELLIGENCE_POSTGRES_TEST_URL` is absent; CI is the required PostgreSQL
+evidence.
+No local PostgreSQL server was available (`pg_isready` returned
+`localhost:5432 - no response`).
+
+The post-rebase verification run is `34385296024` on PR head
+`2e4437aba86702279f1b60dd3401dd951e92e9d8` with merge ref
+`c798acc71e2b2824db4e4b743704f5d92f5c53c0`. Both jobs passed the complete
+5,189-test inventory with PostgreSQL enabled: `p0-tests` job `102579923305`
+and `p0-merge-ref-tests` job `102579923243` each reported `5189 passed, 2
+warnings`. The run includes the real PostgreSQL row-lock race,
+same/opposite durable replacement, cancellation-failure preservation,
+missing-OSM-client HOLD, and materialization-resume isolation. The exact RTX
+retention-failure test is a supplemental local test outside the canonical
+inventory.
+
+The follow-up transaction/provenance correction is on production commit
+`86b97873a2068b02c89f846b7fbd4180417f04d6`. Run `34391055722` reran the same
+PostgreSQL-enabled canonical inventory at the then-current Draft head
+`a84fae378aa2e8083eb16e59c6fab49cf8eef341`. Both exact-head job `102599167598`
+(`p0-tests`) and merge-ref job `102599167468` (`p0-merge-ref-tests`) completed
+successfully. The run includes the shared-transaction multi-incumbent rollback
+and terminal-reread tests, confirmed-trigger provenance fencing, and the
+existing PostgreSQL row-lock race. Local focused evidence for this follow-up
+is 131 passed / 1 skipped in the complete lifecycle-integrity file and 214
+passed / 1 skipped in the adjacent recovery/convergence suites.
+
+The resulting Draft PR ref is maintained in the PR metadata/body because this
+spec is itself part of that ref. The subsequent corrected-head workflow
+`34394117484` ran against the corrected ref and completed successfully for
+exact-head job `102609445596` (`p0-tests`) and merge-ref job `102609445888`
+(`p0-merge-ref-tests`).
+
+This PR owns one failure class:
+
+> A valid deferred entry that regains watcher ownership after a database/readiness interruption must restore one coherent lifecycle authority and progress through the existing callback path. It must not loop forever on `NONE -> TRIGGER_READY`, reset callback attempt state, or terminalize a valid retry merely because restart reconstruction omitted lifecycle state.
+
+No strategy thresholds or broker semantics belong here.
+
+This PR does not modify `ap.pending_trigger_classifier` retry precedence or
+`_resolve_trigger_callback_disposition()` terminal-reason aliases. Those are
+the separate due-materialization-retry-liveness (#596) and terminal-watcher-
+convergence (#597) ownership seams.
+
+---
+
+## September 4 production defect — PEP
+
+Signal:
+
+```text
+signal_id: da9db343-8cec-46af-abd0-e43e73bfa4c6
+ticker: PEP
+execution context: Jason LIVE
+```
+
+Observed repeatedly after the morning Supabase/readiness incident:
+
+```text
+[LIFECYCLE] ILLEGAL_TRANSITION
+PEP NONE -> TRIGGER_READY
+owner=WATCHER
+reason=trigger_breached_entry_submitted
+
+WATCHER_TRIGGER_CALLBACK_ATTEMPT
+PEP attempt=1/3 kept_in_pending=true
+
+WATCHER_TRIGGER_OWNERSHIP_RETAINED
+PEP disposition=KEEP_WATCHER
+```
+
+The loop repeated for minutes.
+
+The signal never reached a real contract selection / broker-ready handoff and produced no broker POST.
+
+It later terminalized through restart cleanup as:
+
+```text
+restart_stuck_trigger_ready_no_broker_proof
+```
+
+This is not proof that PEP was bad. It is proof that the reconstructed watcher/lifecycle authorities disagreed.
+
+Current main itself documents the invariant in an existing test comment: `NONE -> TRIGGER_READY` is illegal because `LEGAL_TRANSITIONS` requires the signal to be `WATCHING` first, and bypassing the normal `add_signal()` lifecycle registration can prevent submit.
+
+The production restart/reattach path reproduced that class of failure.
+
+---
+
+## Relationship to pending PRs
+
+### #569 — fresh market truth / late watcher recovery
+
+#569 owns the late/ownerless overnight recovery policy and the freshness/deadline boundary around watcher installation. It is relevant upstream.
+
+It does **not** own the entire September 4 PEP failure because the current PR changes restart recovery/readiness/reeval consumers but does not establish one canonical callback-attempt/lifecycle restoration invariant inside the entry watcher/lifecycle seam.
+
+Do not copy #569's market-truth logic here.
+
+After #569 is finalized, this PR must be independently re-audited against the
+resulting main and prove the same resolved lifecycle behavior with #569's
+recovery output. This PR is not merge-ready while #569 remains unresolved.
+
+### #568 — validity-bound deferred materialization retry
+
+#568 owns deferred selector/materialization attempt authority. Its attempt counter is not automatically the same authority as `APEntryWatcher`'s `_trigger_attempts`.
+
+Do not merge the two counters casually.
+
+This PR must first document exactly which counter owns:
+
+- watcher callback retry;
+- deferred selector/materializer retry;
+- restart recovery attempt;
+- terminalization.
+
+Only consolidate authorities if the actual caller trace proves they represent the same economic attempt.
+
+### #560 / older readiness PRs
+
+Older readiness PRs are stale implementation vehicles. Use them as historical evidence only. Do not cherry-pick broad old diffs.
+
+---
+
+## Required production code trace before implementation
+
+Trace the exact path for a preclaimed/restarted deferred signal:
+
+```text
+startup / preopen readiness
+-> pending-trigger restart recovery
+-> durable order/meta read
+-> watcher reconstruction / watch()
+-> lifecycle state restoration
+-> quote poll / breach confirmation
+-> lifecycle TRIGGER_READY transition
+-> on_trigger callback
+-> execution core disposition
+-> watcher retry ownership
+-> next callback or terminalization
+```
+
+For every changed function record:
+
+```text
+caller
+-> state read
+-> identity/generation authority
+-> lifecycle mutation
+-> retry mutation
+-> return classification
+-> downstream consumer
+```
+
+Do not accept a lifecycle helper in isolation while one restart caller still bypasses it.
+
+---
+
+## Binding authorities
+
+The implementation must explicitly resolve these independent authorities.
+
+### Identity
+
+- `client_id`;
+- `execution_mode`;
+- canonical `signal_id`;
+- local order ID;
+- direction/side;
+- OCC only after materialization;
+- lifecycle/materialization generation;
+- watcher ownership token or durable equivalent.
+
+### Lifecycle
+
+One canonical durable source must determine whether the reconstructed signal is:
+
+- WATCHING;
+- TRIGGER_READY;
+- broker-ready/submitting;
+- terminal;
+- invalid for recovery.
+
+`NONE` is not an acceptable silent default when durable order/meta proves an owned watching/retry lifecycle.
+
+### Retry
+
+The implementation must distinguish and prove the authority for:
+
+1. watcher callback attempt;
+2. selector/materialization attempt;
+3. restart recovery attempt;
+4. broker submit attempt.
+
+A log that emits `attempt=1/3` forever is not bounded retry semantics.
+
+Do not increment a money-path attempt merely because an infrastructure/lifecycle write failed before selector or broker work occurred unless the binding authority explicitly defines that as an attempt.
+
+---
+
+## Required state behavior
+
+### Healthy first attempt
+
+```text
+durable WATCHING
+-> watcher owns
+-> breach confirmed
+-> TRIGGER_READY legal transition
+-> callback attempt 1
+-> execution core progresses
+```
+
+Exactly one callback per accepted retry window.
+
+### Retryable callback result
+
+```text
+TRIGGER_READY / owned retry
+-> callback returns KEEP_WATCHER or RETRY_WAIT
+-> durable retry authority preserved
+-> lifecycle remains a legal resumable state
+-> next retry occurs no earlier than next_retry_at
+-> attempt/counter semantics advance exactly as defined
+```
+
+No busy loop.
+
+### Restart with durable WATCHING
+
+```text
+process dies
+-> restart reads exact durable owner/state
+-> reconstructs watcher
+-> restores lifecycle WATCHING before any TRIGGER_READY emission
+-> future breach follows normal path
+```
+
+### Restart with durable TRIGGER_READY retry
+
+```text
+process dies after trigger claim but before successful callback completion
+-> restart does NOT synthesize NONE
+-> exact same signal/order/generation resumes
+-> no duplicate selector/broker submission
+-> retry owner remains durable
+```
+
+### Broker-ready or submit-intent state
+
+Once exact durable broker-ready/submit ownership exists:
+
+- watcher must not re-fire the breach callback as a new attempt;
+- restart must hand off to the canonical broker-ready/OSM recovery consumer;
+- zero duplicate submit authority.
+
+### Ownership loss / stale generation
+
+If exact owner or generation is stale/conflicting:
+
+- no lifecycle mutation to TRIGGER_READY;
+- no selector;
+- no broker call;
+- explicit HOLD/recovery classification;
+- diagnostics preserve the conflicting fields.
+
+---
+
+## PEP exact positive control
+
+Build a behavioral replay using the September 4 PEP shape:
+
+```text
+signal da9db343-8cec-46af-abd0-e43e73bfa4c6
+LIVE
+valid deferred order
+watcher reconstructed after DB/readiness interruption
+lifecycle registry starts without in-memory state
+```
+
+Fail-first should reproduce current behavior:
+
+```text
+NONE -> TRIGGER_READY
+ILLEGAL_TRANSITION
+KEEP_WATCHER
+attempt 1/3 repeats
+```
+
+After the fix, the same durable data must produce one of only two valid outcomes:
+
+1. exact durable recovery restores a legal WATCHING/TRIGGER_READY retry state and progresses to the canonical execution callback; or
+2. authority is genuinely unprovable, so the path HOLDs without broker mutation and without falsely terminalizing as a legitimate trade rejection.
+
+The test must not hard-code that PEP necessarily deserves a fill. Contract quality / final risk gates remain downstream and may legitimately reject it.
+
+---
+
+## Failure timing matrix
+
+Execute process-death / DB-failure behavioral tests at:
+
+1. before watcher reconstruction;
+2. after watcher object creation but before durable owner registration;
+3. after owner registration but before lifecycle WATCHING restore;
+4. after WATCHING restore but before breach poll;
+5. after breach evidence but before TRIGGER_READY persistence;
+6. after TRIGGER_READY persistence but before callback;
+7. during callback before selector;
+8. after selector starts but before materialization persistence;
+9. after materialization persistence but before broker-ready copyback;
+10. after broker-ready copyback but before submit;
+11. after submit intent but before broker response.
+
+Required result at every boundary:
+
+- no duplicate broker call;
+- no ownerless durable retry;
+- restart converges to the same economic attempt;
+- no illegal lifecycle jump;
+- no silent terminalization of a valid retry.
+
+---
+
+## Data corruption matrix
+
+Behavioral tests must cover:
+
+- missing lifecycle metadata;
+- malformed lifecycle metadata;
+- blank lifecycle state;
+- lifecycle column/meta disagreement;
+- durable WATCHING but in-memory NONE;
+- durable TRIGGER_READY but in-memory NONE;
+- wrong client;
+- wrong mode;
+- PAPER/LIVE collision;
+- stale generation;
+- missing generation where current schema requires it;
+- conflicting duplicate owner;
+- whitespace/case variants;
+- direction reversal;
+- missing local order ID;
+- wrong local order ID;
+- terminal order with stale watcher;
+- broker-ready order with stale watcher;
+- retry timestamp in past/future/malformed;
+- explicit zero attempt;
+- negative attempt;
+- non-integer attempt;
+- conflicting watcher/materializer counters.
+
+Every ambiguous identity/generation case must fail closed with zero broker mutation.
+
+---
+
+## Runtime / restart / deferred materializer parity
+
+Build an explicit matrix with actual resolved values:
+
+| Scenario | Execution core | Restart recovery | Deferred materializer / watcher |
+|---|---|---|---|
+| valid WATCHING | WATCHING | WATCHING | WATCHING |
+| valid triggered retry | same generation | same generation | same generation |
+| stale generation | HOLD | HOLD | HOLD |
+| client mismatch | HOLD | HOLD | HOLD |
+| mode mismatch | HOLD | HOLD | HOLD |
+| ownership loss | no mutation | no mutation | no mutation |
+| broker-ready | no re-trigger | handoff | no re-trigger |
+| terminal | no callback | no rearm | remove owner |
+
+No prose substitutes for this matrix.
+
+---
+
+## Readiness recovery requirements
+
+The September 4 incident also showed readiness remaining degraded after the transient database problem.
+
+Do not solve that by globally forcing `entries_allowed=true`.
+
+Instead prove the exact dependency chain:
+
+```text
+readiness degraded reason
+-> condition becomes healthy
+-> authoritative inventory is reread
+-> stale degraded reason clears only when its invariant is satisfied
+-> valid owned retry is allowed to continue
+```
+
+Required tests include:
+
+- DB unavailable -> readiness degraded -> DB healthy -> inventory proof healthy;
+- stale `pending_trigger_without_watcher_ownership` clears only after exact owner proof;
+- stale `watching_rows_missing_orders` clears only after exact order proof;
+- a genuinely ownerless row remains blocked;
+- LIVE/PAPER inventories cannot satisfy one another's readiness proof.
+
+If #569 already owns a given readiness reason correctly after rebase, do not duplicate it here.
+
+---
+
+## Money-path safety
+
+Required invariants:
+
+- zero broker POST on all fail-closed lifecycle/recovery paths;
+- exactly one canonical submit on the valid resumed path, and only through existing submit authority;
+- no new cancel authority;
+- no position mutation;
+- no proof_trades write before fill;
+- no queue/result corruption;
+- no duplicate submit from watcher re-fire;
+- no capacity replay that silently suppresses a trade because the same retry is counted twice.
+
+Could this make Jason trade junk? **No**, if implemented correctly. It restores valid lifecycle ownership only. Score, contract quality, Master Control, sizing, and final risk gates still decide whether the resumed signal may trade.
+
+---
+
+## Test quality requirements
+
+Primary proof must be executed behavior, not source-string assertions.
+
+At least one production-shaped PostgreSQL/driver-faithful restart replay must reconstruct the watcher from durable rows rather than reusing the same object.
+
+Inspect tests for camouflage:
+
+- callback mock must actually be reached in positive control;
+- negative tests need a valid positive control;
+- no monkeypatch may bypass lifecycle validation;
+- retry tests must advance time or durable next-retry authority realistically;
+- attempt assertions must verify durable/reconstructed behavior, not just one object's attribute;
+- broker mock must assert call count zero or exactly one as applicable.
+
+---
+
+## Expected production scope
+
+Do not pre-authorize broad edits. Fail-first caller tracing decides the minimal scope.
+
+Likely relevant seams:
+
+- `ap_lifecycle.py` only if lifecycle restoration requires a canonical recovery API;
+- `ap_entry_watcher.py` for callback retry ownership/counter behavior;
+- `ap/pending_trigger_restart_recovery.py` for reconstruction caller wiring;
+- `ap/order_monitor.py` only if broker-ready handoff still routes through the wrong consumer after #569;
+- focused P0 tests and workflow registration.
+
+Explicitly out of scope:
+
+- Master Control thresholds;
+- sector mapping (#548);
+- contract selector quality policy;
+- sizing;
+- scanner admission;
+- exit logic;
+- broker submit/cancel semantics;
+- proof taxonomy.
+
+If the fix requires changing more than the proven caller chain, stop and amend the spec before broadening.
+
+---
+
+## Merge gate
+
+Final implementation remains **HARD HOLD** until:
+
+1. exact PEP fail-first loop is reproduced;
+2. every changed production line is traced to callers/downstream mutations;
+3. `NONE -> TRIGGER_READY` loop is eliminated for recovered valid owners;
+4. watcher retry attempt semantics are durable and bounded or explicitly validity-bound, never `1/3` forever;
+5. restart after every lifecycle boundary converges;
+6. #569 and #568 interactions are tested after rebase;
+7. readiness recovery clears only stale infrastructure blocks, not real safety failures;
+8. stale generation/ownership/client/mode tests fail closed;
+9. zero broker calls on fail-closed paths;
+10. exactly one submit on the valid resumed path;
+11. no trade-quality/risk threshold changes;
+12. exact-head P0 CI green;
+13. independent final audit gives MERGE.

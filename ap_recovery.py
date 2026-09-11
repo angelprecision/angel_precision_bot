@@ -1811,7 +1811,31 @@ class APStartupRecovery:
             return False
 
     def _build_recovery_plan_from_order(self, order: dict):
-        meta = self._coerce_order_meta(order.get("meta"))
+        # ``meta`` and ``metadata`` are separate durable authorities.  Merge
+        # them only when every populated alias is a valid object and agrees;
+        # an empty primary alias must not hide a populated secondary alias.
+        # The final watcher fence repeats this proof against the locked row,
+        # so this builder never becomes a conflict-resolution authority.
+        meta: dict = {}
+        for _meta_key in ("meta", "metadata"):
+            if _meta_key not in order or order.get(_meta_key) is None:
+                continue
+            _raw_meta = order.get(_meta_key)
+            if isinstance(_raw_meta, dict):
+                _parsed_meta = dict(_raw_meta)
+            elif isinstance(_raw_meta, str) and _raw_meta.strip():
+                try:
+                    _parsed_meta = json.loads(_raw_meta)
+                except Exception:
+                    return None
+                if not isinstance(_parsed_meta, dict):
+                    return None
+            else:
+                return None
+            for _meta_name, _meta_value in _parsed_meta.items():
+                if _meta_name in meta and meta[_meta_name] != _meta_value:
+                    return None
+                meta[_meta_name] = _meta_value
 
         contract = (
             order.get("contract")
@@ -1868,15 +1892,45 @@ class APStartupRecovery:
             or meta.get("canonical_signal_id")
             or ""
         )
-        materialization_generation = meta.get("materialization_generation")
-        try:
-            materialization_generation = (
-                int(materialization_generation)
-                if materialization_generation is not None
-                else None
+        materialization_generation = (
+            meta.get("materialization_generation")
+            if "materialization_generation" in meta
+            else order.get("materialization_generation")
+        )
+        trigger_generation = (
+            meta.get("trigger_generation")
+            if "trigger_generation" in meta
+            else order.get("trigger_generation")
+        )
+        if "materialization_generation" not in metadata and "materialization_generation" in order:
+            metadata["materialization_generation"] = order.get(
+                "materialization_generation"
             )
-        except (TypeError, ValueError):
-            materialization_generation = None
+        if "trigger_generation" not in metadata and "trigger_generation" in order:
+            metadata["trigger_generation"] = order.get("trigger_generation")
+        # Preserve top-level trigger/ownership authorities when a legacy row
+        # stores them outside JSONB.  Never overwrite a populated metadata
+        # alias; the final identity/evidence fence rejects any contradiction.
+        for _authority_key in (
+            "watcher_token",
+            "watcher_owner",
+            "current_owner",
+            "trigger_cursor",
+            "trigger_cursor_id",
+            "trigger_crossed_at",
+            "trigger_crossed_at_provenance",
+            "watcher_audit",
+        ):
+            if (
+                _authority_key in order
+                and _authority_key not in metadata
+            ):
+                metadata[_authority_key] = order.get(_authority_key)
+        # Preserve the raw authority in metadata. The #580 watcher fence
+        # performs the strict positive-integer parse; coercing here would
+        # erase malformed boolean/fractional/blank values before they can be
+        # held. The existing #596 materialization-resume plan shape remains
+        # unchanged.
 
         return _RecoveryPlan(
             signal_id=signal_id,
@@ -1906,6 +1960,7 @@ class APStartupRecovery:
             ).strip().lower(),
             local_order_id=local_order_id,
             materialization_generation=materialization_generation,
+            trigger_generation=trigger_generation,
             trigger_crossed_at=(
                 order.get("trigger_crossed_at")
                 or meta.get("trigger_crossed_at")
@@ -2386,7 +2441,10 @@ class APStartupRecovery:
                 )
                 continue
 
-            meta = self._coerce_order_meta(order.get("meta"))
+            _raw_order_meta = order.get("meta")
+            if _raw_order_meta is None:
+                _raw_order_meta = order.get("metadata")
+            meta = self._coerce_order_meta(_raw_order_meta)
             lifecycle = str(meta.get("lifecycle_state") or "").upper()
             materialization_status = str(meta.get("materialization_status") or "").upper()
 
@@ -3621,6 +3679,33 @@ class APStartupRecovery:
         from datetime import datetime, timezone, timedelta
         from zoneinfo import ZoneInfo
 
+        # Recover observability for any incumbent cancellation that committed
+        # before the prior process died.  This is deliberately broker-free
+        # and runs before watcher admission so a sink outage cannot erase a
+        # durable terminal transition.
+        _recovery_osm = getattr(self, "osm", None)
+        _replay_observability = getattr(
+            _recovery_osm, "replay_deferred_transition_observability", None
+        )
+        if (
+            callable(_replay_observability)
+            and getattr(
+                _recovery_osm,
+                "_supports_deferred_transition_observability_replay",
+                False,
+            ) is True
+        ):
+            try:
+                result["recovery_transition_observability_replayed"] = int(
+                    _replay_observability() or 0
+                )
+            except Exception as exc:
+                log.warning(
+                    "[%s] recovery transition observability replay failed: %s",
+                    self.client_id,
+                    exc,
+                )
+
         ET = ZoneInfo("America/New_York")
         now_et   = datetime.now(ET)
         # Default 48 hours covers Sunday evening scanner signals for Monday open.
@@ -3681,20 +3766,7 @@ class APStartupRecovery:
                 # made. Nothing is written; only the read set narrows.
                 c.execute(
                     """
-                    SELECT o.local_order_id,
-                           o.signal_id,
-                           o.plan_id,
-                           o.symbol,
-                           o.contract,
-                           o.direction,
-                           o.score,
-                           o.tier,
-                           o.trigger_price,
-                           o.stop_underlying,
-                           o.target_underlying,
-                           o.pattern,
-                           o.timeframe,
-                           o.meta,
+                    SELECT o.*,
                            tq.status     AS _tq_status,
                            tq.last_error AS _tq_last_error
                     FROM orders o
@@ -3865,8 +3937,11 @@ class APStartupRecovery:
                 _reseed_row_meta = {}
                 _requires_durable_adoption = False
                 try:
+                    _raw_reseed_meta = order.get("meta")
+                    if _raw_reseed_meta is None:
+                        _raw_reseed_meta = order.get("metadata")
                     _reseed_row_meta = self._coerce_order_meta(
-                        order.get("meta")
+                        _raw_reseed_meta
                     )
                     _requires_durable_adoption = bool(
                         _reseed_row_meta.get(
