@@ -721,7 +721,7 @@ class DeferredMaterializationConfigConflict(RuntimeError):
     for the same conceptual retry ceiling."""
 
 
-_DEFERRED_MATERIALIZATION_MAX_ATTEMPTS_DEFAULT = 5
+_DEFERRED_MATERIALIZATION_MAX_ATTEMPTS_DEFAULT = 20
 
 
 def resolve_deferred_materialization_max_attempts() -> int:
@@ -735,7 +735,7 @@ def resolve_deferred_materialization_max_attempts() -> int:
     defaults (which is all the prior fix guaranteed).
 
     Precedence:
-      - neither var set: both default to 5.
+      - neither var set: both default to 20.
       - exactly one set: that value is used.
       - both set and equal: that value is used.
       - both set and unequal: raises DeferredMaterializationConfigConflict.
