@@ -130,13 +130,13 @@ class _ReadbackOSM(_DispatchOSM):
         }
 
 
-def _confirmed_dispatch(osm, signal, *, mode="PAPER"):
+def _confirmed_dispatch(osm, signal, *, mode="PAPER", callback=None):
     watcher = _AuditWatcher(MagicMock(), order_state_machine=osm, mode=mode)
     watched = WatchedSignal(signal, overnight=False)
     watched._watcher_ref = watcher
     watcher._pending.append(watched)
     watcher._dedup_set.add(signal["signal_id"])
-    callback = MagicMock(return_value=None)
+    callback = callback or MagicMock(return_value=None)
     watcher.on_trigger = callback
 
     with patch.object(watcher, "_fetch_quotes", return_value={
@@ -337,6 +337,7 @@ def test_response_loss_readback_normalizes_z_and_preserves_durable_spelling():
             meta={
                 "trigger_crossed_at": durable_timestamp,
                 "trigger_crossed_at_provenance": durable_provenance,
+                "broker_ready": "false",
             },
         )
     )
@@ -352,6 +353,133 @@ def test_response_loss_readback_normalizes_z_and_preserves_durable_spelling():
     assert osm.calls[1][2]["expected_existing_trigger_authority"] is True
     assert osm.calls[1][1]["trigger_crossed_at"] == durable_timestamp
     assert osm.calls[1][1]["trigger_crossed_at_provenance"] == durable_provenance
+
+
+class _ReadbackCursor:
+    def __init__(self, row):
+        self.row = row
+
+    def execute(self, _sql, _params):
+        return self
+
+    def fetchall(self):
+        return [self.row]
+
+
+@contextmanager
+def _readback_conn(row):
+    yield _ReadbackCursor(row)
+
+
+def _durable_authority_row(signal, *, broker_ready):
+    provenance = {
+        "canonical_signal_id": signal["canonical_signal_id"],
+        "client_id": signal["client_id"],
+        "execution_mode": signal["execution_mode"],
+        "local_order_id": signal["local_order_id"],
+    }
+    return {
+        "local_order_id": signal["local_order_id"],
+        "client_id": signal["client_id"],
+        "signal_id": signal["signal_id"],
+        "canonical_signal_id": signal["canonical_signal_id"],
+        "execution_mode": signal["execution_mode"],
+        "status": "PENDING_TRIGGER",
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "meta": {
+            "trigger_crossed_at": "2026-09-09T20:00:00Z",
+            "trigger_crossed_at_provenance": provenance,
+            "broker_ready": broker_ready,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "broker_ready",
+    [None, False, "", "false", " FALSE "],
+    ids=["absent-or-null", "bool-false", "empty", "text-false", "trimmed-text-false"],
+)
+def test_readback_accepts_explicit_broker_not_ready_values(monkeypatch, broker_ready):
+    import ap.order_state_machine as osm_module
+
+    signal = _signal(local_order_id=f"local-confirm-606-positive-{str(broker_ready)!r}")
+    row = _durable_authority_row(signal, broker_ready=broker_ready)
+    if broker_ready is None:
+        row["meta"].pop("broker_ready")
+    monkeypatch.setattr(osm_module, "conn", lambda: _readback_conn(row))
+    monkeypatch.setattr(osm_module, "run_with_retry", lambda fn: fn())
+    osm = osm_module.APOrderStateMachine.__new__(osm_module.APOrderStateMachine)
+    osm.client_id = signal["client_id"]
+
+    authority = osm.read_trigger_confirmation_authority(
+        signal["local_order_id"],
+        client_id=signal["client_id"],
+        execution_mode=signal["execution_mode"],
+        signal_id=signal["signal_id"],
+        canonical_signal_id=signal["canonical_signal_id"],
+    )
+
+    assert authority["proven"] is True
+    assert authority["trigger_crossed_at"] == row["meta"]["trigger_crossed_at"]
+
+
+@pytest.mark.parametrize(
+    "broker_ready",
+    [True, "true", "broker-free", 0, 1, [], {}],
+    ids=["bool-true", "text-true", "malformed-text", "zero", "one", "list", "object"],
+)
+def test_readback_rejects_truthy_or_malformed_broker_ready_values(monkeypatch, broker_ready):
+    import ap.order_state_machine as osm_module
+
+    signal = _signal(local_order_id=f"local-confirm-606-negative-{type(broker_ready).__name__}")
+    row = _durable_authority_row(signal, broker_ready=broker_ready)
+    monkeypatch.setattr(osm_module, "conn", lambda: _readback_conn(row))
+    monkeypatch.setattr(osm_module, "run_with_retry", lambda fn: fn())
+    osm = osm_module.APOrderStateMachine.__new__(osm_module.APOrderStateMachine)
+    osm.client_id = signal["client_id"]
+
+    assert osm.read_trigger_confirmation_authority(
+        signal["local_order_id"],
+        client_id=signal["client_id"],
+        execution_mode=signal["execution_mode"],
+        signal_id=signal["signal_id"],
+        canonical_signal_id=signal["canonical_signal_id"],
+    ) is None
+
+
+def test_response_loss_legacy_false_reaches_callback_only_after_existing_cas(monkeypatch):
+    import ap.order_state_machine as osm_module
+
+    signal = _signal(local_order_id="local-confirm-606-response-loss")
+    durable_timestamp = "2026-09-09T20:00:00Z"
+    signal["trigger_crossed_at"] = durable_timestamp
+    row = _durable_authority_row(signal, broker_ready="false")
+    row["meta"]["trigger_crossed_at"] = durable_timestamp
+    osm = _ReadbackOSM(row)
+
+    def _production_readback(*args, **kwargs):
+        return osm_module.APOrderStateMachine.read_trigger_confirmation_authority(
+            osm, *args, **kwargs
+        )
+
+    osm.read_trigger_confirmation_authority = _production_readback
+    monkeypatch.setattr(osm_module, "conn", lambda: _readback_conn(row))
+    monkeypatch.setattr(osm_module, "run_with_retry", lambda fn: fn())
+
+    def _callback(*_args, **_kwargs):
+        assert len(osm.calls) == 2
+        assert osm.calls[0][2]["expected_new_trigger_authority"] is True
+        assert osm.calls[1][2]["expected_existing_trigger_authority"] is True
+
+    callback = MagicMock(side_effect=_callback)
+    _watcher, watched, _ = _confirmed_dispatch(
+        osm, signal, callback=callback
+    )
+
+    assert callback.call_count == 1
+    assert len(osm.calls) == 2
+    assert watched._trigger_authority_persisted is True
 
 
 def test_ccep_shaped_live_timestamp_only_row_is_held_without_runner_backfill():
@@ -598,6 +726,51 @@ def test_postgres_confirmation_cas_has_one_winner_and_never_repairs_timestamp_on
             "materialization_generation": 7,
             "trigger_crossed_at": "2026-09-09T13:56:51+00:00",
         }
+
+        # PR #606: exercise the production readback against JSONB text
+        # broker_ready="false".  The SQL selector and Python validator must
+        # agree before an existing-authority CAS can be attempted.
+        monkeypatch.setattr(osm_module, "conn", scoped.conn)
+        legacy_false_id = "local-confirm-606-postgres-false"
+        legacy_false_timestamp = "2026-09-09T20:00:00Z"
+        legacy_false_provenance = {
+            "canonical_signal_id": signal["canonical_signal_id"],
+            "client_id": signal["client_id"],
+            "execution_mode": signal["execution_mode"],
+            "local_order_id": legacy_false_id,
+        }
+        with scoped.conn() as connection:
+            connection.execute(
+                """
+                INSERT INTO orders (
+                    local_order_id, client_id, execution_mode, signal_id,
+                    canonical_signal_id, status, meta, updated_ts
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,NOW())
+                """,
+                (
+                    legacy_false_id, signal["client_id"], signal["execution_mode"],
+                    signal["signal_id"], signal["canonical_signal_id"],
+                    "PENDING_TRIGGER",
+                    json.dumps({
+                        "materialization_generation": 7,
+                        "trigger_crossed_at": legacy_false_timestamp,
+                        "trigger_crossed_at_provenance": legacy_false_provenance,
+                        "broker_ready": "false",
+                    }),
+                ),
+            )
+        authority = osm.read_trigger_confirmation_authority(
+            legacy_false_id,
+            client_id=signal["client_id"],
+            execution_mode=signal["execution_mode"],
+            signal_id=signal["signal_id"],
+            canonical_signal_id=signal["canonical_signal_id"],
+            expected_materialization_generation=7,
+        )
+        assert authority is not None
+        assert authority["proven"] is True
+        assert authority["trigger_crossed_at"] == legacy_false_timestamp
+        assert authority["trigger_crossed_at_provenance"] == legacy_false_provenance
     finally:
         with setup.cursor() as cursor:
             setup.rollback()

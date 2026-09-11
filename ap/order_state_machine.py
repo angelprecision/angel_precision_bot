@@ -2319,7 +2319,7 @@ class APOrderStateMachine:
                         " AND COALESCE(broker_order_id, '') = ''"
                         " AND submitted_ts IS NULL"
                         " AND NULLIF(COALESCE(meta->>'submit_intent_at', ''), '') IS NULL"
-                        " AND LOWER(COALESCE(meta->>'broker_ready', 'false')) IN ('false', '')"
+                        " AND LOWER(TRIM(COALESCE(meta->>'broker_ready', 'false'))) IN ('false', '')"
                     )
                 if expected_existing_trigger_authority:
                     existing_provenance = (
@@ -2354,7 +2354,7 @@ class APOrderStateMachine:
                         " AND COALESCE(broker_order_id, '') = ''"
                         " AND submitted_ts IS NULL"
                         " AND NULLIF(COALESCE(meta->>'submit_intent_at', ''), '') IS NULL"
-                        " AND LOWER(COALESCE(meta->>'broker_ready', 'false')) IN ('false', '')"
+                        " AND LOWER(TRIM(COALESCE(meta->>'broker_ready', 'false'))) IN ('false', '')"
                     )
                     _params.extend([
                         existing_crossed_at.strip(),
@@ -2461,7 +2461,7 @@ class APOrderStateMachine:
                        AND COALESCE(broker_order_id, '') = ''
                        AND submitted_ts IS NULL
                        AND NULLIF(COALESCE(meta->>'submit_intent_at', ''), '') IS NULL
-                       AND LOWER(COALESCE(meta->>'broker_ready', 'false')) IN ('false', '')
+                       AND LOWER(TRIM(COALESCE(meta->>'broker_ready', 'false'))) IN ('false', '')
                 """
                 _params = [_local, _client, _mode, _signal, _canonical]
                 if expected_materialization_generation is not None:
@@ -2550,9 +2550,21 @@ class APOrderStateMachine:
             if _actual != _expected:
                 return None
 
-        # False is a valid explicit non-ready marker; any other value is not
-        # absence of broker authority and must not be adopted.
-        if "broker_ready" in _meta and _meta.get("broker_ready") not in (None, False, ""):
+        # Keep this type-strict with the SQL predicate above.  psycopg2 returns
+        # JSON booleans as bools, while legacy rows may carry the textual
+        # representation (including case/whitespace variation).  Do not use
+        # membership against (None, False, ""): Python considers numeric 0
+        # equal to False, which would weaken broker-evidence fencing.
+        _broker_ready = _meta.get("broker_ready")
+        if _broker_ready is None:
+            _broker_not_ready = True
+        elif isinstance(_broker_ready, bool):
+            _broker_not_ready = _broker_ready is False
+        elif isinstance(_broker_ready, str):
+            _broker_not_ready = _broker_ready.strip().lower() in {"false", ""}
+        else:
+            _broker_not_ready = False
+        if not _broker_not_ready:
             return None
         if "submit_intent_at" in _meta and _meta.get("submit_intent_at") not in (None, ""):
             return None
