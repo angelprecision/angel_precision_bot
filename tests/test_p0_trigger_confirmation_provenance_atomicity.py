@@ -593,6 +593,7 @@ def test_postgres_confirmation_cas_has_one_winner_and_never_repairs_timestamp_on
                 CREATE TABLE "{schema}".orders (
                     local_order_id TEXT PRIMARY KEY,
                     client_id TEXT NOT NULL,
+                    kind TEXT,
                     execution_mode TEXT,
                     signal_id TEXT,
                     canonical_signal_id TEXT,
@@ -743,12 +744,13 @@ def test_postgres_confirmation_cas_has_one_winner_and_never_repairs_timestamp_on
             connection.execute(
                 """
                 INSERT INTO orders (
-                    local_order_id, client_id, execution_mode, signal_id,
+                    local_order_id, client_id, kind, execution_mode, signal_id,
                     canonical_signal_id, status, meta, updated_ts
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,NOW())
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,NOW())
                 """,
                 (
-                    legacy_false_id, signal["client_id"], signal["execution_mode"],
+                    legacy_false_id, signal["client_id"], "ENTRY",
+                    signal["execution_mode"],
                     signal["signal_id"], signal["canonical_signal_id"],
                     "PENDING_TRIGGER",
                     json.dumps({
