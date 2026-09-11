@@ -105,6 +105,7 @@ def _isolated_schema():
                     status TEXT NOT NULL,
                     execution_mode TEXT NOT NULL,
                     signal_id TEXT,
+                    canonical_signal_id TEXT,
                     broker_order_id TEXT,
                     submitted_ts TIMESTAMPTZ,
                     meta JSONB,
@@ -125,9 +126,11 @@ def _seed_row(pg_conn, schema, *, local_order_id, client_id, signal_id,
         c.execute(
             f'INSERT INTO "{schema}".orders '
             "(local_order_id, client_id, kind, status, execution_mode, "
-            "signal_id, meta) VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb)",
+            "signal_id, canonical_signal_id, meta) VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb)",
             (local_order_id, client_id, "ENTRY", "PENDING_TRIGGER",
-             execution_mode, signal_id, _json.dumps(meta)),
+             execution_mode, signal_id,
+             meta.get("canonical_signal_id") or signal_id,
+             _json.dumps(meta)),
         )
 
 
@@ -556,8 +559,9 @@ def test_15_broker_order_id_present_blocks_claim():
             c.execute(
                 f'INSERT INTO "{schema}".orders '
                 "(local_order_id,client_id,kind,status,execution_mode,signal_id,"
-                "broker_order_id,meta) VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb)",
+                "canonical_signal_id,broker_order_id,meta) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)",
                 (loid, cid, "ENTRY", "PENDING_TRIGGER", "paper", sid,
+                 sid,
                  "already-submitted-bkr-1",
                  _json.dumps(_base_seed(generation=1, signal_id=sid,
                                         execution_mode="paper", client_id=cid,
@@ -577,8 +581,9 @@ def test_16_submitted_ts_present_blocks_claim():
             c.execute(
                 f'INSERT INTO "{schema}".orders '
                 "(local_order_id,client_id,kind,status,execution_mode,signal_id,"
-                "submitted_ts,meta) VALUES (%s,%s,%s,%s,%s,%s,NOW(),%s::jsonb)",
+                "canonical_signal_id,submitted_ts,meta) VALUES (%s,%s,%s,%s,%s,%s,%s,NOW(),%s::jsonb)",
                 (loid, cid, "ENTRY", "PENDING_TRIGGER", "paper", sid,
+                 sid,
                  _json.dumps(_base_seed(generation=1, signal_id=sid,
                                         execution_mode="paper", client_id=cid,
                                         ra=1, bac=1, mats=1))))

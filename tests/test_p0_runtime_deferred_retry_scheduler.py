@@ -1,0 +1,1244 @@
+"""Production-shaped runtime caller proof for PR 603.
+
+The test starts after startup recovery has already completed, creates the
+incident-shaped due retry in durable test state, and lets the real
+ClientRunner-owned scheduler call the existing recovery boundary.  It must
+not call the execution-core retry method directly.
+"""
+from __future__ import annotations
+
+import os
+import inspect
+import sys
+import threading
+import time
+import types
+from unittest.mock import MagicMock
+
+import pytest
+
+
+os.environ.setdefault("DATABASE_URL", "postgresql://test:test@127.0.0.1:1/test")
+
+
+def _install_import_stubs() -> None:
+    """Keep this runner-boundary test independent of external services."""
+    def _stub(name: str):
+        sys.modules.setdefault(name, types.ModuleType(name))
+
+    _stub("supabase")
+    _stub("cryptography")
+    _stub("cryptography.fernet")
+    _stub("ap.db")
+    _stub("ap.queue")
+    _stub("ap.order_monitor")
+    _stub("ap.position_sizer")
+    _stub("ap.market_intelligence")
+    _stub("ap.worker_health")
+    _stub("ap_reconciler")
+    _stub("ap_recovery")
+    _stub("ap.self_healing")
+
+    supabase = sys.modules["supabase"]
+    supabase.create_client = getattr(supabase, "create_client", lambda *a, **k: None)
+    supabase.Client = getattr(supabase, "Client", type("Client", (), {}))
+    fernet = sys.modules["cryptography.fernet"]
+    fernet.Fernet = getattr(fernet, "Fernet", type("Fernet", (), {}))
+    db = sys.modules["ap.db"]
+    db.run_with_retry = getattr(db, "run_with_retry", lambda fn, *a, **k: fn(*a, **k))
+    queue = sys.modules["ap.queue"]
+    queue.enqueue_signal = getattr(queue, "enqueue_signal", lambda *a, **k: None)
+    queue.worker_loop = getattr(queue, "worker_loop", lambda *a, **k: None)
+    sys.modules["ap.order_monitor"].APOrderMonitor = getattr(
+        sys.modules["ap.order_monitor"], "APOrderMonitor", type("APOrderMonitor", (), {})
+    )
+    sys.modules["ap.position_sizer"].APPositionSizer = getattr(
+        sys.modules["ap.position_sizer"], "APPositionSizer", type("APPositionSizer", (), {})
+    )
+    sys.modules["ap.market_intelligence"].APEarningsGuard = getattr(
+        sys.modules["ap.market_intelligence"], "APEarningsGuard", type("APEarningsGuard", (), {})
+    )
+    sys.modules["ap.market_intelligence"].APIVRankFilter = getattr(
+        sys.modules["ap.market_intelligence"], "APIVRankFilter", type("APIVRankFilter", (), {})
+    )
+    sys.modules["ap.worker_health"].get_monitor = getattr(
+        sys.modules["ap.worker_health"], "get_monitor", lambda: None
+    )
+    sys.modules["ap.worker_health"].init_monitor = getattr(
+        sys.modules["ap.worker_health"], "init_monitor", lambda *a, **k: None
+    )
+    sys.modules["ap_reconciler"].APBrokerReconciler = getattr(
+        sys.modules["ap_reconciler"], "APBrokerReconciler", type("APBrokerReconciler", (), {})
+    )
+    sys.modules["ap_recovery"].APStartupRecovery = getattr(
+        sys.modules["ap_recovery"], "APStartupRecovery", type("APStartupRecovery", (), {})
+    )
+    sys.modules["ap.self_healing"].get_healer = getattr(
+        sys.modules["ap.self_healing"], "get_healer", lambda: None
+    )
+    sys.modules["ap.self_healing"].init_self_healing = getattr(
+        sys.modules["ap.self_healing"], "init_self_healing", lambda *a, **k: None
+    )
+
+
+_STUB_NAMES = {
+    "ap",
+    "supabase",
+    "cryptography",
+    "cryptography.fernet",
+    "ap.db",
+    "ap.queue",
+    "ap.order_monitor",
+    "ap.position_sizer",
+    "ap.market_intelligence",
+    "ap.worker_health",
+    "ap_reconciler",
+    "ap_recovery",
+    "ap.self_healing",
+}
+_PREEXISTING_MODULES = {name: sys.modules.get(name) for name in _STUB_NAMES}
+_install_import_stubs()
+import client_runner as cr  # noqa: E402
+
+for _name, _module in _PREEXISTING_MODULES.items():
+    if _module is None:
+        sys.modules.pop(_name, None)
+    else:
+        sys.modules[_name] = _module
+
+
+class _PulseEvent:
+    """One scheduler tick, then shutdown; avoids sleeping in the test."""
+
+    def __init__(self, results: list[bool] | None = None) -> None:
+        self.wait_calls: list[float] = []
+        self._wait_count = 0
+        self._results = results or [False, True]
+
+    def wait(self, timeout: float) -> bool:
+        self.wait_calls.append(timeout)
+        result = self._results[min(self._wait_count, len(self._results) - 1)]
+        self._wait_count += 1
+        return result
+
+    def is_set(self) -> bool:
+        return False
+
+
+class _TickThenStopEvent:
+    """Allow one scheduler tick and report shutdown on the next wait."""
+
+    def __init__(self) -> None:
+        self.wait_calls: list[float] = []
+        self._wait_count = 0
+        self._stopped = False
+
+    def wait(self, timeout: float) -> bool:
+        self.wait_calls.append(timeout)
+        self._wait_count += 1
+        if self._wait_count == 1:
+            return False
+        self._stopped = True
+        return True
+
+    def is_set(self) -> bool:
+        return self._stopped
+
+
+def _runner() -> object:
+    runner = object.__new__(cr.ClientRunner)
+    runner.email = "jasoncosby1@gmail.com"
+    runner.mode = "LIVE"
+    runner.stopped = _PulseEvent()
+    runner.stopping = _PulseEvent()
+    runner.failed = _PulseEvent()
+    runner.initialized = types.SimpleNamespace(is_set=lambda: True)
+    runner.degraded = threading.Event()
+    runner.entries_allowed = threading.Event()
+    runner.degraded_reasons = set()
+    runner._degraded_lock = threading.Lock()
+    runner.deferred_recovery_scheduler_ready = threading.Event()
+    runner.deferred_recovery_scheduler_healthy = threading.Event()
+    runner.deferred_recovery_scheduler_health_reasons = set()
+    runner._deferred_recovery_scheduler_startup_gate_open = False
+    runner._deferred_recovery_supervisor_restart_requested = False
+    runner._deferred_recovery_supervisor_restart_reason = ""
+    runner._deferred_recovery_supervisor_restart_lock = threading.Lock()
+    runner._deferred_recovery_process_restart_required = False
+    runner._deferred_recovery_process_restart_reason = ""
+    runner._deferred_recovery_process_restart_lock = threading.Lock()
+    runner.deferred_recovery_started_ts = 0.0
+    runner.last_deferred_recovery_completed_ts = 0.0
+    runner.last_deferred_recovery_success_ts = 0.0
+    runner.deferred_recovery_completed_ticks = 0
+    runner.deferred_recovery_successful_ticks = 0
+    runner.deferred_recovery_last_error_ts = 0.0
+    runner.is_alive = lambda: True
+    runner.broker = object()
+    runner.position_manager = object()
+    runner.order_state_machine = object()
+    runner.master_control = types.SimpleNamespace(mode="LIVE")
+    runner.core = types.SimpleNamespace(entry_watcher=object(), exit_eng=object())
+    runner.deferred_retry_calls = 0
+    return runner
+
+
+def test_live_ccep_retry_created_after_startup_is_consumed_by_runtime_scheduler(monkeypatch):
+    """The exact incident shape advances without a runner restart."""
+    runner = _runner()
+    durable_row = {
+        "local_order_id": "30a7ec8e-7c7a-4bf3-b7be-d73134c534d1",
+        "client_id": "jasoncosby1@gmail.com",
+        "execution_mode": "live",
+        "symbol": "CCEP",
+        "contract": "DEFERRED:CCEP",
+        "status": "PENDING_TRIGGER",
+        "lifecycle_state": "RETRY_WAIT",
+        "materialization_status": "RETRY_PENDING",
+        "materialization_generation": 7,
+        "retry_attempt": 2,
+        "broker_order_id": None,
+        "submitted_ts": None,
+    }
+    startup_recovery_completed = True
+    recovery_calls: list[dict] = []
+
+    class _Recovery:
+        def __init__(self, **kwargs):
+            recovery_calls.append(kwargs)
+            assert kwargs["client_id"] == durable_row["client_id"]
+            assert kwargs["master_control"].mode == durable_row["execution_mode"].upper()
+
+        def recover_deferred_lifecycles(self):
+            assert startup_recovery_completed
+            assert durable_row["materialization_status"] == "RETRY_PENDING"
+            durable_row["materialization_status"] = "SELECTED"
+            durable_row["lifecycle_state"] = "BROKER_READY"
+            runner.deferred_retry_calls += 1
+            return {"deferred_lifecycles_recovered": 1, "errors": []}
+
+    monkeypatch.setattr(cr, "APStartupRecovery", _Recovery)
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    runner.deferred_recovery_thread.join(timeout=2)
+
+    assert not runner.deferred_recovery_thread.is_alive()
+    assert runner.stopped.wait_calls == [15.0, 15.0]
+    assert len(recovery_calls) == 1
+    assert runner.deferred_retry_calls == 1
+    assert durable_row["materialization_status"] == "SELECTED"
+    assert durable_row["lifecycle_state"] == "BROKER_READY"
+
+
+def test_runtime_scheduler_stops_before_shutdown_authority(monkeypatch):
+    runner = _runner()
+    runner.stopping = types.SimpleNamespace(is_set=lambda: True)
+    tick = MagicMock()
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", tick)
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+
+    assert tick.call_count == 0
+    assert getattr(runner, "deferred_recovery_thread", None) is None
+
+
+def test_runtime_scheduler_survives_one_tick_failure(monkeypatch):
+    runner = _runner()
+    runner.stopped = _PulseEvent([False, False, True])
+    tick = MagicMock(side_effect=[RuntimeError("transient recovery failure"), None])
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", tick)
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    runner.deferred_recovery_thread.join(timeout=2)
+
+    assert not runner.deferred_recovery_thread.is_alive()
+    assert tick.call_count == 2
+    assert runner.deferred_recovery_errors == 1
+    assert runner.deferred_recovery_completed_ticks == 2
+    assert runner.last_deferred_recovery_completed_ts > 0
+    assert runner.deferred_recovery_last_error_ts > 0
+    assert runner.deferred_recovery_successful_ticks == 1
+    assert runner.last_deferred_recovery_success_ts > 0
+
+
+def test_runtime_recovery_boundary_exception_is_infrastructure_failure(monkeypatch):
+    runner = _runner()
+
+    class _BrokenRecovery:
+        def __init__(self, **kwargs):
+            pass
+
+        def recover_deferred_lifecycles(self):
+            raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(cr, "APStartupRecovery", _BrokenRecovery)
+
+    result = runner._run_deferred_breach_lifecycle_recovery()
+
+    assert result["errors"] == ["runtime_tick:RuntimeError"]
+    assert result["infrastructure_errors"] == ["runtime_tick:RuntimeError"]
+
+
+def test_row_level_recovery_errors_do_not_mark_scheduler_unhealthy(monkeypatch):
+    """An executed pass may report bad rows without losing executor health."""
+    runner = _runner()
+    runner.degraded.set()
+    runner.degraded_reasons.add(
+        "startup_deferred_recovery_failed:prior_transient_failure"
+    )
+    runner.stopped = _TickThenStopEvent()
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    tick = MagicMock(
+        return_value={
+            "deferred_lifecycles_recovered": 0,
+            "errors": ["recovery_malformed_counter"],
+            "infrastructure_errors": [],
+        }
+    )
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", tick)
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    runner.deferred_recovery_thread.join(timeout=2)
+
+    assert tick.call_count == 1
+    assert runner.deferred_recovery_completed_ticks == 1
+    assert runner.deferred_recovery_successful_ticks == 1
+    assert runner.last_deferred_recovery_completed_ts > 0
+    assert runner.last_deferred_recovery_success_ts > 0
+    assert runner.deferred_recovery_scheduler_health_reasons == set()
+    assert runner.deferred_recovery_scheduler_healthy.is_set()
+    assert not any(
+        runner._reason_key(reason) == "startup_deferred_recovery_failed"
+        for reason in runner.degraded_reasons
+    )
+    assert not runner.degraded.is_set()
+
+    # The thread has intentionally stopped for the test; model the same live
+    # handle during the health check to isolate the failure classification.
+    runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.deferred_recovery_scheduler_ready.set()
+    assert runner._check_deferred_recovery_scheduler_health(now=time.time()) is True
+
+
+def test_startup_recovery_timeout_holds_entries_until_clean_scheduler_tick(
+    monkeypatch,
+):
+    """A timeout cannot be healed by readiness; the next infra-clean tick can."""
+    runner = _permission_runner()
+    runner._log_startup_recovery_complete = MagicMock()
+    active_calls = 0
+    max_active_calls = 0
+    call_order: list[str] = []
+    active_lock = threading.Lock()
+
+    def _record_call(kind: str):
+        nonlocal active_calls, max_active_calls
+        with active_lock:
+            active_calls += 1
+            max_active_calls = max(max_active_calls, active_calls)
+            call_order.append(kind)
+
+        def _release():
+            nonlocal active_calls
+            with active_lock:
+                active_calls -= 1
+
+        return _release
+
+    class _Recovery:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, include_watcher_reseed=False):
+            release = _record_call("startup")
+            try:
+                time.sleep(0.02)
+                return {}
+            finally:
+                release()
+
+        def recover_deferred_lifecycles(self):
+            release = _record_call("runtime")
+            try:
+                return {
+                    "deferred_lifecycles_recovered": 0,
+                    "errors": ["recovery_malformed_counter"],
+                    "infrastructure_errors": [],
+                }
+            finally:
+                release()
+
+    monkeypatch.setattr(cr, "APStartupRecovery", _Recovery)
+    monkeypatch.setenv("STARTUP_RECOVERY_TIMEOUT_SEC", "0.001")
+    runner._run_startup_recovery(MagicMock(), object())
+
+    assert not runner.entries_allowed.is_set()
+    assert "startup_deferred_recovery_failed:timeout" in runner.degraded_reasons
+
+    # A live, ready scheduler handle without a completed recovery tick cannot
+    # bypass the startup hold created by the timeout.
+    runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.deferred_recovery_scheduler_ready.set()
+    runner.deferred_recovery_started_ts = time.time()
+    runner.deferred_recovery_heartbeat_max_sec = 60.0
+    assert runner._set_entry_permission() is False
+    assert not runner.entries_allowed.is_set()
+    runner.deferred_recovery_thread = None
+    runner.deferred_recovery_scheduler_ready.clear()
+
+    runner.stopped = _TickThenStopEvent()
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+    runner._start_deferred_breach_lifecycle_scheduler()
+    runner.deferred_recovery_thread.join(timeout=2)
+
+    assert call_order == ["startup", "runtime"]
+    assert max_active_calls == 1
+    assert runner.deferred_recovery_errors == 1
+    assert runner.deferred_recovery_successful_ticks == 1
+    assert "startup_deferred_recovery_failed:timeout" not in runner.degraded_reasons
+    assert not runner.degraded.is_set()
+
+    # Model the still-live, ready scheduler after the test thread's deliberate
+    # shutdown; readiness alone was not sufficient before the clean tick.
+    runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.deferred_recovery_scheduler_ready.set()
+    runner.deferred_recovery_started_ts = time.time()
+    runner.last_deferred_recovery_completed_ts = time.time()
+    runner.deferred_recovery_heartbeat_max_sec = 60.0
+    assert runner._set_entry_permission() is True
+    assert runner.entries_allowed.is_set()
+
+
+def test_recovery_infrastructure_failure_stays_unhealthy_despite_fresh_liveness(
+    monkeypatch,
+):
+    """A failed recovery boundary cannot be made healthy by ``finally``."""
+    runner = _runner()
+    runner._deferred_recovery_scheduler_startup_gate_open = True
+    runner.entries_allowed.set()
+    runner.stopped = _TickThenStopEvent()
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    tick = MagicMock(
+        return_value={
+            "deferred_lifecycles_recovered": 0,
+            "errors": ["runtime_stack_unavailable"],
+            "infrastructure_errors": ["runtime_stack_unavailable"],
+        }
+    )
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", tick)
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    runner.deferred_recovery_thread.join(timeout=2)
+
+    assert tick.call_count == 1
+    assert runner.deferred_recovery_completed_ticks == 1
+    assert runner.deferred_recovery_successful_ticks == 0
+    assert runner.last_deferred_recovery_completed_ts > 0
+    assert runner.last_deferred_recovery_success_ts == 0.0
+    assert "deferred_recovery_scheduler_recovery_failed" in (
+        runner.deferred_recovery_scheduler_health_reasons
+    )
+    assert not runner.deferred_recovery_scheduler_healthy.is_set()
+
+    # The handle is live and the completed heartbeat is fresh, but the
+    # explicit infrastructure-failure reason still fails the deferred seam
+    # closed without clearing unrelated post-startup entry permission.
+    runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.deferred_recovery_scheduler_ready.set()
+    assert runner._check_deferred_recovery_scheduler_health(now=time.time()) is False
+    assert runner.entries_allowed.is_set()
+    assert not runner.degraded.is_set()
+
+
+def test_runtime_scheduler_handle_is_never_replaced_after_exit(monkeypatch):
+    """A dead scheduler is a health fault, never a reason to overlap one."""
+    runner = _runner()
+    runner.stopped = _PulseEvent([True])
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    first = runner.deferred_recovery_thread
+    first.join(timeout=2)
+    assert not first.is_alive()
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    assert runner.deferred_recovery_thread is first
+
+
+def test_runtime_scheduler_health_requests_one_supervised_runner_restart():
+    """Post-startup liveness faults restart the owning runner once."""
+    runner = _runner()
+    runner.stopping = threading.Event()
+    runner.stopped = threading.Event()
+    runner.entries_allowed = threading.Event()
+    runner.entries_allowed.set()
+    runner._deferred_recovery_scheduler_startup_gate_open = True
+
+    dead = types.SimpleNamespace(is_alive=lambda: False)
+    runner.deferred_recovery_thread = dead
+    assert runner._check_deferred_recovery_scheduler_health(now=100.0) is False
+    assert not runner.entries_allowed.is_set()
+    assert runner.stopping.is_set()
+    assert runner.stopped.is_set()
+    assert runner._deferred_recovery_supervisor_restart_requested is True
+    assert runner.deferred_recovery_scheduler_health_reasons == {
+        "deferred_recovery_scheduler_dead"
+    }
+    assert not runner.deferred_recovery_scheduler_healthy.is_set()
+
+    runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.deferred_recovery_scheduler_ready.set()
+    runner.deferred_recovery_started_ts = 10.0
+    runner.last_deferred_recovery_completed_ts = 20.0
+    runner.deferred_recovery_heartbeat_max_sec = 5.0
+    assert runner._check_deferred_recovery_scheduler_health(now=100.0) is False
+    assert not runner.entries_allowed.is_set()
+    assert runner._deferred_recovery_supervisor_restart_requested is True
+    assert runner.degraded_reasons == set()
+    assert runner.deferred_recovery_scheduler_health_reasons == {
+        "deferred_recovery_scheduler_dead",
+        "deferred_recovery_scheduler_stale",
+    }
+
+
+def test_runtime_stale_scheduler_escalates_process_restart_without_dead_handle():
+    """A live but stale child cannot be healed by an in-process replacement."""
+    runner = _runner()
+    runner.stopping = threading.Event()
+    runner.stopped = threading.Event()
+    runner.entries_allowed = threading.Event()
+    runner.entries_allowed.set()
+    runner._deferred_recovery_scheduler_startup_gate_open = True
+    runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.deferred_recovery_scheduler_ready.set()
+    runner.deferred_recovery_started_ts = 10.0
+    runner.last_deferred_recovery_completed_ts = 20.0
+    runner.deferred_recovery_heartbeat_max_sec = 5.0
+
+    assert runner._check_deferred_recovery_scheduler_health(now=100.0) is False
+    assert not runner.entries_allowed.is_set()
+    assert runner.stopping.is_set()
+    assert runner.stopped.is_set()
+    assert runner._deferred_recovery_supervisor_restart_requested is False
+    assert runner._deferred_recovery_process_restart_required is True
+    assert (
+        runner._deferred_recovery_process_restart_reason
+        == "deferred_recovery_scheduler_stale"
+    )
+    assert runner.deferred_recovery_scheduler_health_reasons == {
+        "deferred_recovery_scheduler_stale"
+    }
+
+
+def test_live_stale_scheduler_escalates_without_second_recovery_consumer(
+    monkeypatch,
+):
+    """A hung canonical tick holds the row and reaches process restart escalation."""
+    runner = _runner()
+    runner.stopped = threading.Event()
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    runner.entries_allowed.set()
+    runner._deferred_recovery_scheduler_startup_gate_open = True
+    runner.broker = MagicMock()
+    runner.core = types.SimpleNamespace(entry_watcher=MagicMock(), exit_eng=MagicMock())
+    runner.order_state_machine = MagicMock()
+    runner.position_manager = MagicMock()
+    runner.master_control = types.SimpleNamespace(mode="LIVE")
+    durable_row = {
+        "local_order_id": "stale-live-retry-1",
+        "client_id": runner.email,
+        "execution_mode": "live",
+        "status": "PENDING_TRIGGER",
+        "materialization_status": "RETRY_PENDING",
+        "materialization_generation": 7,
+        "retry_attempt": 2,
+    }
+    recovery_entered = threading.Event()
+    release_recovery = threading.Event()
+    recovery_calls: list[int] = []
+
+    class _HungRecovery:
+        def __init__(self, **kwargs):
+            assert kwargs["client_id"] == durable_row["client_id"]
+            assert kwargs["master_control"].mode == "LIVE"
+
+        def recover_deferred_lifecycles(self):
+            recovery_calls.append(1)
+            recovery_entered.set()
+            release_recovery.wait(timeout=3)
+            return {"deferred_lifecycles_recovered": 0, "errors": []}
+
+    monkeypatch.setattr(cr, "APStartupRecovery", _HungRecovery)
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "1")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    assert recovery_entered.wait(timeout=2)
+    first_scheduler = runner.deferred_recovery_thread
+    runner.deferred_recovery_started_ts = 10.0
+    runner.last_deferred_recovery_completed_ts = 20.0
+    runner.deferred_recovery_heartbeat_max_sec = 5.0
+
+    assert runner._check_deferred_recovery_scheduler_health(now=100.0) is False
+    assert not runner.entries_allowed.is_set()
+    assert runner.stopping.is_set()
+    assert runner.stopped.is_set()
+    assert runner._deferred_recovery_process_restart_required is True
+    assert runner._deferred_recovery_supervisor_restart_requested is False
+    assert first_scheduler.is_alive()
+
+    # The old child remains the sole consumer while the canonical call is
+    # hung. A later start attempt cannot create a second scheduler or invoke
+    # recovery again, and the durable retry row is untouched.
+    runner._start_deferred_breach_lifecycle_scheduler()
+    assert runner.deferred_recovery_thread is first_scheduler
+    assert recovery_calls == [1]
+    assert durable_row["materialization_status"] == "RETRY_PENDING"
+    runner.broker.submit_order.assert_not_called()
+    runner.broker.submit_entry.assert_not_called()
+
+    release_recovery.set()
+    first_scheduler.join(timeout=2)
+    assert not first_scheduler.is_alive()
+    assert recovery_calls == [1]
+
+    # A late return cannot heal a process-restart escalation or re-open entries.
+    runner.deferred_recovery_scheduler_ready.set()
+    assert runner._check_deferred_recovery_scheduler_health(now=time.time()) is False
+    assert not runner.entries_allowed.is_set()
+    assert runner._deferred_recovery_process_restart_required is True
+
+
+def test_runtime_set_entry_permission_requests_supervised_replacement_after_scheduler_fault():
+    """The canonical permission caller requests supervised replacement."""
+    runner = _permission_runner()
+    runner.stopping = threading.Event()
+    runner.stopped = threading.Event()
+    runner._deferred_recovery_scheduler_startup_gate_open = True
+    runner.entries_allowed.set()
+    runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: False)
+
+    assert runner._set_entry_permission() is False
+    assert not runner.entries_allowed.is_set()
+    assert runner.stopping.is_set()
+    assert runner.stopped.is_set()
+    assert "deferred_recovery_scheduler_dead" in (
+        runner.deferred_recovery_scheduler_health_reasons
+    )
+
+
+def test_runtime_scheduler_fault_holds_deferred_work_without_replacement_or_broker_side_effects():
+    """A dead scheduler does not run a deferred row or create a replacement."""
+    runner = _runner()
+    runner.stopping = threading.Event()
+    runner.stopped = threading.Event()
+    runner._deferred_recovery_scheduler_startup_gate_open = True
+    runner.entries_allowed.set()
+    runner.broker = MagicMock()
+    recovery = MagicMock()
+    runner._run_deferred_breach_lifecycle_recovery = recovery
+    dead = types.SimpleNamespace(is_alive=lambda: False)
+    runner.deferred_recovery_thread = dead
+
+    assert runner._check_deferred_recovery_scheduler_health(now=100.0) is False
+    runner._start_deferred_breach_lifecycle_scheduler()
+
+    assert runner.deferred_recovery_thread is dead
+    recovery.assert_not_called()
+    assert not runner.entries_allowed.is_set()
+    assert runner.stopping.is_set()
+    assert runner.stopped.is_set()
+    assert not runner.broker.submit_order.called
+    assert not runner.broker.submit_entry.called
+
+
+def test_supervisor_waits_for_old_deferred_scheduler_before_replacement(monkeypatch):
+    """A controlled restart never overlaps the prior recovery consumer."""
+    email = "jasoncosby1@gmail.com"
+    old_runner = _runner()
+    old_runner.email = email
+    old_runner.is_alive = lambda: False
+    old_runner.stopping = threading.Event()
+    old_runner.stopping.set()
+    old_runner._deferred_recovery_supervisor_restart_requested = True
+    scheduler_alive = [True]
+    old_runner.deferred_recovery_thread = types.SimpleNamespace(
+        is_alive=lambda: scheduler_alive[0]
+    )
+    monkeypatch.setattr(cr, "_active_runners", {email: old_runner})
+    monkeypatch.setattr(
+        cr,
+        "_fetch_active_members",
+        lambda _sb: [{"email": email}],
+    )
+
+    created: list[object] = []
+
+    class _Replacement:
+        def __init__(self, member):
+            self.email = member["email"]
+            created.append(self)
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return True
+
+    monkeypatch.setattr(cr, "ClientRunner", _Replacement)
+
+    cr._sync_runners(object())
+    assert created == []
+    assert cr._active_runners[email] is old_runner
+
+    scheduler_alive[0] = False
+    cr._sync_runners(object())
+    assert len(created) == 1
+    assert cr._active_runners[email] is created[0]
+
+
+def test_supervisor_does_not_replace_process_restart_tombstone(monkeypatch):
+    """A stale-live escalation waits for the external process restart authority."""
+    email = "jasoncosby1@gmail.com"
+    old_runner = _runner()
+    old_runner.email = email
+    old_runner.is_alive = lambda: False
+    old_runner.stopping = threading.Event()
+    old_runner.stopping.set()
+    old_runner._deferred_recovery_process_restart_required = True
+    scheduler_alive = [True]
+    old_runner.deferred_recovery_thread = types.SimpleNamespace(
+        is_alive=lambda: scheduler_alive[0]
+    )
+    monkeypatch.setattr(cr, "_active_runners", {email: old_runner})
+    monkeypatch.setattr(
+        cr,
+        "_fetch_active_members",
+        lambda _sb: [{"email": email}],
+    )
+
+    created: list[object] = []
+
+    class _Replacement:
+        def __init__(self, member):
+            self.email = member["email"]
+            created.append(self)
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return True
+
+    monkeypatch.setattr(cr, "ClientRunner", _Replacement)
+
+    cr._sync_runners(object())
+    assert created == []
+    assert cr._active_runners[email] is old_runner
+
+    # Even if the blocked child later exits, this process-level escalation does
+    # not silently downgrade into an in-process replacement.
+    scheduler_alive[0] = False
+    cr._sync_runners(object())
+    assert created == []
+    assert cr._active_runners[email] is old_runner
+
+
+def _permission_runner() -> object:
+    runner = _runner()
+    runner.worker_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.fill_monitor_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner._is_market_hours_now = lambda: False
+    runner._quote_monitor_healthy = lambda: True
+    runner.core = types.SimpleNamespace(exit_eng=object())
+    return runner
+
+
+def test_run_inner_starts_scheduler_before_first_entry_permission_gate():
+    """Startup ordering cannot reintroduce the pre-health-loop fail-open."""
+    source = inspect.getsource(cr.ClientRunner._run_inner)
+    assert source.index("self._start_deferred_breach_lifecycle_scheduler()") < source.index(
+        "self._set_entry_permission()"
+    )
+
+
+@pytest.mark.parametrize("scheduler_state", ("absent", "dead", "not_ready", "stale"))
+def test_set_entry_permission_requires_live_ready_nonstale_scheduler(
+    scheduler_state,
+):
+    """No direct caller can bypass the deferred-recovery money-path gate."""
+    runner = _permission_runner()
+    runner.entries_allowed.set()
+
+    if scheduler_state == "dead":
+        runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: False)
+    elif scheduler_state == "not_ready":
+        runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+        runner.deferred_recovery_started_ts = time.time()
+        runner.deferred_recovery_heartbeat_max_sec = 60.0
+    elif scheduler_state == "stale":
+        runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+        runner.deferred_recovery_scheduler_ready.set()
+        runner.deferred_recovery_started_ts = 1.0
+        runner.last_deferred_recovery_completed_ts = 1.0
+        runner.deferred_recovery_heartbeat_max_sec = 0.1
+
+    assert runner._set_entry_permission() is False
+    assert not runner.entries_allowed.is_set()
+
+
+def test_started_scheduler_readiness_allows_entry_permission(monkeypatch):
+    """The startup handshake is sufficient to let the normal gate proceed."""
+    runner = _permission_runner()
+    runner.stopped = threading.Event()
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+
+    assert runner.deferred_recovery_thread is not None
+    assert runner.deferred_recovery_thread.is_alive()
+    assert runner.deferred_recovery_scheduler_ready.is_set()
+    assert runner._set_entry_permission() is True
+    assert runner.entries_allowed.is_set()
+
+    runner.stopping.set()
+    runner.stopped.set()
+    runner.deferred_recovery_thread.join(timeout=2)
+    assert not runner.deferred_recovery_thread.is_alive()
+
+
+def test_startup_internal_deferred_recovery_failure_holds_entries(monkeypatch):
+    """Returned startup infrastructure errors keep the first unlock closed."""
+    runner = _permission_runner()
+    runner._log_startup_recovery_complete = MagicMock()
+
+    class _Recovery:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, *, include_watcher_reseed):
+            assert include_watcher_reseed is False
+            return {
+                "errors": ["recovery_due_retry_executor_raised:RuntimeError"],
+                "infrastructure_errors": [
+                    "recovery_due_retry_executor_raised:RuntimeError"
+                ],
+            }
+
+    monkeypatch.setattr(cr, "APStartupRecovery", _Recovery)
+
+    runner._run_startup_recovery(MagicMock(), object())
+
+    assert not runner.entries_allowed.is_set()
+    assert runner.degraded.is_set()
+    assert any(
+        runner._reason_key(reason) == "startup_deferred_recovery_failed"
+        for reason in runner.degraded_reasons
+    )
+    assert runner._log_startup_recovery_complete.call_args.kwargs["status"] == "failed"
+
+    # Readiness alone cannot bypass the startup failure state.
+    runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.deferred_recovery_scheduler_ready.set()
+    runner.deferred_recovery_started_ts = time.time()
+    runner.last_deferred_recovery_completed_ts = time.time()
+    runner.deferred_recovery_heartbeat_max_sec = 60.0
+    assert runner._set_entry_permission() is False
+    assert not runner.entries_allowed.is_set()
+
+
+def test_scheduler_infrastructure_failure_does_not_heal_startup_hold(monkeypatch):
+    """A failed first runtime pass leaves the startup degraded reason intact."""
+    runner = _permission_runner()
+    runner.degraded.set()
+    runner.degraded_reasons.add(
+        "startup_deferred_recovery_failed:recovery_due_retry_executor_raised"
+    )
+    runner.stopped = _PulseEvent([False, True])
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    tick = MagicMock(
+        return_value={
+            "deferred_lifecycles_recovered": 0,
+            "errors": ["recovery_due_retry_executor_raised:RuntimeError"],
+            "infrastructure_errors": [
+                "recovery_due_retry_executor_raised:RuntimeError"
+            ],
+        }
+    )
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", tick)
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_READY_TIMEOUT_SEC", "0.1")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    runner.deferred_recovery_thread.join(timeout=2)
+
+    assert tick.call_count == 1
+    assert any(
+        runner._reason_key(reason) == "startup_deferred_recovery_failed"
+        for reason in runner.degraded_reasons
+    )
+    assert "deferred_recovery_scheduler_recovery_failed" in (
+        runner.deferred_recovery_scheduler_health_reasons
+    )
+    assert runner.degraded.is_set()
+    assert not runner.entries_allowed.is_set()
+    assert runner.deferred_recovery_successful_ticks == 0
+
+
+def test_successful_scheduler_tick_heals_startup_hold_and_allows_entries(
+    monkeypatch,
+):
+    """Only a clean canonical tick may heal the startup recovery hold."""
+    runner = _permission_runner()
+    runner.degraded.set()
+    runner.degraded_reasons.add(
+        "startup_deferred_recovery_failed:transient_executor_failure"
+    )
+    runner.stopped = _TickThenStopEvent()
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    tick = MagicMock(
+        return_value={
+            "deferred_lifecycles_recovered": 0,
+            "errors": [],
+            "infrastructure_errors": [],
+        }
+    )
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", tick)
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    runner.deferred_recovery_thread.join(timeout=2)
+
+    assert tick.call_count == 1
+    assert not any(
+        runner._reason_key(reason) == "startup_deferred_recovery_failed"
+        for reason in runner.degraded_reasons
+    )
+    assert not runner.degraded.is_set()
+
+    # The test scheduler has intentionally stopped.  Model a live, ready
+    # handle for the direct permission check after the clean recovery proof.
+    runner.deferred_recovery_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner.deferred_recovery_scheduler_ready.set()
+    runner.deferred_recovery_started_ts = time.time()
+    runner.last_deferred_recovery_completed_ts = time.time()
+    runner.deferred_recovery_heartbeat_max_sec = 60.0
+    assert runner._set_entry_permission() is True
+    assert runner.entries_allowed.is_set()
+
+
+def test_successful_scheduler_tick_clears_only_startup_recovery_reason(
+    monkeypatch,
+):
+    """Healing scheduler state cannot erase an unrelated degraded reason."""
+    runner = _permission_runner()
+    runner.degraded.set()
+    runner.degraded_reasons.update(
+        {
+            "startup_deferred_recovery_failed:transient_executor_failure",
+            "operator_hold:manual_review",
+        }
+    )
+    runner.stopped = _TickThenStopEvent()
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    tick = MagicMock(
+        return_value={
+            "deferred_lifecycles_recovered": 0,
+            "errors": [],
+            "infrastructure_errors": [],
+        }
+    )
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", tick)
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    runner.deferred_recovery_thread.join(timeout=2)
+
+    assert tick.call_count == 1
+    assert not any(
+        runner._reason_key(reason) == "startup_deferred_recovery_failed"
+        for reason in runner.degraded_reasons
+    )
+    assert "operator_hold:manual_review" in runner.degraded_reasons
+    assert runner.degraded.is_set()
+    assert not runner.entries_allowed.is_set()
+
+
+def test_scheduler_dies_immediately_before_health_tick_keeps_entries_blocked(monkeypatch):
+    """A startup child that exits before the first health tick fails closed."""
+    runner = _permission_runner()
+    runner.broker = MagicMock()
+    runner.stopped = _PulseEvent([True])
+    runner.stopping = _PulseEvent([False])
+    runner.failed = _PulseEvent([False])
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_READY_TIMEOUT_SEC", "0.1")
+
+    class _DyingThread:
+        def __init__(self, *, target, daemon, name):
+            self._target = target
+            self.daemon = daemon
+            self.name = name
+
+        def start(self):
+            self._target()
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(cr.threading, "Thread", _DyingThread)
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+
+    assert runner.deferred_recovery_thread is not None
+    assert not runner.deferred_recovery_thread.is_alive()
+    assert runner._set_entry_permission() is False
+    assert not runner.entries_allowed.is_set()
+    assert not runner.broker.submit_order.called
+    assert not runner.broker.submit_entry.called
+    assert "deferred_recovery_scheduler_dead" in runner.degraded_reasons
+
+
+def test_runtime_scheduler_serializes_a_slow_tick_without_overlap(monkeypatch):
+    """A slow due-retry scan cannot stack a second scan on the same runner."""
+    runner = _runner()
+    runner.stopped = threading.Event()
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def slow_tick():
+        calls.append("start")
+        started.set()
+        release.wait(timeout=3)
+        calls.append("finish")
+
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", slow_tick)
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "1")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    assert started.wait(timeout=2)
+    time.sleep(0.1)
+    assert calls == ["start"]
+
+    release.set()
+    runner.stopped.set()
+    runner.deferred_recovery_thread.join(timeout=2)
+    assert not runner.deferred_recovery_thread.is_alive()
+    assert calls == ["start", "finish"]
+
+
+@pytest.mark.parametrize(
+    ("email", "mode", "symbol"),
+    [
+        ("mo@example.com", "LIVE", "MO"),
+        ("mmm@example.com", "PAPER", "MMM"),
+        ("wfc@example.com", "LIVE", "WFC"),
+    ],
+)
+def test_runtime_scheduler_preserves_client_and_mode_isolation(
+    monkeypatch, email, mode, symbol
+):
+    """The same runtime caller handles LIVE/PAPER positive controls."""
+    runner = _runner()
+    runner.email = email
+    runner.mode = mode
+    runner.master_control.mode = mode
+    recovery_calls: list[dict] = []
+
+    class _Recovery:
+        def __init__(self, **kwargs):
+            recovery_calls.append(kwargs)
+
+        def recover_deferred_lifecycles(self):
+            return {
+                "deferred_lifecycles_found": 1,
+                "deferred_lifecycles_due": 1,
+                "deferred_lifecycles_recovered": 1,
+                "symbol": symbol,
+                "errors": [],
+            }
+
+    monkeypatch.setattr(cr, "APStartupRecovery", _Recovery)
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "15")
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    runner.deferred_recovery_thread.join(timeout=2)
+
+    assert len(recovery_calls) == 1
+    assert recovery_calls[0]["client_id"] == email
+    assert recovery_calls[0]["master_control"].mode == mode
+
+
+def _health_loop_runner() -> object:
+    runner = _runner()
+    runner.stopped = threading.Event()
+    runner.stopping = threading.Event()
+    runner.failed = threading.Event()
+    runner.core = types.SimpleNamespace(exit_eng=object(), entry_watcher=None)
+    runner.worker_thread = None
+    runner.fill_monitor_thread = None
+    runner.equity_thread = None
+    runner.last_worker_heartbeat_ts = 0.0
+    runner.last_fill_monitor_heartbeat_ts = 0.0
+    runner.last_equity_heartbeat_ts = 0.0
+    runner.entries_allowed = threading.Event()
+    runner.degraded = threading.Event()
+    return runner
+
+
+def _disable_health_side_effects(monkeypatch, runner):
+    """Keep the health-loop proof focused on thread liveness, not subsystems."""
+    for name in (
+        "_enter_degraded_mode",
+        "_clear_degraded_reason_key",
+        "_try_recover_degraded_mode",
+        "_check_split_brain_recovery",
+        "_run_overnight_reeval_if_due",
+        "_run_exit_autonomous_recovery",
+        "_detect_manual_closes",
+        "_set_entry_permission",
+    ):
+        monkeypatch.setattr(runner, name, MagicMock())
+
+
+def _stop_runner_threads(runner):
+    runner.stopping.set()
+    runner.stopped.set()
+    for name in ("health_thread", "deferred_recovery_thread"):
+        thread = getattr(runner, name, None)
+        if thread is not None:
+            thread.join(timeout=3)
+            assert not thread.is_alive()
+
+
+def test_health_loop_does_not_invoke_deferred_recovery_scheduler(monkeypatch):
+    """Only the dedicated scheduler may call the deferred recovery boundary."""
+    runner = _health_loop_runner()
+    _disable_health_side_effects(monkeypatch, runner)
+    health_tick = threading.Event()
+    scheduler_tick = threading.Event()
+    deferred_calls = []
+
+    def health_permission():
+        health_tick.set()
+
+    def deferred_tick():
+        deferred_calls.append("scheduler")
+        scheduler_tick.set()
+
+    monkeypatch.setattr(runner, "_set_entry_permission", health_permission)
+    monkeypatch.setattr(
+        runner,
+        "_check_deferred_recovery_scheduler_health",
+        MagicMock(return_value=True),
+    )
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", deferred_tick)
+    monkeypatch.setenv("RUNNER_HEALTH_CHECK_SEC", "0.01")
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "1")
+
+    runner._start_runtime_health_loop()
+    assert health_tick.wait(timeout=2)
+    assert deferred_calls == []
+
+    runner._start_deferred_breach_lifecycle_scheduler()
+    assert scheduler_tick.wait(timeout=2)
+    assert deferred_calls == ["scheduler"]
+
+    _stop_runner_threads(runner)
+    calls_after_stop = list(deferred_calls)
+    time.sleep(1.1)
+    assert deferred_calls == calls_after_stop == ["scheduler"]
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_scheduler_survives_independent_health_loop_failure(monkeypatch):
+    """A stopped/raised health loop cannot take deferred recovery with it."""
+    runner = _health_loop_runner()
+    _disable_health_side_effects(monkeypatch, runner)
+    health_failed = threading.Event()
+    scheduler_tick = threading.Event()
+    tick_calls = []
+
+    def health_failure():
+        health_failed.set()
+        # SystemExit terminates only this thread and avoids converting the
+        # intentional isolation proof into a pytest thread-warning failure.
+        raise SystemExit("simulated health-loop failure")
+
+    def deferred_tick():
+        tick_calls.append("tick")
+        scheduler_tick.set()
+
+    monkeypatch.setattr(runner, "_check_split_brain_recovery", health_failure)
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", deferred_tick)
+    monkeypatch.setenv("RUNNER_HEALTH_CHECK_SEC", "0.01")
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "1")
+
+    runner._start_runtime_health_loop()
+    runner._start_deferred_breach_lifecycle_scheduler()
+
+    assert health_failed.wait(timeout=2)
+    runner.health_thread.join(timeout=2)
+    assert not runner.health_thread.is_alive()
+    assert scheduler_tick.wait(timeout=2)
+    assert tick_calls == ["tick"]
+
+    _stop_runner_threads(runner)
+    calls_after_stop = list(tick_calls)
+    time.sleep(1.1)
+    assert tick_calls == calls_after_stop == ["tick"]
+
+
+def test_health_loop_survives_independent_scheduler_tick_failure(monkeypatch):
+    """A deferred tick exception is contained while the health loop stays live."""
+    runner = _health_loop_runner()
+    _disable_health_side_effects(monkeypatch, runner)
+    health_tick = threading.Event()
+    scheduler_tick = threading.Event()
+    tick_calls = []
+
+    def health_observer():
+        health_tick.set()
+
+    def deferred_failure():
+        tick_calls.append("tick")
+        scheduler_tick.set()
+        raise RuntimeError("simulated deferred-recovery failure")
+
+    monkeypatch.setattr(runner, "_set_entry_permission", health_observer)
+    monkeypatch.setattr(runner, "_run_deferred_breach_lifecycle_recovery", deferred_failure)
+    monkeypatch.setenv("RUNNER_HEALTH_CHECK_SEC", "0.01")
+    monkeypatch.setenv("DEFERRED_RETRY_SCHEDULER_INTERVAL_SEC", "1")
+
+    runner._start_runtime_health_loop()
+    runner._start_deferred_breach_lifecycle_scheduler()
+
+    assert health_tick.wait(timeout=2)
+    assert scheduler_tick.wait(timeout=2)
+    assert runner.health_thread.is_alive()
+    assert runner.deferred_recovery_thread.is_alive()
+    assert runner.deferred_recovery_errors == 1
+
+    _stop_runner_threads(runner)
+    calls_after_stop = list(tick_calls)
+    time.sleep(1.1)
+    assert tick_calls == calls_after_stop == ["tick"]

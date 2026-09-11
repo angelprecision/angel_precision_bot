@@ -134,6 +134,12 @@ def _run_entry_trigger(
         "meta": {
             "trigger_crossed_at": now.isoformat(),
             "trigger_confirmed_at": now.isoformat(),
+            "trigger_crossed_at_provenance": {
+                "canonical_signal_id": "sig-1",
+                "client_id": "client@example.com",
+                "execution_mode": execution_mode,
+                "local_order_id": "local-1",
+            },
             "absolute_entry_deadline": (now + timedelta(minutes=5)).isoformat(),
         },
     }
@@ -145,7 +151,7 @@ def _run_entry_trigger(
         "status": "SUBMITTED",
         "error": None,
     }
-    def _update_order_meta(local_order_id, patch):
+    def _update_order_meta(local_order_id, patch, **_expected):
         order_row.setdefault("meta", {}).update(patch)
         return True
 
@@ -191,6 +197,14 @@ def _run_entry_trigger(
             "canonical_signal_id": "sig-1",
             "local_order_id": "local-1",
             "client_id": "client@example.com",
+            "execution_mode": execution_mode,
+            "metadata": {
+                "signal_id": "sig-1",
+                "canonical_signal_id": "sig-1",
+                "local_order_id": "local-1",
+                "client_id": "client@example.com",
+                "execution_mode": execution_mode,
+            },
             "timeframe": "1d",
             "score": 78,
         },
@@ -263,7 +277,12 @@ def _run_watcher_poll_to_submit(
     if watcher_quote is not None:
         quote.update(watcher_quote)
 
-    watcher = _Watcher(_DummyBroker(), quotes={"AAPL": quote})
+    watcher = _Watcher(
+        _DummyBroker(),
+        order_state_machine=core.order_state_machine,
+        mode=execution_mode.upper(),
+        quotes={"AAPL": quote},
+    )
     watcher.on_trigger = core._on_entry_trigger
     watched = WatchedSignal(
         {
@@ -276,6 +295,14 @@ def _run_watcher_poll_to_submit(
             "canonical_signal_id": "sig-1",
             "local_order_id": "local-1",
             "client_id": "client@example.com",
+            "execution_mode": execution_mode,
+            "metadata": {
+                "signal_id": "sig-1",
+                "canonical_signal_id": "sig-1",
+                "local_order_id": "local-1",
+                "client_id": "client@example.com",
+                "execution_mode": execution_mode,
+            },
             "timeframe": "1d",
             "score": 78,
         },

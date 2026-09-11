@@ -514,16 +514,18 @@ def test_restart_broker_ready_without_execution_core_retains_row(monkeypatch):
     osm.update_order_meta.assert_not_called()
 
 
-def test_restart_due_retry_row_rearms_same_generation(monkeypatch):
+def test_restart_due_retry_without_executor_holds_row(monkeypatch):
     due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
     watcher, osm, result = _run_recovery_rows(
         monkeypatch, [_recovery_order("RETRY_WAIT", next_retry_at=due)]
     )
-    watcher.watch.assert_called_once()
-    assert watcher.watch.call_args.kwargs["materialization_resume"] is True
-    assert watcher.watch.call_args.args[0].metadata["materialization_generation"] == 2
+    watcher.watch.assert_not_called()
+    assert result["errors"] == ["recovery_due_retry_executor_unavailable"]
+    assert result["infrastructure_errors"] == [
+        "recovery_due_retry_executor_unavailable"
+    ]
     osm.submit_existing_entry.assert_not_called()
-    assert result["deferred_lifecycles_recovered"] == 1
+    assert result["deferred_lifecycles_recovered"] == 0
 
 
 def test_restart_stale_materializing_row_rearms(monkeypatch):

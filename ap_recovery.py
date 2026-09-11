@@ -456,12 +456,15 @@ class APStartupRecovery:
             "dedup_seeded":        0,
             "watchers_requeued":   0,
             "deferred_lifecycles_recovered": 0,
+            "deferred_lifecycles_found": 0,
+            "deferred_lifecycles_due": 0,
             "exit_fill_reconciliations_attempted": 0,
             "exit_fill_reconciliations_reconciled": 0,
             "exit_fill_reconciliations_quarantined": 0,
             "exit_fill_reconciliations_failed": 0,
             "exit_fill_reconciliations_skipped": 0,
             "errors":              [],
+            "infrastructure_errors": [],
         }
 
         log.info("[%s] Startup recovery beginning...", self.client_id)
@@ -469,13 +472,16 @@ class APStartupRecovery:
         if self._execution_mode() is None:
             log.error("[%s] RECOVERY_BLOCKED unknown execution_mode", self.client_id)
             result["errors"].append("recovery_unknown_execution_mode")
+            result["infrastructure_errors"].append("recovery_unknown_execution_mode")
             return result
 
         try:
             self._recover_deferred_breach_lifecycles(result)
         except Exception as e:
             log.error("[%s] Deferred breach lifecycle recovery error: %s", self.client_id, e)
-            result["errors"].append(f"deferred_lifecycle: {e}")
+            _error = f"deferred_lifecycle: {e}"
+            result["errors"].append(_error)
+            result["infrastructure_errors"].append(_error)
 
         try:
             self._retry_canonical_exit_fill_reconciliations(result)
@@ -635,15 +641,26 @@ class APStartupRecovery:
         result = {
             "client_id": self.client_id,
             "deferred_lifecycles_recovered": 0,
+            "deferred_lifecycles_found": 0,
+            "deferred_lifecycles_due": 0,
             "errors": [],
+            # ``errors`` includes row-level recovery outcomes.  This separate
+            # channel is reserved for failures at the recovery boundary itself
+            # so the runtime scheduler can distinguish an executable pass that
+            # found a bad row from an executor that could not run.
+            "infrastructure_errors": [],
         }
         if self._execution_mode() is None:
-            result["errors"].append("recovery_unknown_execution_mode")
+            _error = "recovery_unknown_execution_mode"
+            result["errors"].append(_error)
+            result["infrastructure_errors"].append(_error)
             return result
         try:
             self._recover_deferred_breach_lifecycles(result)
         except Exception as exc:
-            result["errors"].append(f"deferred_lifecycle:{exc}")
+            _error = f"deferred_lifecycle:{exc}"
+            result["errors"].append(_error)
+            result["infrastructure_errors"].append(_error)
         return result
 
     def _execution_mode(self) -> str | None:
@@ -1948,6 +1965,9 @@ class APStartupRecovery:
                 self.client_id,
             )
             result.setdefault("errors", []).append("recovery_unknown_execution_mode")
+            result.setdefault("infrastructure_errors", []).append(
+                "recovery_unknown_execution_mode"
+            )
             return
         recovery_mode_sql = recovery_mode.lower()  # SQL predicate is case-insensitive lower
 
@@ -1960,6 +1980,9 @@ class APStartupRecovery:
                 self.client_id, osm_client_id, self.client_id,
             )
             result.setdefault("errors", []).append("recovery_osm_client_id_mismatch")
+            result.setdefault("infrastructure_errors", []).append(
+                "recovery_osm_client_id_mismatch"
+            )
             return
 
         def _load():
@@ -1986,8 +2009,22 @@ class APStartupRecovery:
                 return c.fetchall()
 
         rows = run_with_retry(_load) or []
+        result["deferred_lifecycles_found"] = len(rows)
         now = datetime.now(timezone.utc)
         recovered = 0
+
+        def _record_infrastructure_error(code: str) -> None:
+            """Surface an executor-boundary failure to the runtime scheduler.
+
+            Row-level dispositions remain ordinary recovery errors.  An
+            unavailable or unexpectedly-raising canonical executor is
+            different: the pass could not execute the authority that owns
+            that lifecycle, so the scheduler must not publish a successful
+            tick merely because the row was retained.
+            """
+            _code = str(code or "recovery_infrastructure_failure")
+            result.setdefault("errors", []).append(_code)
+            result.setdefault("infrastructure_errors", []).append(_code)
 
         def _strict_durable_counter(
             meta_dict: dict,
@@ -2496,6 +2533,9 @@ class APStartupRecovery:
                         "(possible live broker order)",
                         self.client_id, local_order_id,
                     )
+                    _record_infrastructure_error(
+                        "recovery_crash_window_reconciler_unavailable"
+                    )
                     _retain_recovery_ownership(
                         local_order_id, reason="crash_window_reconciler_unavailable",
                     )
@@ -2507,6 +2547,10 @@ class APStartupRecovery:
                         "[%s] reconcile_deferred_broker_intent raised "
                         "local_order_id=%s exc=%s",
                         self.client_id, local_order_id, exc,
+                    )
+                    _record_infrastructure_error(
+                        "recovery_crash_window_reconcile_raised:"
+                        f"{type(exc).__name__}"
                     )
                     _retain_recovery_ownership(
                         local_order_id, reason="crash_window_reconcile_raised",
@@ -2574,6 +2618,9 @@ class APStartupRecovery:
                         "(never falling back to submit_existing_entry per §2)",
                         self.client_id, local_order_id,
                     )
+                    _record_infrastructure_error(
+                        "recovery_broker_ready_executor_unavailable"
+                    )
                     continue
 
                 # Build and validate the plan before passing to the scaffold.
@@ -2623,6 +2670,10 @@ class APStartupRecovery:
                         "[%s] resume_deferred_broker_ready_order raised "
                         "local_order_id=%s exc=%s",
                         self.client_id, local_order_id, exc,
+                    )
+                    _record_infrastructure_error(
+                        "recovery_broker_ready_executor_raised:"
+                        f"{type(exc).__name__}"
                     )
                     continue
 
@@ -2839,6 +2890,9 @@ class APStartupRecovery:
 
                 # ── Due-retry path (blocker §4: watcher not required) ─────────
                 if _is_retry_row and _is_due:
+                    result["deferred_lifecycles_due"] = int(
+                        result.get("deferred_lifecycles_due", 0) or 0
+                    ) + 1
                     # Prove executable ownership regardless of watcher state.
                     _proof_result = {"proven": False, "reason_code": "PROOF_UNAVAILABLE"}
                     if self.entry_watcher is not None:
@@ -2882,13 +2936,20 @@ class APStartupRecovery:
                             self.execution_core, "resume_deferred_materialization_retry", None,
                         )
                     if not callable(_resume_fn):
-                        log.warning(
+                        log.critical(
                             "[%s] RECOVERY_DUE_RETRY_TAKEOVER_UNAVAILABLE "
-                            "local_order_id=%s proof_reason=%s — falling through "
-                            "to legacy rearm",
+                            "local_order_id=%s proof_reason=%s — retaining row "
+                            "without legacy rearm",
                             self.client_id, local_order_id, _proof_reason,
                         )
-                        # Fall through to the future-due / legacy rearm block.
+                        _record_infrastructure_error(
+                            "recovery_due_retry_executor_unavailable"
+                        )
+                        _retain_recovery_ownership(
+                            local_order_id,
+                            reason="due_retry_executor_unavailable",
+                        )
+                        continue
                     else:
                         _expected_generation = int(_retry_generation)
                         _expected_attempt = int(_retry_attempt) + 1
@@ -2908,6 +2969,10 @@ class APStartupRecovery:
                                 "[%s] resume_deferred_materialization_retry raised "
                                 "local_order_id=%s exc=%s",
                                 self.client_id, local_order_id, _resume_exc,
+                            )
+                            _record_infrastructure_error(
+                                "recovery_due_retry_executor_raised:"
+                                f"{type(_resume_exc).__name__}"
                             )
                             _retain_recovery_ownership(
                                 local_order_id,
