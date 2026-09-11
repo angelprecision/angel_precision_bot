@@ -114,18 +114,27 @@ def _quote(symbol: str, broker: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
-def _history(symbol: str, broker: Any, *, days: int = 400) -> list[dict[str, Any]]:
+def _history(
+    symbol: str,
+    broker: Any,
+    *,
+    days: int = 400,
+    now: Optional[datetime] = None,
+) -> list[dict[str, Any]]:
     source = _quote_source(broker)
     if not symbol or source is None or not hasattr(source, "_get"):
         return []
-    now = datetime.now(timezone.utc)
+    history_now = now or datetime.now(timezone.utc)
+    if history_now.tzinfo is None or history_now.utcoffset() is None:
+        return []
+    history_et = history_now.astimezone(ET)
     payload = source._get(
         "/v1/markets/history",
         params={
             "symbol": symbol,
             "interval": "daily",
-            "start": (now - timedelta(days=days)).strftime("%Y-%m-%d"),
-            "end": now.strftime("%Y-%m-%d"),
+            "start": (history_et - timedelta(days=days)).strftime("%Y-%m-%d"),
+            "end": history_et.strftime("%Y-%m-%d"),
         },
     )
     rows = ((payload.get("history") or {}).get("day") or []) if isinstance(payload, dict) else []
@@ -249,6 +258,225 @@ def _intraday_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"vwap": vwap, "relative_volume": relative_volume, "total_volume": total_volume}
 
 
+def _parse_breach_as_of(value: Any) -> tuple[Optional[datetime], str]:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None, "malformed"
+    else:
+        return None, "missing"
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None, "timezone_aware_required"
+    return parsed, ""
+
+
+def _filter_completed_bars(
+    rows: Any, *, interval_minutes: int, as_of: datetime
+) -> list[dict[str, Any]]:
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        return []
+    completed: list[dict[str, Any]] = []
+    interval = timedelta(minutes=interval_minutes)
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        raw_time = str(row.get("time") or row.get("timestamp") or "")
+        try:
+            opened = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if opened.tzinfo is None or opened.utcoffset() is None:
+            continue
+        if opened + interval <= as_of:
+            completed.append(dict(row))
+    return completed
+
+
+def _frozen_breach_observation(signal: dict[str, Any], as_of: datetime) -> dict[str, Any]:
+    candidates = (
+        ("signal_breach_price", signal.get("breach_price")),
+        ("signal_frozen_underlying_price", signal.get("frozen_underlying_price")),
+        ("signal_underlying_at_breach", signal.get("underlying_at_breach")),
+        ("signal_underlying_at_signal", signal.get("underlying_at_signal")),
+        ("signal_underlying_price", signal.get("underlying_price")),
+        ("signal_current_price", signal.get("current_price")),
+    )
+    for source, raw_price in candidates:
+        price = to_float(raw_price)
+        if price is None:
+            continue
+        source_timestamp = (
+            signal.get("breach_price_at")
+            or signal.get("underlying_at_breach_at")
+            or as_of.isoformat()
+        )
+        return {
+            "price": price,
+            "source": source,
+            "observed_at": as_of.isoformat(),
+            "source_timestamp": str(source_timestamp),
+            "age_seconds": None,
+        }
+    return {
+        "price": None,
+        "source": None,
+        "observed_at": None,
+        "source_timestamp": None,
+        "age_seconds": None,
+    }
+
+
+def _breach_data_sources(
+    signal: dict[str, Any],
+    *,
+    daily: list[dict[str, Any]],
+    bars_5m: list[dict[str, Any]],
+    bars_15m: list[dict[str, Any]],
+    candles_1h: list[dict[str, Any]],
+    candles_4h: list[dict[str, Any]],
+    now: datetime,
+    observed_price: Optional[float],
+) -> dict[str, Any]:
+    today_et = now.astimezone(ET).date().isoformat()
+    completed_daily = [
+        row
+        for row in daily
+        if isinstance(row, dict) and str(row.get("time") or "")[:10] < today_et
+    ]
+    metrics = _intraday_metrics(bars_15m)
+    return {
+        "candles": {
+            "monthly": _aggregate_calendar(completed_daily, "monthly", now=now),
+            "weekly": _aggregate_calendar(completed_daily, "weekly", now=now),
+            "daily": completed_daily,
+            "5m": bars_5m,
+            "15m": bars_15m,
+            "1h": candles_1h,
+            "4h": candles_4h,
+        },
+        "trend": {"vwap": metrics.get("vwap"), "current_price": observed_price},
+        "volume": {"relative_volume": metrics.get("relative_volume")},
+        "market": {
+            "symbol": str(signal.get("market_symbol") or "SPY"),
+            "change_pct": None,
+        },
+        "sector": {
+            "sector": signal.get("sector"),
+            "symbol": signal.get("sector_etf"),
+            "change_pct": None,
+        },
+    }
+
+
+def _collect_breach_context(
+    signal: dict[str, Any],
+    *,
+    broker: Any,
+    ticker: str,
+    evidence_now: datetime,
+    collected_at: str,
+) -> dict[str, Any]:
+    errors: list[str] = []
+    daily: list[dict[str, Any]] = []
+    bars_5m: list[dict[str, Any]] = []
+    bars_15m: list[dict[str, Any]] = []
+    fetched_5m = False
+    fetched_15m = False
+
+    # BREACH deliberately has no current quote path. Only bounded historical
+    # reads and already-frozen signal evidence are allowed here.
+    if broker is not None and ticker:
+        try:
+            daily = _history(ticker, broker, now=evidence_now)
+        except Exception as exc:
+            errors.append(f"daily_history:{type(exc).__name__}")
+        try:
+            from ap.fvg_telemetry import fetch_15m_bars
+
+            fetched_15m = True
+            bars_15m = fetch_15m_bars(ticker, broker, now=evidence_now)
+        except Exception as exc:
+            errors.append(f"intraday_history:{type(exc).__name__}")
+        try:
+            from ap.fvg_telemetry import fetch_5m_bars
+
+            fetched_5m = True
+            bars_5m = fetch_5m_bars(ticker, broker, now=evidence_now)
+        except Exception as exc:
+            errors.append(f"intraday_history_5m:{type(exc).__name__}")
+
+    bars_15m = _filter_completed_bars(
+        bars_15m, interval_minutes=15, as_of=evidence_now
+    )
+    frozen_15m = _filter_completed_bars(
+        extract_candles(signal, "15m"), interval_minutes=15, as_of=evidence_now
+    )
+    used_frozen_15m = not bars_15m and bool(frozen_15m)
+    if used_frozen_15m:
+        bars_15m = frozen_15m
+
+    bars_5m = _filter_completed_bars(
+        bars_5m, interval_minutes=5, as_of=evidence_now
+    )
+    frozen_5m = _filter_completed_bars(
+        extract_candles(signal, "5m"), interval_minutes=5, as_of=evidence_now
+    )
+    used_frozen_5m = not bars_5m and bool(frozen_5m)
+    if used_frozen_5m:
+        bars_5m = frozen_5m
+
+    try:
+        candles_1h = _completed_intraday(
+            bars_15m, bucket_minutes=60, now=evidence_now
+        )
+        candles_4h = _completed_intraday(
+            bars_15m, bucket_minutes=240, now=evidence_now
+        )
+    except Exception as exc:
+        errors.append(f"intraday_aggregation:{type(exc).__name__}")
+        candles_1h = []
+        candles_4h = []
+
+    observation = _frozen_breach_observation(signal, evidence_now)
+    data_sources = _breach_data_sources(
+        signal,
+        daily=daily,
+        bars_5m=bars_5m,
+        bars_15m=bars_15m,
+        candles_1h=candles_1h,
+        candles_4h=candles_4h,
+        now=evidence_now,
+        observed_price=observation.get("price"),
+    )
+    return {
+        "phase": "BREACH",
+        "collected_at": collected_at,
+        "as_of": evidence_now.isoformat(),
+        "data_sources": data_sources,
+        "underlying_observation": observation,
+        "errors": errors,
+        "provenance": {
+            "quote": None,
+            "daily": "tradier_history_daily" if daily else None,
+            "intraday": (
+                "signal_frozen_15min"
+                if used_frozen_15m
+                else "tradier_timesales_15min" if fetched_15m and bars_15m else None
+            ),
+            "intraday_5m": (
+                "signal_frozen_5min"
+                if used_frozen_5m
+                else "tradier_timesales_5min" if fetched_5m and bars_5m else None
+            ),
+            "market": None,
+            "sector": None,
+        },
+    }
+
+
 def collect_point_in_time_context(
     signal: dict[str, Any], *, broker: Any = None, phase: str
 ) -> dict[str, Any]:
@@ -256,6 +484,56 @@ def collect_point_in_time_context(
     ticker = str(signal.get("ticker") or signal.get("symbol") or "").strip().upper()
     now_utc = datetime.now(timezone.utc)
     collected_at = now_utc.isoformat()
+    phase_name = str(phase).upper()
+    if phase_name == "BREACH":
+        evidence_now, reason = _parse_breach_as_of(signal.get("trigger_crossed_at"))
+        if evidence_now is None:
+            return {
+                "phase": "BREACH",
+                "collected_at": collected_at,
+                "as_of": None,
+                "data_sources": {
+                    "candles": {
+                        "monthly": [], "weekly": [], "daily": [],
+                        "5m": [], "15m": [], "1h": [], "4h": [],
+                    },
+                    "trend": {"vwap": None, "current_price": None},
+                    "volume": {"relative_volume": None},
+                    "market": {
+                        "symbol": str(signal.get("market_symbol") or "SPY"),
+                        "change_pct": None,
+                    },
+                    "sector": {
+                        "sector": signal.get("sector"),
+                        "symbol": signal.get("sector_etf"),
+                        "change_pct": None,
+                    },
+                },
+                "underlying_observation": {
+                    "price": None,
+                    "source": None,
+                    "observed_at": None,
+                    "source_timestamp": None,
+                    "age_seconds": None,
+                },
+                "errors": [f"breach_as_of_invalid:{reason}"],
+                "provenance": {
+                    "quote": None,
+                    "daily": None,
+                    "intraday": None,
+                    "intraday_5m": None,
+                    "market": None,
+                    "sector": None,
+                },
+            }
+        return _collect_breach_context(
+            signal,
+            broker=broker,
+            ticker=ticker,
+            evidence_now=evidence_now,
+            collected_at=collected_at,
+        )
+
     errors: list[str] = []
     quote: dict[str, Any] = {}
     daily: list[dict[str, Any]] = []
@@ -321,7 +599,7 @@ def collect_point_in_time_context(
         },
     }
     return {
-        "phase": str(phase).upper(), "collected_at": collected_at,
+        "phase": phase_name, "collected_at": collected_at,
         "data_sources": data_sources, "underlying_observation": observation,
         "errors": errors,
         "provenance": {
