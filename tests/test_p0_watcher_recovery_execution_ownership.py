@@ -116,7 +116,7 @@ def test_trigger_timestamps_are_persisted_before_execution_callback():
     watcher._dedup_set.add("sig-1")
     events: list[str] = []
 
-    def _update_order_meta(_oid, patch):
+    def _update_order_meta(_oid, patch, **_expected):
         if "trigger_confirmed_at" in patch:
             events.append("timestamps")
         return True
@@ -241,7 +241,7 @@ def _execution_core(monkeypatch, submit_result: dict):
         },
     }
     osm.get_order.return_value = order_row
-    def _update_order_meta(_oid, patch):
+    def _update_order_meta(_oid, patch, **_expected):
         order_row["meta"].update(patch)
         return True
     osm.update_order_meta.side_effect = _update_order_meta
