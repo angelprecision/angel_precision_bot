@@ -464,6 +464,7 @@ class APProofLogger:
         position_id:         str  = "",
         local_order_id:      str  = "",
         execution_mode:      str  = "",
+        fill_timestamp_quality: str = "",
         # Adaptive exit pricing slippage fields (filled by exit engine)
         exit_bid:            float = 0.0,
         exit_ask:            float = 0.0,
@@ -541,6 +542,12 @@ class APProofLogger:
             "exit_attempt":       exit_attempt if exit_attempt else None,
             "seconds_to_fill":    round(seconds_to_fill, 1) if seconds_to_fill else None,
         }
+        # Keep chronology quality in the proof row whenever the caller has an
+        # explicit classification.  Legacy exact callers omit the key so the
+        # existing schema fallback remains compatible; a non-exact close must
+        # not be silently persisted without its quality marker.
+        if str(fill_timestamp_quality or "").strip():
+            row["fill_timestamp_quality"] = str(fill_timestamp_quality).strip()
 
         # Cache for convenience — not source of truth
         with self._lock:
@@ -571,6 +578,7 @@ class APProofLogger:
             "entry_option_price", "exit_option_price", "contracts",
             "exit_reason", "option_pnl_pct", "underlying_pnl_pct", "win",
             "synthetic_entry", "position_id", "local_order_id",
+            "fill_timestamp_quality",
         }
         # ── Persistence-status tracking ──────────────────────────────────────
         # _persisted is set True only after a confirmed Supabase insert.

@@ -48,7 +48,16 @@ from ap.logger import get_logger
 from ap.config import Config
 from ap.state import release_equity, release_symbol_lock
 from ap.broker import BrokerAdapter
-from ap.manual_close_reconciliation import order_filled_at
+from ap.manual_close_reconciliation import (
+    BROKER_FILL_TIMESTAMP_KEYS,
+    BROKER_FILL_TIMESTAMP_SOURCE,
+    FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY,
+    FILL_TIMESTAMP_QUALITY_EXACT,
+    FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+    broker_fill_timestamp_evidence,
+    order_fill_price,
+    order_filled_qty,
+)
 from ap.observability import emit_decision_event, get_git_commit
 
 log = get_logger("ap.fill_monitor")
@@ -775,7 +784,8 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
 
     Contract:
     - returned filled_qty is broker cumulative filled quantity, not incremental
-    - raw order quantity is used as fallback only when broker status is truly FILLED
+    - execution quantity and execution price come only from explicit broker
+      fill fields; requested order quantity/limit price are never fallbacks
     - active broker statuses map to ACKNOWLEDGED / EXIT_ACKNOWLEDGED
     """
     broker_order_id = order.get("broker_order_id")
@@ -817,15 +827,11 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
             }
             our = "ACKNOWLEDGED" if status in ACTIVE_BROKER_STATUSES else status_map.get(status, "UNKNOWN")
 
-        explicit_filled_qty = raw.get("exec_quantity") or raw.get("filled_quantity")
-        if explicit_filled_qty is not None:
-            filled_qty = int(explicit_filled_qty or 0)
-        elif our in ("FILLED", "EXIT_FILLED"):
-            filled_qty = int(raw.get("quantity") or 0)
-        else:
-            filled_qty = 0
-
-        avg_fill = float(raw.get("avg_fill_price") or raw.get("price") or 0.0)
+        filled_qty = int(order_filled_qty(raw) or 0)
+        # ``price`` is a limit/stop price on Tradier orders, never execution
+        # truth. A missing explicit average/last fill price must remain a
+        # broker-truth HOLD rather than becoming fabricated P&L.
+        avg_fill = float(order_fill_price(raw) or 0.0)
 
         # PR #579 amendment (2026-09-06): also extract the broker
         # execution timestamp when the mapped state is terminal
@@ -835,15 +841,24 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
         # timestamp to converge the executed delta before terminalizing
         # the remainder. Without this the delta is silently dropped
         # (see September 4 2026 audit note on partial-then-cancel).
-        broker_filled_at = None
+        timestamp_evidence = {
+            "filled_ts": None,
+            "fill_timestamp_quality": FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+            "fill_timestamp_source": "",
+            "fill_timestamp_key": "",
+            "broker_order_updated_at": None,
+        }
         _extract_ts = our in {"FILLED", "PARTIAL_FILL", "EXIT_FILLED", "EXIT_PARTIAL_FILL"}
         if not _extract_ts and our in {"CANCELED", "REJECTED", "EXPIRED"} and int(filled_qty or 0) > 0:
             _extract_ts = True
         if _extract_ts:
             try:
-                broker_filled_at = order_filled_at(raw)
+                timestamp_evidence = broker_fill_timestamp_evidence(raw)
             except Exception:
-                broker_filled_at = None
+                timestamp_evidence["reason"] = "timestamp_evidence_exception"
+
+        broker_filled_at = timestamp_evidence.get("filled_ts")
+        broker_order_updated_at = timestamp_evidence.get("broker_order_updated_at")
 
         result = {
             "status": our,
@@ -851,7 +866,21 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
             "avg_fill": avg_fill,
             "filled_ts": (
                 broker_filled_at.astimezone(timezone.utc).isoformat()
-                if broker_filled_at is not None
+                if isinstance(broker_filled_at, datetime)
+                else None
+            ),
+            "fill_timestamp_quality": timestamp_evidence.get(
+                "fill_timestamp_quality", FILL_TIMESTAMP_QUALITY_UNAVAILABLE
+            ),
+            "fill_timestamp_source": timestamp_evidence.get(
+                "fill_timestamp_source", ""
+            ),
+            "fill_timestamp_key": timestamp_evidence.get(
+                "fill_timestamp_key", ""
+            ),
+            "broker_order_updated_at": (
+                broker_order_updated_at.astimezone(timezone.utc).isoformat()
+                if isinstance(broker_order_updated_at, datetime)
                 else None
             ),
             "reason": raw.get("reason") or status,
@@ -894,6 +923,46 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
                 "reason": reason,
             }
 
+        # A positive execution quantity without an explicit execution price
+        # is incomplete broker truth.  Do not let the requested/limit price
+        # leak into P&L or OSM state; leave the order retryable for a later
+        # broker/reconciler observation.
+        if (
+            our in {"FILLED", "PARTIAL_FILL", "EXIT_FILLED", "EXIT_PARTIAL_FILL"}
+            and int(filled_qty or 0) > 0
+            and float(avg_fill or 0.0) <= 0
+        ):
+            reason = "BROKER_FILLED_INVALID_PRICE"
+            client_id = str(order.get("client_id") or "default")
+            payload = {
+                "local_order_id": order.get("local_order_id"),
+                "broker_order_id": broker_order_id,
+                "kind": kind,
+                "mapped_status": our,
+                "filled_qty": filled_qty,
+                "avg_fill": avg_fill,
+                "broker_reason": raw.get("reason") or status,
+            }
+            log.critical("[%s] %s | %s", client_id, reason, payload)
+            audit(client_id, "CRITICAL", reason, payload)
+            emit_fill_event(
+                order,
+                decision="ERROR",
+                reason_code=reason,
+                explanation=(
+                    "Broker reported executed quantity without a positive "
+                    "explicit execution price; OSM and side effects are "
+                    "blocked pending a complete broker response."
+                ),
+                result=result,
+                extra_context=payload,
+            )
+            return {
+                **result,
+                "status": "ERROR",
+                "reason": reason,
+            }
+
         # PR #235 (hardening #1 + #2): on confirmed ENTRY FILLED, resolve
         # option side from orders.direction (canonical) or the OCC C/P
         # marker on the contract symbol.  If neither resolves, emit critical
@@ -926,6 +995,48 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
             },
         )
         return {"status": "ERROR", "filled_qty": 0, "avg_fill": 0.0, "reason": str(e), "raw": {}}
+
+
+def _usable_fill_timestamp_evidence(result: dict) -> bool:
+    """Require an explicit exact or non-exact chronology classification."""
+    if not isinstance(result, dict):
+        return False
+    quality = str(result.get("fill_timestamp_quality") or "").strip()
+    filled_ts = result.get("filled_ts")
+    source = str(result.get("fill_timestamp_source") or "").strip()
+    key = str(result.get("fill_timestamp_key") or "").strip()
+
+    def _aware(value) -> bool:
+        if value in (None, ""):
+            return False
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed.tzinfo is not None and parsed.utcoffset() is not None
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    if not quality and _aware(filled_ts):
+        # Compatibility for direct callers that predate the quality fields.
+        # A supplied execution timestamp is still an explicit broker marker;
+        # this does not infer chronology from a lifecycle/update timestamp.
+        return (
+            source in {"", BROKER_FILL_TIMESTAMP_SOURCE}
+            and key in ({""} | set(BROKER_FILL_TIMESTAMP_KEYS))
+        )
+    if quality == FILL_TIMESTAMP_QUALITY_EXACT:
+        return (
+            _aware(filled_ts)
+            and source == BROKER_FILL_TIMESTAMP_SOURCE
+            and key in BROKER_FILL_TIMESTAMP_KEYS
+        )
+    if quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY:
+        return (
+            filled_ts in (None, "")
+            and _aware(result.get("broker_order_updated_at"))
+            and source == "tradier_transaction_date"
+            and key == "transaction_date"
+        )
+    return False
 
 
 # =============================================================================
@@ -2683,14 +2794,14 @@ def process_pending_order(
         )
         return
 
-    # EXIT position mutation requires an exact broker execution timestamp.
-    # Do not let OSM persist a new cumulative fill that the canonical
-    # convergence seam cannot chronologically prove.  A later poll or the
-    # reconciler may retry the same broker-confirmed order.
+    # EXIT position mutation requires explicit broker fill-occurrence evidence.
+    # Exact execution time is strongest; documented Tradier order rows may use
+    # transaction_date only as a separately-labelled order-update boundary.
+    # A later poll or the reconciler may retry the same broker-confirmed order.
     if (
         kind == "EXIT"
         and mapped in {"EXIT_FILLED", "EXIT_PARTIAL_FILL"}
-        and not result.get("filled_ts")
+        and not _usable_fill_timestamp_evidence(result)
     ):
         reason = "EXIT_FILL_TIMESTAMP_MISSING_OR_INVALID"
         payload = {
@@ -2705,7 +2816,6 @@ def process_pending_order(
                     "filled_at",
                     "filled_ts",
                     "fill_ts",
-                    "transaction_date",
                 )
                 if key in (result.get("raw") or {})
             },
@@ -2717,9 +2827,9 @@ def process_pending_order(
             decision="HOLD",
             reason_code=reason,
             explanation=(
-                "Broker confirmed an EXIT fill without an exact timezone-aware "
-                "execution timestamp; no OSM, position, proof, or runtime "
-                "projection is authorized."
+                "Broker confirmed an EXIT fill without usable timestamp-quality "
+                "evidence; no OSM, position, proof, or runtime projection is "
+                "authorized."
             ),
             result=result,
             extra_context=payload,
@@ -2756,6 +2866,10 @@ def process_pending_order(
                     fill_price=result.get("avg_fill"),
                     broker_order_id=broker_id,
                     filled_ts=result.get("filled_ts"),
+                    fill_timestamp_quality=result.get("fill_timestamp_quality"),
+                    fill_timestamp_source=result.get("fill_timestamp_source"),
+                    fill_timestamp_key=result.get("fill_timestamp_key"),
+                    broker_order_updated_at=result.get("broker_order_updated_at"),
                 )
             except Exception as exc:
                 log.error("[%s] OSM transition %s failed for %s: %s", client_id, mapped, local_id, exc)
@@ -2902,6 +3016,10 @@ def process_pending_order(
                             fill_price=result.get("avg_fill"),
                             broker_order_id=broker_id,
                             filled_ts=result.get("filled_ts"),
+                            fill_timestamp_quality=result.get("fill_timestamp_quality"),
+                            fill_timestamp_source=result.get("fill_timestamp_source"),
+                            fill_timestamp_key=result.get("fill_timestamp_key"),
+                            broker_order_updated_at=result.get("broker_order_updated_at"),
                         )
                     )
                 else:
@@ -2913,6 +3031,10 @@ def process_pending_order(
                             fill_price=result.get("avg_fill"),
                             broker_order_id=broker_id,
                             filled_ts=result.get("filled_ts"),
+                            fill_timestamp_quality=result.get("fill_timestamp_quality"),
+                            fill_timestamp_source=result.get("fill_timestamp_source"),
+                            fill_timestamp_key=result.get("fill_timestamp_key"),
+                            broker_order_updated_at=result.get("broker_order_updated_at"),
                         )
                     )
             except Exception as exc:
@@ -2972,19 +3094,16 @@ def process_pending_order(
         # the leak the September 4 2026 audit called out.
         #
         # Rules:
-        #   filled_ts present → advance OSM cumulative + converge
-        #     position exactly once, then fall through to the ordinary
-        #     terminal handling so the remainder cancels.
-        #   filled_ts missing → HOLD the whole terminalization; a
-        #     later poll or the reconciler resolves. Never fabricate
-        #     a timestamp — chronology is the whole point of #579.
+        #   usable timestamp-quality evidence → advance OSM cumulative +
+        #     converge position exactly once, then fall through to the
+        #     ordinary terminal handling so the remainder cancels.
+        #   unusable evidence → HOLD the whole terminalization; a later poll
+        #     or the reconciler resolves. Never fabricate a timestamp — the
+        #     order-update marker remains separate from execution chronology.
         #   ENTRY orders → out of scope; the entry-fill path owns that
         #     class of defect.
-        if (
-            kind == "EXIT"
-            and int(new_filled or 0) > int(prev_filled or 0)
-        ):
-            _delta = int(new_filled) - int(prev_filled)
+        if kind == "EXIT" and int(new_filled or 0) > 0:
+            _delta = max(0, int(new_filled) - int(prev_filled))
             _payload_terminal_delta = {
                 "local_order_id": local_id,
                 "broker_order_id": broker_id,
@@ -2993,10 +3112,12 @@ def process_pending_order(
                 "new_filled_qty": int(new_filled),
                 "unresolved_delta": _delta,
                 "has_filled_ts": bool(result.get("filled_ts")),
+                "fill_timestamp_quality": result.get("fill_timestamp_quality"),
+                "broker_order_updated_at": result.get("broker_order_updated_at"),
             }
-            if not result.get("filled_ts"):
+            if not _usable_fill_timestamp_evidence(result):
                 # HOLD — cannot converge without proven chronology, and
-                # cannot terminalize without losing the executed delta.
+                # cannot revalidate/replay the positive broker fill safely.
                 reason = "EXIT_TERMINAL_WITH_UNRESOLVED_EXECUTED_DELTA_HOLD"
                 log.critical("[%s] %s | %s", client_id, reason, _payload_terminal_delta)
                 audit(client_id, "CRITICAL", reason, _payload_terminal_delta)
@@ -3007,9 +3128,9 @@ def process_pending_order(
                     explanation=(
                         f"Broker returned {mapped} with cumulative executed "
                         f"quantity {new_filled} > durable applied {prev_filled} "
-                        f"but no exact broker execution timestamp. Cannot "
-                        f"terminalize (would drop the executed delta) and "
-                        f"cannot converge (would fabricate chronology). "
+                        f"but no usable broker timestamp-quality evidence. Cannot "
+                        f"revalidate/converge the positive fill or terminalize "
+                        f"safely. "
                         f"Awaiting next broker poll or reconciler pass."
                     ),
                     result=result,
@@ -3025,9 +3146,12 @@ def process_pending_order(
                         pass
                 return
 
-            # Timestamp present — advance OSM cumulative and converge
-            # the delta into the canonical position, then fall through
-            # to the ordinary terminal handling for the remainder.
+            # Timestamp-quality evidence is present — advance OSM cumulative
+            # and converge the positive cumulative fill into the canonical
+            # position, then fall through to ordinary terminal handling. The
+            # delta can be zero on a retry after an earlier OSM write; that
+            # retry still must re-run canonical convergence before the
+            # terminal remainder is accepted.
             fill_applied = False
             if osm:
                 try:
@@ -3038,8 +3162,18 @@ def process_pending_order(
                         "fill_price": result.get("avg_fill"),
                         "broker_order_id": broker_id,
                         "filled_ts": result.get("filled_ts"),
+                        "fill_timestamp_quality": result.get("fill_timestamp_quality"),
+                        "fill_timestamp_source": result.get("fill_timestamp_source"),
+                        "fill_timestamp_key": result.get("fill_timestamp_key"),
+                        "broker_order_updated_at": result.get("broker_order_updated_at"),
                     }
-                    if current_status in {"PARTIAL_FILL", "EXIT_PARTIAL_FILL"}:
+                    if _delta == 0 and current_status == "EXIT_PARTIAL_FILL":
+                        # The cumulative quantity is already durable. Do not
+                        # manufacture a second lifecycle fill update; the PM
+                        # call below repairs/reconfirms the canonical
+                        # position projection idempotently.
+                        fill_applied = True
+                    elif current_status in {"PARTIAL_FILL", "EXIT_PARTIAL_FILL"}:
                         # Same-state updates are legal only after the durable
                         # lifecycle is already partial.
                         fill_applied = bool(osm.apply_fill_update(**fill_kwargs))
@@ -3057,6 +3191,10 @@ def process_pending_order(
                                 fill_price=result.get("avg_fill"),
                                 broker_order_id=broker_id,
                                 filled_ts=result.get("filled_ts"),
+                                fill_timestamp_quality=result.get("fill_timestamp_quality"),
+                                fill_timestamp_source=result.get("fill_timestamp_source"),
+                                fill_timestamp_key=result.get("fill_timestamp_key"),
+                                broker_order_updated_at=result.get("broker_order_updated_at"),
                             )
                         )
                 except Exception as exc:

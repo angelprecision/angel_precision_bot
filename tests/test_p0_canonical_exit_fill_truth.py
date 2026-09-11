@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from ap.exit_fill_truth_guard import (
+    FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY,
     LifecycleProjectionError,
     PositionUpdateCardinalityError,
     ReconciliationIdentityError,
@@ -76,6 +77,33 @@ def test_spy_partial_exit_preserves_four_open_contracts() -> None:
     assert projection.weighted_exit_price == pytest.approx(1.253)
 
 
+def test_documented_tradier_nonexact_fill_closes_without_filled_ts() -> None:
+    projection = project_position_from_exit_fills(
+        _position(qty=2, entry=1.00),
+        [
+            {
+                "filled_qty": 2,
+                "fill_price": 1.50,
+                "filled_ts": None,
+                "meta": {
+                    "exit_fill_timestamp_quality": (
+                        FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY
+                    ),
+                    "exit_fill_timestamp_source": "tradier_transaction_date",
+                    "exit_fill_timestamp_key": "transaction_date",
+                    "broker_order_updated_at": "2026-07-17T16:01:00Z",
+                },
+            }
+        ],
+    )
+
+    assert projection.closed is True
+    assert projection.exited_qty == 2
+    assert projection.final_fill_ts is None
+    assert projection.final_observed_at == "2026-07-17T16:01:00+00:00"
+    assert projection.fill_timestamp_quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY
+
+
 def test_partial_googl_exit_does_not_falsely_close_position() -> None:
     projection = project_position_from_exit_fills(
         _position(qty=4, entry=2.75),
@@ -98,7 +126,10 @@ def test_exit_overfill_is_quarantined_not_clamped() -> None:
 
 
 def test_rows_without_positive_broker_fill_are_not_counted() -> None:
-    with pytest.raises(LifecycleProjectionError, match="no_positive_exit_fills"):
+    with pytest.raises(
+        LifecycleProjectionError,
+        match="BROKER_FILL_ECONOMICS_MISSING_OR_INVALID",
+    ):
         project_position_from_exit_fills(
             _position(qty=3, entry=2.63),
             [
@@ -142,7 +173,7 @@ def test_fill_loader_never_sweeps_unrelated_synthetic_orders() -> None:
     assert "broker-repair-%%" not in source
 
 
-def test_fill_loader_includes_exact_current_partial_row_with_null_filled_ts_only_for_matching_local_id() -> None:
+def test_fill_loader_includes_current_nonexact_partial_row_only_for_matching_local_id() -> None:
     class _Result:
         def __init__(self, rows):
             self._rows = rows
@@ -159,6 +190,12 @@ def test_fill_loader_includes_exact_current_partial_row_with_null_filled_ts_only
             "fill_price": 1.50,
             "filled_ts": None,
             "status": "EXIT_PARTIAL_FILL",
+            "meta": {
+                "exit_fill_timestamp_quality": "order_update_not_exact_execution",
+                "exit_fill_timestamp_source": "tradier_transaction_date",
+                "exit_fill_timestamp_key": "transaction_date",
+                "broker_order_updated_at": "2026-07-17T16:01:00Z",
+            },
             "contract": "SPY260717C00600000",
             "client_id": "jason@example.com",
             "kind": "EXIT",
@@ -167,11 +204,12 @@ def test_fill_loader_includes_exact_current_partial_row_with_null_filled_ts_only
         {
             "local_order_id": "exit-unrelated",
             "broker_order_id": "broker-unrelated",
-            "position_id": "position-1",
+            "position_id": "other-position",
             "filled_qty": 1,
             "fill_price": 1.60,
             "filled_ts": None,
             "status": "EXIT_PARTIAL_FILL",
+            "meta": {},
             "contract": "SPY260717C00600000",
             "client_id": "jason@example.com",
             "kind": "EXIT",
@@ -181,21 +219,16 @@ def test_fill_loader_includes_exact_current_partial_row_with_null_filled_ts_only
 
     class _Connection:
         def execute(self, sql, params):
-            assert "OR (%s <> '' AND local_order_id=%s)" in sql
-            assert "ORDER BY filled_ts ASC NULLS LAST, created_ts ASC" in sql
+            assert "OR (%s<>'' AND local_order_id=%s)" in sql
+            assert "ORDER BY created_ts ASC" in sql
             (
                 client_id,
                 contract,
                 statuses,
-                entry_ts,
-                _entry_ts_again,
-                current_local_id,
-                current_local_id_again,
                 position_id,
                 local_id_match_gate,
                 local_id_match_again,
             ) = params
-            assert current_local_id == current_local_id_again == "exit-current"
             assert local_id_match_gate == local_id_match_again == "exit-current"
             filtered = []
             for row in exit_rows:
@@ -206,12 +239,6 @@ def test_fill_loader_includes_exact_current_partial_row_with_null_filled_ts_only
                 if row["status"] not in statuses:
                     continue
                 if int(row["filled_qty"] or 0) <= 0 or row["fill_price"] is None:
-                    continue
-                timestamp_ok = entry_ts is None or (
-                    row["filled_ts"] is not None and row["filled_ts"] >= entry_ts
-                )
-                exact_current_ok = bool(current_local_id) and row["local_order_id"] == current_local_id
-                if not (timestamp_ok or exact_current_ok):
                     continue
                 identity_ok = (
                     str(row["position_id"]) == str(position_id)
@@ -228,6 +255,8 @@ def test_fill_loader_includes_exact_current_partial_row_with_null_filled_ts_only
                             "fill_price",
                             "filled_ts",
                             "status",
+                            "meta",
+                            "created_ts",
                         )
                     })
             filtered.sort(key=lambda row: ((row["filled_ts"] is None), row["filled_ts"], row["local_order_id"]))
@@ -565,7 +594,7 @@ def test_partial_fill_with_exact_filled_ts_is_reconciled_from_current_local_orde
         def execute(self, sql, params=None):
             params = params or ()
             if "SELECT local_order_id, broker_order_id, position_id, filled_qty, fill_price, filled_ts, status" in sql:
-                assert "OR (%s <> '' AND local_order_id=%s)" in sql
+                assert "OR (%s<>'' AND local_order_id=%s)" in sql
                 return _Result(rows=[
                     {
                         "local_order_id": "exit-current",

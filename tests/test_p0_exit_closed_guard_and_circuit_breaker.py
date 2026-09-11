@@ -1564,7 +1564,7 @@ def test_pr566_restart_adopts_exact_tagged_filled_order_into_original_exit_once(
                 status="filled",
                 exec_quantity=2,
                 avg_fill_price=1.25,
-                transaction_date=_RECOVERY_FILL_TS,
+                filled_at=_RECOVERY_FILL_TS,
                 tag=canonical_broker_submit_key("local-exit-566"),
             )
         ],
@@ -1593,6 +1593,10 @@ def test_pr566_restart_adopts_exact_tagged_filled_order_into_original_exit_once(
             "filled_qty": 2,
             "fill_price": 1.25,
             "filled_ts": "2026-09-04T17:07:14+00:00",
+            "fill_timestamp_quality": "exact_execution",
+            "fill_timestamp_source": "broker_response",
+            "fill_timestamp_key": "filled_at",
+            "broker_order_updated_at": None,
         },
     )
     assert hooks.order_state_machine.row["local_order_id"] == "local-exit-566"
@@ -1682,7 +1686,7 @@ def test_pr566_filled_order_wrong_tag_is_not_adopted():
                 status="filled",
                 exec_quantity=2,
                 avg_fill_price=1.25,
-                transaction_date=_RECOVERY_FILL_TS,
+                filled_at=_RECOVERY_FILL_TS,
                 tag=canonical_broker_submit_key("other-exit-566"),
             )
         ],
@@ -1709,7 +1713,7 @@ def test_pr566_filled_order_wrong_account_is_not_adopted():
                 status="filled",
                 exec_quantity=2,
                 avg_fill_price=1.25,
-                transaction_date=_RECOVERY_FILL_TS,
+                filled_at=_RECOVERY_FILL_TS,
                 account_id="other-account",
                 tag=canonical_broker_submit_key("local-exit-566"),
             )
@@ -1738,7 +1742,7 @@ def test_pr566_filled_order_wrong_occ_is_not_adopted():
                 status="filled",
                 exec_quantity=2,
                 avg_fill_price=1.25,
-                transaction_date=_RECOVERY_FILL_TS,
+                filled_at=_RECOVERY_FILL_TS,
                 tag=canonical_broker_submit_key("local-exit-566"),
             )
         ],
@@ -1766,7 +1770,7 @@ def test_pr566_multiple_tagged_filled_orders_stay_ambiguous():
                 status="filled",
                 exec_quantity=2,
                 avg_fill_price=1.25,
-                transaction_date=_RECOVERY_FILL_TS,
+                filled_at=_RECOVERY_FILL_TS,
                 tag=tag,
             ),
             _recovery_open_order(
@@ -1774,7 +1778,7 @@ def test_pr566_multiple_tagged_filled_orders_stay_ambiguous():
                 status="filled",
                 exec_quantity=2,
                 avg_fill_price=1.26,
-                transaction_date=_RECOVERY_FILL_TS,
+                filled_at=_RECOVERY_FILL_TS,
                 tag=tag,
             ),
         ],
@@ -1974,7 +1978,7 @@ def test_pr566_filled_partial_requires_exact_fill_fields_and_preserves_remaining
             "filled_qty": 1,
             "avg_fill_price": 1.25,
             "quantity": 1,
-            "transaction_date": _RECOVERY_FILL_TS,
+            "filled_at": _RECOVERY_FILL_TS,
         },
     )
     hooks = _RecoveryHooks()
@@ -2008,7 +2012,7 @@ def test_pr566_cumulative_fill_restart_applies_only_delta_once():
             "quantity": 2,
             "exec_quantity": 2,
             "avg_fill_price": 1.25,
-            "transaction_date": _RECOVERY_FILL_TS,
+            "filled_at": _RECOVERY_FILL_TS,
         },
     )
     hooks = _RecoveryHooks()
@@ -2048,7 +2052,7 @@ def test_pr566_filled_recovery_delegates_to_canonical_osm_and_dedupes():
             "quantity": 2,
             "exec_quantity": 2,
             "avg_fill_price": 1.25,
-            "transaction_date": _RECOVERY_FILL_TS,
+            "filled_at": _RECOVERY_FILL_TS,
         },
     )
     hooks = _RecoveryHooks()
@@ -2081,6 +2085,10 @@ def test_pr566_filled_recovery_delegates_to_canonical_osm_and_dedupes():
         "filled_qty": 2,
         "fill_price": 1.25,
         "filled_ts": "2026-09-04T17:07:14+00:00",
+        "fill_timestamp_quality": "exact_execution",
+        "fill_timestamp_source": "broker_response",
+        "fill_timestamp_key": "filled_at",
+        "broker_order_updated_at": None,
     }
     assert hooks.closed_calls == []
     assert hooks.partial_calls == []

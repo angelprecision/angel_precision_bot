@@ -65,6 +65,7 @@ REQUIRED_SCHEMA: dict[str, frozenset[str]] = {
         "position_id", "client_email", "closed_at", "execution_mode",
         "official_live_performance_eligible", "performance_taxonomy",
         "training_eligible", "taxonomy_reason", "quote_domain_consistent",
+        "fill_timestamp_quality",
     }),
     # PR #360 — durable EXIT ownership on positions (pending_exit_action /
     # pending_exit_reason are intentionally NOT required: the fill-truth
@@ -74,7 +75,8 @@ REQUIRED_SCHEMA: dict[str, frozenset[str]] = {
         "execution_mode",
         "exit_in_flight", "pending_exit_qty",
         "pending_exit_local_order_id", "pending_exit_broker_order_id",
-        "quantity_remaining", "contracts_exited",
+        "quantity_remaining", "contracts_exited", "exit_observed_at",
+        "exit_timestamp_quality",
     }),
     # Core order lifecycle columns referenced verbatim across OSM, exit
     # guards, reconciler, and the durable-generation reader.

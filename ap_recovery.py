@@ -42,7 +42,17 @@ from ap_entry_watcher import (
 )
 from ap.pending_trigger_classifier import is_active_materialization_in_flight
 from ap.pending_trigger_restart_recovery import _RecoveryPlan
-from ap.manual_close_reconciliation import order_filled_at
+from ap.manual_close_reconciliation import (
+    BROKER_FILL_TIMESTAMP_KEYS,
+    BROKER_FILL_TIMESTAMP_SOURCE,
+    BROKER_ORDER_UPDATED_AT_KEY,
+    BROKER_ORDER_UPDATED_AT_SOURCE,
+    FILL_TIMESTAMP_QUALITY_EXACT,
+    FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY,
+    FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+    broker_fill_timestamp_evidence,
+    order_filled_at,
+)
 
 log = logging.getLogger("ap.recovery")
 
@@ -153,6 +163,58 @@ def _extract_broker_fill_timestamp(raw: dict) -> Optional[str]:
         return None
 
 
+def _recovery_fill_timestamp_evidence(raw: dict) -> dict:
+    """Classify recovery chronology without promoting transaction_date."""
+    evidence = broker_fill_timestamp_evidence(raw)
+
+    def _iso(value):
+        if not isinstance(value, datetime):
+            return value
+        try:
+            return value.astimezone(timezone.utc).isoformat()
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    return {
+        **evidence,
+        "filled_ts": _iso(evidence.get("filled_ts")),
+        "broker_order_updated_at": _iso(
+            evidence.get("broker_order_updated_at")
+        ),
+    }
+
+
+def _usable_recovery_fill_evidence(evidence: dict) -> bool:
+    """Require either exact execution time or explicit Tradier update evidence."""
+    quality = str(evidence.get("fill_timestamp_quality") or "").strip()
+    source = str(evidence.get("fill_timestamp_source") or "").strip()
+    key = str(evidence.get("fill_timestamp_key") or "").strip()
+
+    def _aware(value) -> bool:
+        if value in (None, ""):
+            return False
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed.tzinfo is not None and parsed.utcoffset() is not None
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    if quality == FILL_TIMESTAMP_QUALITY_EXACT:
+        return (
+            _aware(evidence.get("filled_ts"))
+            and source == BROKER_FILL_TIMESTAMP_SOURCE
+            and key in BROKER_FILL_TIMESTAMP_KEYS
+        )
+    if quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY:
+        return (
+            evidence.get("filled_ts") in (None, "")
+            and _aware(evidence.get("broker_order_updated_at"))
+            and source == BROKER_ORDER_UPDATED_AT_SOURCE
+            and key == BROKER_ORDER_UPDATED_AT_KEY
+        )
+    return False
+
+
 def _write_fill_truth_blocked_meta(
     client_id: str,
     local_order_id: str,
@@ -162,6 +224,10 @@ def _write_fill_truth_blocked_meta(
     broker_status: str,
     extracted_qty,
     extracted_price,
+    fill_timestamp_quality: str = "",
+    fill_timestamp_source: str = "",
+    fill_timestamp_key: str = "",
+    broker_order_updated_at=None,
 ) -> None:
     """
     P0 (PR #259): durable diagnostic when recovery REFUSES to mark a
@@ -184,15 +250,25 @@ def _write_fill_truth_blocked_meta(
     try:
         from ap.db import conn as _conn, run_with_retry as _rwr
 
+        _block = {
+            "reason": reason,
+            "broker_order_id": str(broker_order_id or ""),
+            "broker_status_raw": str(broker_status or ""),
+            "extracted_filled_qty": extracted_qty,
+            "extracted_avg_fill_price": extracted_price,
+            "blocked_at": datetime.now(timezone.utc).isoformat(),
+            "recorded_by": "ap_recovery",
+        }
+        if fill_timestamp_quality:
+            _block.update({
+                "fill_timestamp_quality": str(fill_timestamp_quality),
+                "fill_timestamp_source": str(fill_timestamp_source or ""),
+                "fill_timestamp_key": str(fill_timestamp_key or ""),
+                "broker_order_updated_at": broker_order_updated_at,
+            })
         _patch = json.dumps({
             "recovery_fill_truth_block": {
-                "reason": reason,
-                "broker_order_id": str(broker_order_id or ""),
-                "broker_status_raw": str(broker_status or ""),
-                "extracted_filled_qty": extracted_qty,
-                "extracted_avg_fill_price": extracted_price,
-                "blocked_at": datetime.now(timezone.utc).isoformat(),
-                "recorded_by": "ap_recovery",
+                **_block,
             }
         })
 
@@ -1071,18 +1147,19 @@ class APStartupRecovery:
             if broker_status in BROKER_FILLED:
                 filled_qty = _extract_explicit_fill_qty(broker_raw)
                 avg_fill   = _extract_avg_fill_price(broker_raw)
-                filled_ts  = _extract_broker_fill_timestamp(broker_raw)
+                timestamp_evidence = _recovery_fill_timestamp_evidence(broker_raw)
+                filled_ts = timestamp_evidence.get("filled_ts")
                 if (
                     not filled_qty
                     or filled_qty <= 0
                     or not avg_fill
                     or avg_fill <= 0
-                    or not filled_ts
+                    or not _usable_recovery_fill_evidence(timestamp_evidence)
                 ):
                     msg = (
                         f"RECOVERY_EXIT_FILL_TRUTH_MISSING local={local_id} "
                         f"broker={broker_oid} pos={pos_id} broker_status={broker_status} "
-                        "missing explicit filled_qty/avg_fill/exact_filled_ts; "
+                        "missing explicit filled_qty/avg_fill/usable_timestamp_evidence; "
                         "keeping CLOSING for reconciler/fill_monitor"
                     )
                     log.critical("[%s] %s", self.client_id, msg)
@@ -1095,6 +1172,18 @@ class APStartupRecovery:
                         broker_status=broker_status,
                         extracted_qty=filled_qty,
                         extracted_price=avg_fill,
+                        fill_timestamp_quality=timestamp_evidence.get(
+                            "fill_timestamp_quality"
+                        ),
+                        fill_timestamp_source=timestamp_evidence.get(
+                            "fill_timestamp_source"
+                        ),
+                        fill_timestamp_key=timestamp_evidence.get(
+                            "fill_timestamp_key"
+                        ),
+                        broker_order_updated_at=timestamp_evidence.get(
+                            "broker_order_updated_at"
+                        ),
                     )
                     continue
 
@@ -1110,6 +1199,18 @@ class APStartupRecovery:
                         filled_qty=filled_qty,
                         fill_price=avg_fill,
                         filled_ts=filled_ts,
+                        fill_timestamp_quality=timestamp_evidence.get(
+                            "fill_timestamp_quality"
+                        ),
+                        fill_timestamp_source=timestamp_evidence.get(
+                            "fill_timestamp_source"
+                        ),
+                        fill_timestamp_key=timestamp_evidence.get(
+                            "fill_timestamp_key"
+                        ),
+                        broker_order_updated_at=timestamp_evidence.get(
+                            "broker_order_updated_at"
+                        ),
                     )
                 except Exception as e:
                     log.error("[%s] RECOVERY: %s transition failed: %s",
@@ -1133,6 +1234,18 @@ class APStartupRecovery:
                     "filled_qty": persisted_order["filled_qty"],
                     "fill_price": persisted_order["fill_price"],
                     "filled_ts": persisted_order["filled_ts"],
+                    "fill_timestamp_quality": timestamp_evidence.get(
+                        "fill_timestamp_quality"
+                    ),
+                    "fill_timestamp_source": timestamp_evidence.get(
+                        "fill_timestamp_source"
+                    ),
+                    "fill_timestamp_key": timestamp_evidence.get(
+                        "fill_timestamp_key"
+                    ),
+                    "broker_order_updated_at": timestamp_evidence.get(
+                        "broker_order_updated_at"
+                    ),
                 }
                 try:
                     reconcile_confirmed_exit_fill(persisted_order, canonical_result)
@@ -1172,7 +1285,8 @@ class APStartupRecovery:
                 # convergence applied — check quantity_remaining first.
                 exec_qty   = _extract_explicit_fill_qty(broker_raw)
                 exec_price = _extract_avg_fill_price(broker_raw)
-                exec_ts    = _extract_broker_fill_timestamp(broker_raw)
+                exec_timestamp_evidence = _recovery_fill_timestamp_evidence(broker_raw)
+                exec_ts = exec_timestamp_evidence.get("filled_ts")
                 durable_qty = int((exit_order or {}).get("filled_qty") or 0)
 
                 if exec_qty and exec_qty > 0:
@@ -1194,14 +1308,22 @@ class APStartupRecovery:
                         continue
 
                     # Broker reports executed contracts that are not yet
-                    # durably applied. Require exact economics.
-                    if not exec_ts or not exec_price or exec_price <= 0:
+                    # durably applied. Require valid economics and usable
+                    # chronology evidence; transaction_date is an observation
+                    # boundary, never an exact execution timestamp.
+                    if (
+                        not exec_price
+                        or exec_price <= 0
+                        or not _usable_recovery_fill_evidence(
+                            exec_timestamp_evidence
+                        )
+                    ):
                         msg = (
                             f"RECOVERY_TERMINAL_EXECUTED_DELTA_HOLD "
                             f"local={local_id} pos={pos_id} "
                             f"broker_status={broker_status} "
                             f"exec_qty={exec_qty} durable_qty={durable_qty} "
-                            "missing exec_ts/exec_price — holding; "
+                            "missing exec_price/usable_timestamp_evidence — holding; "
                             "reconciler/fill_monitor will retry"
                         )
                         log.critical("[%s] %s", self.client_id, msg)
@@ -1220,7 +1342,15 @@ class APStartupRecovery:
                         result.setdefault("errors", []).append(msg)
                         continue
 
-                    if exec_qty > durable_qty:
+                    should_stamp_evidence = (
+                        exec_qty > durable_qty
+                        or (
+                            exec_qty == durable_qty
+                            and str((exit_order or {}).get("status") or "").upper()
+                            == "EXIT_PARTIAL_FILL"
+                        )
+                    )
+                    if should_stamp_evidence:
                         # Persist the executed partial fill, then require the
                         # OSM transition to prove that the durable row reached
                         # EXIT_PARTIAL_FILL. OSM may write the row and still
@@ -1234,6 +1364,18 @@ class APStartupRecovery:
                                     filled_qty=exec_qty,
                                     fill_price=exec_price,
                                     filled_ts=exec_ts,
+                                    fill_timestamp_quality=exec_timestamp_evidence.get(
+                                        "fill_timestamp_quality"
+                                    ),
+                                    fill_timestamp_source=exec_timestamp_evidence.get(
+                                        "fill_timestamp_source"
+                                    ),
+                                    fill_timestamp_key=exec_timestamp_evidence.get(
+                                        "fill_timestamp_key"
+                                    ),
+                                    broker_order_updated_at=exec_timestamp_evidence.get(
+                                        "broker_order_updated_at"
+                                    ),
                                 )
                             )
                         except Exception as e:

@@ -95,13 +95,21 @@ DURABLE_EXIT_FILLED_STATUSES = frozenset({"EXIT_FILLED", "EXIT_PARTIAL_FILL"})
 ACTIVE_POSITION_STATUSES = ("OPEN", "CLOSING", "PARTIAL", "ACTIVE")
 EXTERNAL_LOCAL_ID_PREFIX = "external-exit:"
 BROKER_FILL_TIMESTAMP_SOURCE = "broker_response"
+# Only fields that identify execution chronology belong in this authority
+# list. Tradier's transaction_date is the order's last-updated time, not a
+# fill timestamp. It is handled below as explicitly non-exact order-update
+# evidence; it must never populate filled_ts.
 BROKER_FILL_TIMESTAMP_KEYS = (
     "last_fill_date",
     "filled_at",
     "filled_ts",
     "fill_ts",
-    "transaction_date",
 )
+FILL_TIMESTAMP_QUALITY_EXACT = "exact_execution"
+FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY = "order_update_not_exact_execution"
+FILL_TIMESTAMP_QUALITY_UNAVAILABLE = "unavailable"
+BROKER_ORDER_UPDATED_AT_SOURCE = "tradier_transaction_date"
+BROKER_ORDER_UPDATED_AT_KEY = "transaction_date"
 
 
 def _terminal_position_statuses() -> list[str]:
@@ -868,8 +876,9 @@ def order_filled_qty(order: dict) -> int:
         qty = positive_int(order.get(key))
         if qty > 0:
             return qty
-    if order_status(order) == "filled":
-        return positive_int(order.get("quantity") or order.get("qty"))
+    # Requested order quantity is not proof that any contracts executed. The
+    # documented Tradier order response supplies exec_quantity for this
+    # authority; missing execution quantity must remain unresolved.
     return 0
 
 
@@ -900,12 +909,6 @@ def _broker_fill_timestamp(order: dict) -> tuple[datetime | None, str | None]:
         raw = order.get(key)
         if raw is None or raw == "":
             continue
-        # Tradier documents transaction_date as the order's last-updated time,
-        # so it is fill authority only for a terminal FILLED order. Never use
-        # it for working/partial/lifecycle-only rows, and never fall back to
-        # update_date or updated_at.
-        if key == "transaction_date" and order_status(order) != "filled":
-            continue
         parsed = parse_broker_fill_timestamp(raw)
         if parsed is None:
             # A present but malformed execution field is unsafe. Do not
@@ -925,6 +928,85 @@ def order_filled_at(order: dict) -> datetime | None:
     return _broker_fill_timestamp(order)[0]
 
 
+def broker_fill_timestamp_evidence(order: dict) -> dict:
+    """Classify broker fill chronology without conflating order updates and fills.
+
+    The documented Tradier order response exposes ``transaction_date`` as the
+    order's last-update time. That timestamp is useful to retain for audit and
+    liveness bounds, but it cannot establish the exact execution instant. A
+    caller may consume the broker-proven quantity/price only when this helper
+    returns an explicit quality marker; missing or malformed chronology stays
+    fail-closed.
+
+    ``filled_ts`` is populated only for the pre-existing exact execution
+    timestamp authority fields. ``broker_order_updated_at`` is always a
+    separate field and is never an execution timestamp.
+    """
+    if not isinstance(order, dict):
+        return {
+            "filled_ts": None,
+            "fill_timestamp_quality": FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+            "fill_timestamp_source": "",
+            "fill_timestamp_key": "",
+            "broker_order_updated_at": None,
+            "reason": "order_not_mapping",
+        }
+
+    exact_filled_at, exact_key = _broker_fill_timestamp(order)
+    raw_updated_at = order.get(BROKER_ORDER_UPDATED_AT_KEY)
+    updated_at = (
+        parse_broker_fill_timestamp(raw_updated_at)
+        if raw_updated_at not in (None, "")
+        else None
+    )
+
+    if exact_filled_at is not None and exact_key is not None:
+        return {
+            "filled_ts": exact_filled_at,
+            "fill_timestamp_quality": FILL_TIMESTAMP_QUALITY_EXACT,
+            "fill_timestamp_source": BROKER_FILL_TIMESTAMP_SOURCE,
+            "fill_timestamp_key": exact_key,
+            "broker_order_updated_at": updated_at,
+            "reason": "exact_execution_timestamp",
+        }
+
+    exact_field_present = any(
+        order.get(key) not in (None, "") for key in BROKER_FILL_TIMESTAMP_KEYS
+    )
+    if exact_field_present:
+        return {
+            "filled_ts": None,
+            "fill_timestamp_quality": FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+            "fill_timestamp_source": "",
+            "fill_timestamp_key": "",
+            "broker_order_updated_at": updated_at,
+            "reason": "exact_execution_timestamp_malformed_or_conflicting",
+        }
+
+    if raw_updated_at not in (None, "") and updated_at is not None:
+        return {
+            "filled_ts": None,
+            "fill_timestamp_quality": FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY,
+            "fill_timestamp_source": BROKER_ORDER_UPDATED_AT_SOURCE,
+            "fill_timestamp_key": BROKER_ORDER_UPDATED_AT_KEY,
+            "broker_order_updated_at": updated_at,
+            "reason": "order_update_timestamp_only",
+        }
+
+    return {
+        "filled_ts": None,
+        "fill_timestamp_quality": FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+        "fill_timestamp_source": "",
+        "fill_timestamp_key": "",
+        "broker_order_updated_at": updated_at,
+        "reason": (
+            "order_update_timestamp_malformed"
+            if raw_updated_at not in (None, "")
+            else "fill_timestamp_unavailable"
+        ),
+    }
+
+
 def normalize_broker_orders(raw_orders: Any) -> list[dict]:
     if raw_orders is None:
         return []
@@ -939,13 +1021,19 @@ def _normalize_fill(order: dict) -> dict | None:
     broker_order_id = order_id(order)
     filled_qty = order_filled_qty(order)
     fill_price = order_fill_price(order)
-    filled_at, timestamp_key = _broker_fill_timestamp(order)
+    timestamp_evidence = broker_fill_timestamp_evidence(order)
+    filled_at = timestamp_evidence.get("filled_ts")
+    timestamp_quality = timestamp_evidence.get("fill_timestamp_quality")
+    timestamp_source = timestamp_evidence.get("fill_timestamp_source")
+    timestamp_key = timestamp_evidence.get("fill_timestamp_key")
+    broker_order_updated_at = timestamp_evidence.get("broker_order_updated_at")
     if (
         not broker_order_id
         or filled_qty <= 0
         or fill_price <= 0
-        or filled_at is None
-        or timestamp_key is None
+        or timestamp_quality == FILL_TIMESTAMP_QUALITY_UNAVAILABLE
+        or not timestamp_source
+        or not timestamp_key
     ):
         return None
     return {
@@ -953,12 +1041,37 @@ def _normalize_fill(order: dict) -> dict | None:
         "filled_qty": filled_qty,
         "fill_price": fill_price,
         "filled_at": filled_at,
-        "fill_timestamp_source": BROKER_FILL_TIMESTAMP_SOURCE,
+        "fill_timestamp_quality": timestamp_quality,
+        "fill_timestamp_source": timestamp_source,
         "fill_timestamp_key": timestamp_key,
+        "broker_order_updated_at": broker_order_updated_at,
         "created_at": order_created_at(order),
         "raw_status": order_status(order),
         "raw_side": order_side(order),
     }
+
+
+def _fill_sort_timestamp(fill: dict) -> datetime | None:
+    """Return an ordering timestamp without upgrading order-update time."""
+    return fill.get("filled_at") or fill.get("broker_order_updated_at")
+
+
+def _fill_timestamp_quality(fill: dict) -> str:
+    quality = str(fill.get("fill_timestamp_quality") or "").strip()
+    if quality:
+        return quality
+    # Rows created before the quality marker was introduced are exact only
+    # when their durable filled_at value and broker-response provenance are
+    # both present; callers validate those fields before using this fallback.
+    if (
+        isinstance(fill.get("filled_at"), datetime)
+        and str(fill.get("fill_timestamp_source") or "").strip()
+        == BROKER_FILL_TIMESTAMP_SOURCE
+        and str(fill.get("fill_timestamp_key") or "").strip()
+        in BROKER_FILL_TIMESTAMP_KEYS
+    ):
+        return FILL_TIMESTAMP_QUALITY_EXACT
+    return FILL_TIMESTAMP_QUALITY_UNAVAILABLE
 
 
 
@@ -979,10 +1092,13 @@ def _validate_durable_fills(
       * broker_order_id: nonempty
       * filled_qty > 0
       * fill_price > 0
-      * filled_at is a datetime instance (not None, not string, not epoch)
-      * fill_timestamp_source is exactly broker_response
-      * fill_timestamp_key is an accepted broker fill/event field
-      * filled_at >= position entry timestamp (when entry is known)
+      * exact rows have filled_at as a timezone-aware datetime, with
+        broker_response provenance and an accepted exact field
+      * documented Tradier order-update rows have no filled_at and instead
+        carry a timezone-aware broker_order_updated_at plus the explicit
+        transaction_date provenance marker
+      * exact filled_at, or non-exact broker_order_updated_at, is not older
+        than position entry (when entry is known)
       * db_status: nonempty AND in {EXIT_FILLED, EXIT_PARTIAL_FILL}
       * db_contract: nonempty AND exactly equals position contract
       * db_direction: nonempty AND in {CALL, PUT} AND equals position direction
@@ -1030,8 +1146,10 @@ def _validate_durable_fills(
         filled_qty = positive_int(f.get("filled_qty"))
         fill_price = positive_float(f.get("fill_price"))
         filled_at = f.get("filled_at")
+        timestamp_quality = _fill_timestamp_quality(f)
         timestamp_source = str(f.get("fill_timestamp_source") or "").strip()
         timestamp_key = str(f.get("fill_timestamp_key") or "").strip()
+        broker_order_updated_at = f.get("broker_order_updated_at")
 
         if not bid:
             log.warning(
@@ -1046,34 +1164,61 @@ def _validate_durable_fills(
                 client_id, position_id, bid, filled_qty, fill_price,
             )
             continue
-        if not isinstance(filled_at, datetime):
+        if timestamp_quality == FILL_TIMESTAMP_QUALITY_EXACT:
+            try:
+                timestamp_is_aware = (
+                    isinstance(filled_at, datetime)
+                    and filled_at.tzinfo is not None
+                    and filled_at.utcoffset() is not None
+                )
+            except Exception:
+                timestamp_is_aware = False
+            if not timestamp_is_aware:
+                log.warning(
+                    "[%s] MANUAL_CLOSE_DURABLE_FILL_TIMESTAMP_INVALID pos=%s "
+                    "broker_id=%s filled_at_type=%s — rejected",
+                    client_id, position_id, bid, type(filled_at).__name__,
+                )
+                continue
+            if (
+                timestamp_source != BROKER_FILL_TIMESTAMP_SOURCE
+                or timestamp_key not in BROKER_FILL_TIMESTAMP_KEYS
+            ):
+                log.warning(
+                    "[%s] MANUAL_CLOSE_DURABLE_FILL_TIMESTAMP_PROVENANCE_INVALID "
+                    "pos=%s broker_id=%s source=%r key=%r — rejected",
+                    client_id, position_id, bid, timestamp_source, timestamp_key,
+                )
+                continue
+            chronology_at = filled_at
+        elif timestamp_quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY:
+            try:
+                update_is_aware = (
+                    isinstance(broker_order_updated_at, datetime)
+                    and broker_order_updated_at.tzinfo is not None
+                    and broker_order_updated_at.utcoffset() is not None
+                )
+            except Exception:
+                update_is_aware = False
+            if (
+                filled_at is not None
+                or not update_is_aware
+                or timestamp_source != BROKER_ORDER_UPDATED_AT_SOURCE
+                or timestamp_key != BROKER_ORDER_UPDATED_AT_KEY
+            ):
+                log.warning(
+                    "[%s] MANUAL_CLOSE_DURABLE_FILL_ORDER_UPDATE_PROVENANCE_INVALID "
+                    "pos=%s broker_id=%s source=%r key=%r updated_at=%r — rejected",
+                    client_id, position_id, bid, timestamp_source, timestamp_key,
+                    broker_order_updated_at,
+                )
+                continue
+            chronology_at = broker_order_updated_at
+        else:
             log.warning(
-                "[%s] MANUAL_CLOSE_DURABLE_FILL_TIMESTAMP_INVALID pos=%s "
-                "broker_id=%s filled_at_type=%s — rejected",
-                client_id, position_id, bid, type(filled_at).__name__,
-            )
-            continue
-        try:
-            timestamp_is_aware = (
-                filled_at.tzinfo is not None and filled_at.utcoffset() is not None
-            )
-        except Exception:
-            timestamp_is_aware = False
-        if not timestamp_is_aware:
-            log.warning(
-                "[%s] MANUAL_CLOSE_DURABLE_FILL_TIMESTAMP_NAIVE pos=%s "
-                "broker_id=%s — rejected",
-                client_id, position_id, bid,
-            )
-            continue
-        if (
-            timestamp_source != BROKER_FILL_TIMESTAMP_SOURCE
-            or timestamp_key not in BROKER_FILL_TIMESTAMP_KEYS
-        ):
-            log.warning(
-                "[%s] MANUAL_CLOSE_DURABLE_FILL_TIMESTAMP_PROVENANCE_INVALID "
-                "pos=%s broker_id=%s source=%r key=%r — rejected",
-                client_id, position_id, bid, timestamp_source, timestamp_key,
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_TIMESTAMP_QUALITY_INVALID "
+                "pos=%s broker_id=%s quality=%r — rejected",
+                client_id, position_id, bid, timestamp_quality,
             )
             continue
         if not db_status or db_status not in DURABLE_EXIT_FILLED_STATUSES:
@@ -1118,18 +1263,18 @@ def _validate_durable_fills(
                 client_id, position_id, bid, pos_direction, db_direction,
             )
             continue
-        if opened_at is not None and filled_at < opened_at:
+        if opened_at is not None and chronology_at < opened_at:
             log.warning(
                 "[%s] MANUAL_CLOSE_DURABLE_FILL_TIMESTAMP_STALE pos=%s "
-                "broker_id=%s fill_ts=%s entry_ts=%s — rejected",
-                client_id, position_id, bid, filled_at, opened_at,
+                "broker_id=%s chronology=%s quality=%s entry_ts=%s — rejected",
+                client_id, position_id, bid, chronology_at, timestamp_quality, opened_at,
             )
             continue
-        if (filled_at - detected_at).total_seconds() > MANUAL_CLOSE_FUTURE_SKEW_SEC:
+        if (chronology_at - detected_at).total_seconds() > MANUAL_CLOSE_FUTURE_SKEW_SEC:
             log.warning(
                 "[%s] MANUAL_CLOSE_DURABLE_FILL_TIMESTAMP_FUTURE pos=%s "
-                "broker_id=%s fill_ts=%s detected_at=%s — rejected",
-                client_id, position_id, bid, filled_at, detected_at,
+                "broker_id=%s chronology=%s quality=%s detected_at=%s — rejected",
+                client_id, position_id, bid, chronology_at, timestamp_quality, detected_at,
             )
             continue
         valid.append(f)
@@ -1145,7 +1290,7 @@ def select_external_close_fills(
     adopted_fills: list[dict] | None = None,
     detected_at: datetime,
 ) -> tuple[dict | None, str]:
-    """Pick the exact broker fill(s) that closed a missing position.
+    """Pick broker fill(s) that closed a missing position.
 
     Distinguishes three categories of matching orders:
 
@@ -1211,9 +1356,12 @@ def select_external_close_fills(
         normalized = _normalize_fill(order)
         if normalized is None:
             continue
-        if normalized["filled_at"] < opened_at:
+        chronology_at = _fill_sort_timestamp(normalized)
+        if chronology_at is None:
             continue
-        if (normalized["filled_at"] - detected_at).total_seconds() > MANUAL_CLOSE_FUTURE_SKEW_SEC:
+        if chronology_at < opened_at:
+            continue
+        if (chronology_at - detected_at).total_seconds() > MANUAL_CLOSE_FUTURE_SKEW_SEC:
             continue
 
         broker_order_id = normalized["broker_order_id"]
@@ -1231,14 +1379,22 @@ def select_external_close_fills(
     if bot_hit:
         return None, "bot_owned_exit_order_present"
 
-    # Dedupe both sets by broker_order_id, keeping the latest filled_at row.
+    # Dedupe both sets by broker_order_id, keeping the latest broker chronology
+    # available. For a documented Tradier row this is explicitly order-update
+    # chronology, never an execution timestamp.
     def _dedupe(rows: list[dict]) -> list[dict]:
         best: dict[str, dict] = {}
         for r in rows:
             cur = best.get(r["broker_order_id"])
-            if cur is None or r["filled_at"] > cur["filled_at"]:
+            if cur is None or (_fill_sort_timestamp(r) or datetime.min.replace(tzinfo=timezone.utc)) > (
+                _fill_sort_timestamp(cur) or datetime.min.replace(tzinfo=timezone.utc)
+            ):
                 best[r["broker_order_id"]] = r
-        return sorted(best.values(), key=lambda r: r["filled_at"])
+        return sorted(
+            best.values(),
+            key=lambda r: _fill_sort_timestamp(r)
+            or datetime.min.replace(tzinfo=timezone.utc),
+        )
 
     # Dedupe: adopted_hits come from DB rows; external_fills from broker orders.
     adopted_hits = _dedupe(adopted_hits)
@@ -1255,7 +1411,11 @@ def select_external_close_fills(
 
     # Weighted aggregate covers BOTH adopted + new — that's the real
     # weighted broker truth for this position's close.
-    all_fills = sorted(adopted_hits + external_fills, key=lambda r: r["filled_at"])
+    all_fills = sorted(
+        adopted_hits + external_fills,
+        key=lambda r: _fill_sort_timestamp(r)
+        or datetime.min.replace(tzinfo=timezone.utc),
+    )
     weighted_notional = sum(
         float(f["fill_price"]) * int(f["filled_qty"]) for f in all_fills
     )
@@ -1263,14 +1423,46 @@ def select_external_close_fills(
     if average_fill <= 0:
         return None, "external_fill_price_invalid"
 
+    all_exact = all(
+        _fill_timestamp_quality(fill) == FILL_TIMESTAMP_QUALITY_EXACT
+        for fill in all_fills
+    )
+    final_fill = all_fills[-1]
+    final_filled_at = final_fill.get("filled_at") if all_exact else None
+    final_updated_at = max(
+        (
+            chronology
+            for chronology in (
+                fill.get("broker_order_updated_at") for fill in all_fills
+            )
+            if isinstance(chronology, datetime)
+        ),
+        default=None,
+    )
+    aggregate_quality = (
+        FILL_TIMESTAMP_QUALITY_EXACT
+        if all_exact
+        else FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY
+    )
     return {
         "fills": external_fills,          # only NEW fills need adoption
         "adopted_fills": adopted_hits,    # already durable; do not re-insert
         "all_fills": all_fills,           # aggregate view for the finalizer
         "filled_qty": required_qty,
         "fill_price": round(average_fill, 6),
-        "filled_ts": all_fills[-1]["filled_at"].isoformat(),
-        "broker_order_id": all_fills[-1]["broker_order_id"],
+        "filled_ts": final_filled_at.isoformat() if final_filled_at else None,
+        "fill_timestamp_quality": aggregate_quality,
+        "fill_timestamp_source": (
+            BROKER_FILL_TIMESTAMP_SOURCE
+            if all_exact
+            else BROKER_ORDER_UPDATED_AT_SOURCE
+        ),
+        "fill_timestamp_key": (
+            final_fill.get("fill_timestamp_key") if all_exact
+            else BROKER_ORDER_UPDATED_AT_KEY
+        ),
+        "broker_order_updated_at": final_updated_at,
+        "broker_order_id": final_fill["broker_order_id"],
         "broker_order_ids": [r["broker_order_id"] for r in all_fills],
     }, "exact_external_broker_fill"
 
@@ -1378,29 +1570,58 @@ def load_manual_close_state(
                     timestamp_key = str(
                         metadata.get("exit_fill_timestamp_key") or ""
                     ).strip()
-                    if (
-                        timestamp_source != BROKER_FILL_TIMESTAMP_SOURCE
-                        or timestamp_key not in BROKER_FILL_TIMESTAMP_KEYS
-                    ):
-                        # Legacy/adulterated external rows without an exact
-                        # broker timestamp binding are not recovery truth.
+                    timestamp_quality = str(
+                        metadata.get("exit_fill_timestamp_quality") or ""
+                    ).strip()
+                    filled_at = parse_broker_fill_timestamp(row.get("filled_ts"))
+                    broker_order_updated_at = parse_broker_fill_timestamp(
+                        metadata.get("broker_order_updated_at")
+                    )
+                    if not timestamp_quality and filled_at is not None:
+                        # Legacy external rows predate the explicit quality
+                        # marker. Their exact broker-response provenance is
+                        # sufficient to retain the historical exact contract.
+                        timestamp_quality = FILL_TIMESTAMP_QUALITY_EXACT
+                        timestamp_source = (
+                            timestamp_source or BROKER_FILL_TIMESTAMP_SOURCE
+                        )
+                        timestamp_key = timestamp_key or "filled_ts"
+                    if timestamp_quality == FILL_TIMESTAMP_QUALITY_EXACT:
+                        valid_timestamp = (
+                            filled_at is not None
+                            and timestamp_source == BROKER_FILL_TIMESTAMP_SOURCE
+                            and timestamp_key in BROKER_FILL_TIMESTAMP_KEYS
+                        )
+                    elif timestamp_quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY:
+                        valid_timestamp = (
+                            filled_at is None
+                            and broker_order_updated_at is not None
+                            and timestamp_source == BROKER_ORDER_UPDATED_AT_SOURCE
+                            and timestamp_key == BROKER_ORDER_UPDATED_AT_KEY
+                        )
+                    else:
+                        valid_timestamp = False
+                    if not valid_timestamp:
+                        # Legacy/adulterated external rows without a complete
+                        # timestamp-quality binding are not recovery truth.
                         continue
                     filled_qty = positive_int(row.get("filled_qty"))
                     fill_price = positive_float(row.get("fill_price"))
-                    filled_at = parse_broker_fill_timestamp(row.get("filled_ts"))
                     db_contract = str(row.get("contract") or "").upper().strip()
                     db_direction = str(row.get("direction") or "").upper().strip()
-                    if filled_qty > 0 and fill_price > 0 and filled_at is not None:
+                    if filled_qty > 0 and fill_price > 0:
                         fill_dict: dict = {
                             "broker_order_id": broker_order_id,
                             "filled_qty": filled_qty,
                             "fill_price": fill_price,
                             "filled_at": filled_at,
+                            "fill_timestamp_quality": timestamp_quality,
                             "created_at": None,
                             "raw_status": row_status,
                             "raw_side": "sell_to_close",
                             "fill_timestamp_source": timestamp_source,
                             "fill_timestamp_key": timestamp_key,
+                            "broker_order_updated_at": broker_order_updated_at,
                             # DB-sourced identity fields for cross-position validation.
                             "db_contract": db_contract,
                             "db_direction": db_direction,
@@ -1521,6 +1742,52 @@ def _row_matches_expected(
         fill.get("fill_timestamp_source") or ""
     ).strip()
     expected_timestamp_key = str(fill.get("fill_timestamp_key") or "").strip()
+    expected_timestamp_quality = _fill_timestamp_quality(fill)
+    actual_filled_at = parse_broker_fill_timestamp(row.get("filled_ts"))
+    actual_updated_at = parse_broker_fill_timestamp(
+        metadata.get("broker_order_updated_at")
+    )
+    actual_timestamp_quality = str(
+        metadata.get("exit_fill_timestamp_quality") or ""
+    ).strip()
+    actual_timestamp_source = str(
+        metadata.get("exit_fill_timestamp_source") or ""
+    ).strip()
+    actual_timestamp_key = str(
+        metadata.get("exit_fill_timestamp_key") or ""
+    ).strip()
+    legacy_exact_provenance = (
+        not actual_timestamp_quality
+        and actual_filled_at is not None
+        and not actual_timestamp_source
+        and not actual_timestamp_key
+    )
+    if not actual_timestamp_quality and actual_filled_at is not None:
+        actual_timestamp_quality = FILL_TIMESTAMP_QUALITY_EXACT
+        actual_timestamp_source = (
+            actual_timestamp_source or BROKER_FILL_TIMESTAMP_SOURCE
+        )
+        actual_timestamp_key = actual_timestamp_key or "filled_ts"
+    timestamp_match = (
+        expected_timestamp_quality == FILL_TIMESTAMP_QUALITY_EXACT
+        and actual_timestamp_quality == FILL_TIMESTAMP_QUALITY_EXACT
+        and actual_filled_at == parse_broker_fill_timestamp(fill.get("filled_at"))
+    ) or (
+        expected_timestamp_quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY
+        and actual_timestamp_quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY
+        and actual_filled_at is None
+        and actual_updated_at == parse_broker_fill_timestamp(
+            fill.get("broker_order_updated_at")
+        )
+    )
+    timestamp_provenance_match = (
+        actual_timestamp_source == expected_timestamp_source
+        and actual_timestamp_key == expected_timestamp_key
+    ) or (
+        legacy_exact_provenance
+        and expected_timestamp_quality == FILL_TIMESTAMP_QUALITY_EXACT
+        and timestamp_match
+    )
     return bool(
         str(row.get("client_id") or "").strip().lower() == client_id.lower()
         and str(row.get("position_id") or "").strip() == str(position.get("id") or "").strip()
@@ -1534,12 +1801,18 @@ def _row_matches_expected(
         and positive_int(row.get("filled_qty")) == int(fill["filled_qty"])
         and abs(actual_fill_price - float(fill["fill_price"])) < 0.000001
         and actual_mode == execution_mode
-        and str(metadata.get("exit_fill_timestamp_source") or "").strip()
-        == expected_timestamp_source
-        and str(metadata.get("exit_fill_timestamp_key") or "").strip()
-        == expected_timestamp_key
-        and expected_timestamp_source == BROKER_FILL_TIMESTAMP_SOURCE
-        and expected_timestamp_key in BROKER_FILL_TIMESTAMP_KEYS
+        and timestamp_provenance_match
+        and timestamp_match
+        and (
+            (
+                expected_timestamp_source == BROKER_FILL_TIMESTAMP_SOURCE
+                and expected_timestamp_key in BROKER_FILL_TIMESTAMP_KEYS
+            )
+            or (
+                expected_timestamp_source == BROKER_ORDER_UPDATED_AT_SOURCE
+                and expected_timestamp_key == BROKER_ORDER_UPDATED_AT_KEY
+            )
+        )
     )
 
 
@@ -1592,18 +1865,32 @@ def adopt_external_exit_fills(
                 filled_qty = positive_int(fill.get("filled_qty"))
                 fill_price = positive_float(fill.get("fill_price"))
                 filled_at = parse_broker_fill_timestamp(fill.get("filled_at"))
+                timestamp_quality = _fill_timestamp_quality(fill)
                 created_at = parse_timestamp(fill.get("created_at"))
+                broker_order_updated_at = parse_broker_fill_timestamp(
+                    fill.get("broker_order_updated_at")
+                )
                 timestamp_source = str(
                     fill.get("fill_timestamp_source") or ""
                 ).strip()
                 timestamp_key = str(fill.get("fill_timestamp_key") or "").strip()
+                valid_timestamp = (
+                    timestamp_quality == FILL_TIMESTAMP_QUALITY_EXACT
+                    and filled_at is not None
+                    and timestamp_source == BROKER_FILL_TIMESTAMP_SOURCE
+                    and timestamp_key in BROKER_FILL_TIMESTAMP_KEYS
+                ) or (
+                    timestamp_quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY
+                    and filled_at is None
+                    and broker_order_updated_at is not None
+                    and timestamp_source == BROKER_ORDER_UPDATED_AT_SOURCE
+                    and timestamp_key == BROKER_ORDER_UPDATED_AT_KEY
+                )
                 if (
                     not broker_order_id
                     or filled_qty <= 0
                     or fill_price <= 0
-                    or filled_at is None
-                    or timestamp_source != BROKER_FILL_TIMESTAMP_SOURCE
-                    or timestamp_key not in BROKER_FILL_TIMESTAMP_KEYS
+                    or not valid_timestamp
                 ):
                     raise RuntimeError("external_exit_adoption_fill_invalid")
 
@@ -1619,8 +1906,13 @@ def adopt_external_exit_fills(
                         "position_id": position_id,
                         "client_id": client_id,
                         "execution_mode": execution_mode,
+                        "exit_fill_timestamp_quality": timestamp_quality,
                         "exit_fill_timestamp_source": timestamp_source,
                         "exit_fill_timestamp_key": timestamp_key,
+                        "broker_order_updated_at": (
+                            broker_order_updated_at.isoformat()
+                            if broker_order_updated_at is not None else None
+                        ),
                     },
                     separators=(",", ":"),
                     sort_keys=True,
@@ -1693,7 +1985,7 @@ def adopt_external_exit_fills(
                         filled_qty,
                         filled_qty,
                         fill_price,
-                        created_at or filled_at,
+                        created_at or filled_at or broker_order_updated_at or datetime.now(timezone.utc),
                         datetime.now(timezone.utc),
                         created_at,
                         filled_at,
@@ -1769,6 +2061,10 @@ def _finalize_position(
     # positions and False for missing positions or DB errors, which is the
     # correct tri-state contract: terminal→evict, unknown/error→retain.
     broker_ids = ",".join(evidence["broker_order_ids"])
+    timestamp_quality = str(
+        evidence.get("fill_timestamp_quality")
+        or FILL_TIMESTAMP_QUALITY_UNAVAILABLE
+    ).strip()
     exit_reason = (
         "MANUAL_CLIENT_CLOSE_BROKER_CONFIRMED "
         f"broker_order_ids={broker_ids}"
@@ -1779,11 +2075,21 @@ def _finalize_position(
                 position_id=position_id,
                 exit_price=float(evidence["fill_price"]),
                 filled_qty=int(evidence["filled_qty"]),
-                filled_ts=str(evidence["filled_ts"]),
+                filled_ts=evidence.get("filled_ts"),
+                fill_timestamp_quality=timestamp_quality,
+                fill_timestamp_source=str(
+                    evidence.get("fill_timestamp_source") or ""
+                ),
+                fill_timestamp_key=str(evidence.get("fill_timestamp_key") or ""),
+                broker_order_updated_at=evidence.get("broker_order_updated_at"),
                 broker_order_id=str(evidence["broker_order_id"]),
                 external_close=True,
                 close_source="manual_client_close_broker_fill",
-                close_confidence="HIGH",
+                close_confidence=(
+                    "HIGH"
+                    if timestamp_quality == FILL_TIMESTAMP_QUALITY_EXACT
+                    else "NONEXACT_ORDER_UPDATE"
+                ),
                 exit_reason=exit_reason,
             )
         )
@@ -2083,11 +2389,31 @@ def detect_manual_closes(self) -> None:
             continue
 
         # Full durable coverage. Build aggregate and finalize without broker.
-        all_fills = sorted(valid_durable, key=lambda r: r["filled_at"])
+        all_fills = sorted(
+            valid_durable,
+            key=lambda r: _fill_sort_timestamp(r)
+            or datetime.min.replace(tzinfo=timezone.utc),
+        )
         weighted_notional = sum(
             float(f["fill_price"]) * int(f["filled_qty"]) for f in all_fills
         )
         avg_price = weighted_notional / adopted_qty
+        all_exact = all(
+            _fill_timestamp_quality(fill) == FILL_TIMESTAMP_QUALITY_EXACT
+            for fill in all_fills
+        )
+        final_fill = all_fills[-1]
+        final_filled_at = final_fill.get("filled_at") if all_exact else None
+        final_updated_at = max(
+            (
+                chronology
+                for chronology in (
+                    fill.get("broker_order_updated_at") for fill in all_fills
+                )
+                if isinstance(chronology, datetime)
+            ),
+            default=None,
+        )
 
         durable_evidence: dict = {
             "fills": [],
@@ -2095,8 +2421,23 @@ def detect_manual_closes(self) -> None:
             "all_fills": all_fills,
             "filled_qty": adopted_qty,
             "fill_price": round(avg_price, 6),
-            "filled_ts": all_fills[-1]["filled_at"].isoformat(),
-            "broker_order_id": all_fills[-1]["broker_order_id"],
+            "filled_ts": final_filled_at.isoformat() if final_filled_at else None,
+            "fill_timestamp_quality": (
+                FILL_TIMESTAMP_QUALITY_EXACT
+                if all_exact
+                else FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY
+            ),
+            "fill_timestamp_source": (
+                BROKER_FILL_TIMESTAMP_SOURCE
+                if all_exact
+                else BROKER_ORDER_UPDATED_AT_SOURCE
+            ),
+            "fill_timestamp_key": (
+                final_fill.get("fill_timestamp_key") if all_exact
+                else BROKER_ORDER_UPDATED_AT_KEY
+            ),
+            "broker_order_updated_at": final_updated_at,
+            "broker_order_id": final_fill["broker_order_id"],
             "broker_order_ids": [f["broker_order_id"] for f in all_fills],
         }
 

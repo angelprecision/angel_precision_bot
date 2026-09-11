@@ -210,6 +210,13 @@ def test_production_declaration_covers_trigger_provenance_source_column():
     assert "canonical_signal_id" in sa.REQUIRED_SCHEMA["orders"]
 
 
+def test_production_declaration_covers_exit_timestamp_quality_columns():
+    """Non-exact broker chronology must have durable schema attestation."""
+    assert "exit_observed_at" in sa.REQUIRED_SCHEMA["positions"]
+    assert "exit_timestamp_quality" in sa.REQUIRED_SCHEMA["positions"]
+    assert "fill_timestamp_quality" in sa.REQUIRED_SCHEMA["proof_trades"]
+
+
 def test_lifecycle_manifest_records_healthy_schema_as_installed(monkeypatch):
     schema_module = SimpleNamespace(
         attest_schema=lambda strict=False: {

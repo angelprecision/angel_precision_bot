@@ -522,14 +522,13 @@ def test_durable_fill_requires_broker_timestamp_provenance(overrides):
     assert valid == []
 
 
-def test_durable_fill_transaction_date_provenance_is_accepted():
+def test_durable_fill_transaction_date_provenance_is_rejected():
     valid = manual_mod._validate_durable_fills(
         [_fill(fill_timestamp_source="broker_response", fill_timestamp_key="transaction_date")],
         position=_pos(),
         detected_at=DETECTED_AT,
     )
-    assert len(valid) == 1
-    assert valid[0]["fill_timestamp_key"] == "transaction_date"
+    assert valid == []
 
 
 def test_durable_fill_stale_timestamp_is_rejected():

@@ -51,6 +51,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
 
+from ap.manual_close_reconciliation import (
+    FILL_TIMESTAMP_QUALITY_EXACT,
+    FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY,
+)
+
 log = logging.getLogger("ap.operator.live_execution_journal")
 
 
@@ -130,6 +135,12 @@ def classify_official(row: dict[str, Any]) -> OfficialClassification:
     the specific reasons the trade did not qualify (empty if official).
     """
     reasons: list[str] = []
+
+    fill_timestamp_quality = str(row.get("fill_timestamp_quality") or "").strip()
+    if fill_timestamp_quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY:
+        reasons.append("exit fill chronology is not exact execution time")
+    elif fill_timestamp_quality not in ("", FILL_TIMESTAMP_QUALITY_EXACT):
+        reasons.append("fill_timestamp_quality invalid")
 
     # 1. execution_mode must be 'live'
     if (row.get("execution_mode") or "").lower() != "live":
@@ -336,6 +347,7 @@ SELECT
     p.broker_exit_fill_ts,
     p.broker_entry_filled_qty,
     p.broker_exit_filled_qty,
+    p.fill_timestamp_quality,
     p.official_live_performance_eligible       AS official_db_default,
     cso.opportunity_status                     AS opp_status,
     cso.miss_stage                             AS opp_miss_stage,
@@ -482,6 +494,7 @@ def _shape_trade_row(row: dict[str, Any]) -> dict[str, Any]:
         "broker_exit_filled_qty":   row.get("broker_exit_filled_qty"),
         "entry_option_price":       row.get("entry_option_price"),
         "exit_fill_price":          row.get("exit_fill_price"),
+        "fill_timestamp_quality":   row.get("fill_timestamp_quality"),
     }
     verdict = classify_official(classify_input)
 
@@ -515,6 +528,7 @@ def _shape_trade_row(row: dict[str, Any]) -> dict[str, Any]:
         "exit_fill_qty":            _safe_float(row.get("broker_exit_filled_qty")),
         "entry_fill_ts":            _iso(row.get("entry_fill_ts") or row.get("broker_entry_fill_ts")),
         "exit_fill_ts":             _iso(row.get("exit_fill_ts") or row.get("broker_exit_fill_ts")),
+        "fill_timestamp_quality":   row.get("fill_timestamp_quality"),
         "entry_price_source":       row.get("entry_price_source"),
         "exit_price_source":        row.get("exit_price_source"),
         "broker_reconciled":        bool(row.get("broker_reconciled")) if row.get("broker_reconciled") is not None else None,

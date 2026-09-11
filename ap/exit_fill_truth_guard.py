@@ -13,7 +13,17 @@ from typing import Any, Iterable
 
 from ap.db import conn, run_with_retry
 from ap.logger import get_logger
-from ap.manual_close_reconciliation import parse_broker_fill_timestamp
+from ap.manual_close_reconciliation import (
+    BROKER_FILL_TIMESTAMP_KEYS,
+    BROKER_FILL_TIMESTAMP_SOURCE,
+    BROKER_ORDER_UPDATED_AT_KEY,
+    BROKER_ORDER_UPDATED_AT_SOURCE,
+    FILL_TIMESTAMP_QUALITY_EXACT,
+    FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY,
+    FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+    broker_fill_timestamp_evidence,
+    parse_broker_fill_timestamp,
+)
 from ap.operator.live_execution_journal import (
     PRICE_SOURCE_PAPER_BROKER,
     PRICE_SOURCE_TRADIER_ENTRY,
@@ -112,6 +122,8 @@ class LifecycleProjection:
     realized_pnl: float
     realized_pnl_pct: float
     final_fill_ts: Any
+    final_observed_at: Any
+    fill_timestamp_quality: str
     closed: bool
 
 
@@ -129,6 +141,234 @@ def _int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _durable_fill_timestamp_evidence(row: dict) -> dict:
+    """Classify a durable EXIT row without promoting order-update time."""
+    meta = _metadata_dict(row.get("meta"))
+    quality = str(
+        row.get("fill_timestamp_quality")
+        or meta.get("exit_fill_timestamp_quality")
+        or ""
+    ).strip()
+    source = str(
+        row.get("fill_timestamp_source")
+        or meta.get("exit_fill_timestamp_source")
+        or ""
+    ).strip()
+    key = str(
+        row.get("fill_timestamp_key")
+        or meta.get("exit_fill_timestamp_key")
+        or ""
+    ).strip()
+    raw_filled_ts = row.get("filled_ts")
+    raw_updated_at = row.get("broker_order_updated_at") or meta.get(
+        "broker_order_updated_at"
+    )
+    filled_at = parse_broker_fill_timestamp(raw_filled_ts)
+    updated_at = parse_broker_fill_timestamp(raw_updated_at)
+
+    if raw_filled_ts not in (None, ""):
+        if (
+            quality not in {"", FILL_TIMESTAMP_QUALITY_EXACT}
+            or filled_at is None
+            or (
+                source
+                and source != BROKER_FILL_TIMESTAMP_SOURCE
+            )
+            or (
+                key
+                and key not in BROKER_FILL_TIMESTAMP_KEYS
+            )
+        ):
+            return {
+                "quality": FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+                "filled_at": None,
+                "filled_ts": None,
+                "observed_at": updated_at,
+                "broker_order_updated_at": updated_at,
+                "source": source,
+                "key": key,
+            }
+        return {
+            "quality": FILL_TIMESTAMP_QUALITY_EXACT,
+            "filled_at": filled_at,
+            "filled_ts": (
+                filled_at.astimezone(timezone.utc).isoformat()
+                if isinstance(raw_filled_ts, (datetime,))
+                else str(raw_filled_ts)
+            ),
+            "observed_at": filled_at,
+            "broker_order_updated_at": updated_at,
+            "source": source or BROKER_FILL_TIMESTAMP_SOURCE,
+            "key": key or "filled_ts",
+        }
+
+    if quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY:
+        if (
+            updated_at is not None
+            and source == BROKER_ORDER_UPDATED_AT_SOURCE
+            and key == BROKER_ORDER_UPDATED_AT_KEY
+        ):
+            return {
+                "quality": quality,
+                "filled_at": None,
+                "filled_ts": None,
+                "observed_at": updated_at,
+                "broker_order_updated_at": updated_at,
+                "source": source,
+                "key": key,
+            }
+        return {
+            "quality": FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+            "filled_at": None,
+            "filled_ts": None,
+            "observed_at": updated_at,
+            "broker_order_updated_at": updated_at,
+            "source": source,
+            "key": key,
+        }
+
+    return {
+        "quality": FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+        "filled_at": None,
+        "filled_ts": None,
+        "observed_at": updated_at,
+        "broker_order_updated_at": updated_at,
+        "source": source,
+        "key": key,
+    }
+
+
+def _fill_evidence_usable(evidence: dict) -> bool:
+    quality = str(evidence.get("quality") or "").strip()
+    source = str(evidence.get("source") or "").strip()
+    key = str(evidence.get("key") or "").strip()
+    if quality == FILL_TIMESTAMP_QUALITY_EXACT:
+        return (
+            evidence.get("filled_at") is not None
+            and source == BROKER_FILL_TIMESTAMP_SOURCE
+            and key in BROKER_FILL_TIMESTAMP_KEYS
+        )
+    if quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY:
+        return (
+            evidence.get("filled_at") is None
+            and evidence.get("observed_at") is not None
+            and source == BROKER_ORDER_UPDATED_AT_SOURCE
+            and key == BROKER_ORDER_UPDATED_AT_KEY
+        )
+    return False
+
+
+def _normalized_fill_timestamp_evidence(
+    *,
+    filled_ts: Any = None,
+    fill_timestamp_quality: Any = None,
+    fill_timestamp_source: Any = None,
+    fill_timestamp_key: Any = None,
+    broker_order_updated_at: Any = None,
+) -> dict:
+    """Normalize one caller/result evidence payload for the guard.
+
+    A blank quality is retained only as the backwards-compatible exact
+    ``filled_ts`` contract.  It is never inferred from an order lifecycle
+    timestamp or from ``transaction_date``.
+    """
+    quality = str(fill_timestamp_quality or "").strip()
+    source = str(fill_timestamp_source or "").strip()
+    key = str(fill_timestamp_key or "").strip()
+    filled_at = parse_broker_fill_timestamp(filled_ts)
+    updated_at = parse_broker_fill_timestamp(broker_order_updated_at)
+
+    if not quality and filled_ts not in (None, ""):
+        quality = FILL_TIMESTAMP_QUALITY_EXACT
+        source = source or BROKER_FILL_TIMESTAMP_SOURCE
+        key = key or "filled_ts"
+
+    if quality == FILL_TIMESTAMP_QUALITY_EXACT:
+        return {
+            "quality": quality if filled_at is not None else FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+            "filled_at": filled_at,
+            "filled_ts": (
+                filled_at.astimezone(timezone.utc).isoformat()
+                if filled_at is not None
+                else None
+            ),
+            "observed_at": filled_at,
+            "broker_order_updated_at": updated_at,
+            "source": source,
+            "key": key,
+        }
+    if quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY:
+        valid = (
+            filled_ts in (None, "")
+            and updated_at is not None
+            and source == BROKER_ORDER_UPDATED_AT_SOURCE
+            and key == BROKER_ORDER_UPDATED_AT_KEY
+        )
+        return {
+            "quality": quality if valid else FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+            "filled_at": None,
+            "filled_ts": None,
+            "observed_at": updated_at,
+            "broker_order_updated_at": updated_at,
+            "source": source,
+            "key": key,
+        }
+    return {
+        "quality": FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+        "filled_at": None,
+        "filled_ts": None,
+        "observed_at": updated_at,
+        "broker_order_updated_at": updated_at,
+        "source": source,
+        "key": key,
+    }
+
+
+def _reconciliation_fill_timestamp_evidence(order: dict, result: dict) -> dict:
+    """Resolve fresh broker evidence before falling back to durable evidence."""
+    result = result if isinstance(result, dict) else {}
+    explicit_keys = (
+        "filled_ts",
+        "fill_timestamp_quality",
+        "fill_timestamp_source",
+        "fill_timestamp_key",
+        "broker_order_updated_at",
+    )
+    if any(
+        key in result and result.get(key) not in (None, "")
+        for key in explicit_keys
+    ):
+        return _normalized_fill_timestamp_evidence(
+            filled_ts=result.get("filled_ts"),
+            fill_timestamp_quality=result.get("fill_timestamp_quality"),
+            fill_timestamp_source=result.get("fill_timestamp_source"),
+            fill_timestamp_key=result.get("fill_timestamp_key"),
+            broker_order_updated_at=result.get("broker_order_updated_at"),
+        )
+
+    raw = result.get("raw")
+    if isinstance(raw, dict):
+        broker_evidence = broker_fill_timestamp_evidence(raw)
+        return _normalized_fill_timestamp_evidence(
+            filled_ts=broker_evidence.get("filled_ts"),
+            fill_timestamp_quality=broker_evidence.get("fill_timestamp_quality"),
+            fill_timestamp_source=broker_evidence.get("fill_timestamp_source"),
+            fill_timestamp_key=broker_evidence.get("fill_timestamp_key"),
+            broker_order_updated_at=broker_evidence.get("broker_order_updated_at"),
+        )
+
+    durable = _durable_fill_timestamp_evidence(order if isinstance(order, dict) else {})
+    return {
+        "quality": durable.get("quality"),
+        "filled_at": durable.get("filled_at"),
+        "filled_ts": durable.get("filled_ts"),
+        "observed_at": durable.get("observed_at"),
+        "broker_order_updated_at": durable.get("broker_order_updated_at"),
+        "source": durable.get("source"),
+        "key": durable.get("key"),
+    }
+
+
 def project_position_from_exit_fills(position: dict, fills: Iterable[dict]) -> LifecycleProjection:
     """Pure cumulative fill reducer using one row per EXIT order."""
     qty = _int(position.get("qty") or position.get("contracts"))
@@ -138,13 +378,22 @@ def project_position_from_exit_fills(position: dict, fills: Iterable[dict]) -> L
     if entry_price <= 0:
         raise LifecycleProjectionError("position_entry_price_missing_or_invalid")
 
-    normalized: list[tuple[Any, int, float]] = []
+    normalized: list[tuple[dict, int, float, dict]] = []
     for row in fills:
         fill_qty = _int(row.get("filled_qty"))
         fill_price = _float(row.get("fill_price"))
-        if fill_qty > 0 and fill_price > 0:
-            normalized.append((row.get("filled_ts"), fill_qty, fill_price))
-    normalized.sort(key=lambda item: str(item[0] or ""))
+        if fill_qty > 0:
+            if fill_price <= 0:
+                raise LifecycleProjectionError(
+                    "BROKER_FILL_ECONOMICS_MISSING_OR_INVALID"
+                )
+            evidence = _durable_fill_timestamp_evidence(row)
+            if not _fill_evidence_usable(evidence):
+                raise LifecycleProjectionError(
+                    "BROKER_FILL_TIMESTAMP_MISSING_OR_INVALID"
+                )
+            normalized.append((row, fill_qty, fill_price, evidence))
+    normalized.sort(key=lambda item: item[3]["observed_at"])
 
     exited_qty = sum(item[1] for item in normalized)
     if exited_qty <= 0:
@@ -152,7 +401,10 @@ def project_position_from_exit_fills(position: dict, fills: Iterable[dict]) -> L
     if exited_qty > qty:
         raise LifecycleProjectionError(f"exit_overfill:{exited_qty}>{qty}")
 
-    proceeds = sum(fill_qty * fill_price * 100.0 for _, fill_qty, fill_price in normalized)
+    proceeds = sum(
+        fill_qty * fill_price * 100.0
+        for _, fill_qty, fill_price, _ in normalized
+    )
     cost = entry_price * exited_qty * 100.0
     realized_pnl = proceeds - cost
     remaining_qty = qty - exited_qty
@@ -162,7 +414,23 @@ def project_position_from_exit_fills(position: dict, fills: Iterable[dict]) -> L
         weighted_exit_price=round(proceeds / (exited_qty * 100.0), 6),
         realized_pnl=round(realized_pnl, 2),
         realized_pnl_pct=round((realized_pnl / cost * 100.0) if cost > 0 else 0.0, 4),
-        final_fill_ts=normalized[-1][0],
+        final_fill_ts=(
+            normalized[-1][3]["filled_ts"]
+            if all(
+                item[3]["quality"] == FILL_TIMESTAMP_QUALITY_EXACT
+                for item in normalized
+            )
+            else None
+        ),
+        final_observed_at=normalized[-1][3]["observed_at"].isoformat(),
+        fill_timestamp_quality=(
+            FILL_TIMESTAMP_QUALITY_EXACT
+            if all(
+                item[3]["quality"] == FILL_TIMESTAMP_QUALITY_EXACT
+                for item in normalized
+            )
+            else FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY
+        ),
         closed=remaining_qty == 0,
     )
 
@@ -179,9 +447,12 @@ def official_live_eligibility(
     entry_fill_price: float = 1.0,
     exit_fill_price: float = 1.0,
     synthetic_entry: bool = False,
+    fill_timestamp_quality: str = FILL_TIMESTAMP_QUALITY_EXACT,
 ) -> bool:
     """Apply the repository's existing Tradier Exit Proof Lock exactly."""
     if not closed or not all_exit_fills_broker_backed:
+        return False
+    if str(fill_timestamp_quality or "").strip() != FILL_TIMESTAMP_QUALITY_EXACT:
         return False
     mode = str(execution_mode or "").strip().lower()
     row = {
@@ -271,21 +542,42 @@ def _load_exit_fills(c, position: dict, order: dict) -> list[dict]:
     contract = str(position.get("contract") or order.get("contract") or "").strip().upper()
     position_id = str(position.get("id") or "").strip()
     current_local_order_id = str(order.get("local_order_id") or "").strip()
-    entry_ts = position.get("entry_ts") or position.get("created_at")
     rows = c.execute(
-        "SELECT local_order_id, broker_order_id, position_id, filled_qty, fill_price, filled_ts, status "
+        "SELECT local_order_id, broker_order_id, position_id, filled_qty, fill_price, "
+        "filled_ts, status, meta, created_ts "
         "FROM orders WHERE client_id=%s AND kind='EXIT' AND UPPER(contract)=UPPER(%s) "
         "AND status IN %s AND COALESCE(filled_qty,0)>0 AND fill_price IS NOT NULL "
-        "AND (%s IS NULL OR filled_ts >= %s OR (%s <> '' AND local_order_id=%s)) "
         "AND (position_id::text=%s OR (%s<>'' AND local_order_id=%s)) "
-        "ORDER BY filled_ts ASC NULLS LAST, created_ts ASC",
+        "ORDER BY created_ts ASC",
         (
-            client_id, contract, _EXIT_FILL_STATUSES, entry_ts, entry_ts,
-            current_local_order_id, current_local_order_id,
+            client_id, contract, _EXIT_FILL_STATUSES,
             position_id, current_local_order_id, current_local_order_id,
         ),
     ).fetchall()
-    return [dict(row) for row in rows]
+    entry_ts = position.get("entry_ts") or position.get("created_at")
+    entry_at = parse_broker_fill_timestamp(entry_ts) if entry_ts else None
+    filtered: list[dict] = []
+    for raw_row in rows:
+        row = dict(raw_row)
+        is_current = (
+            bool(current_local_order_id)
+            and str(row.get("local_order_id") or "").strip()
+            == current_local_order_id
+        )
+        evidence = _durable_fill_timestamp_evidence(row)
+        observed_at = evidence.get("observed_at")
+        # Keep positive rows with missing/malformed chronology in the result so
+        # the reducer holds rather than silently under-counting broker truth.
+        # A proven older fill can be excluded when it is not the current order.
+        if (
+            not is_current
+            and entry_at is not None
+            and observed_at is not None
+            and observed_at < entry_at
+        ):
+            continue
+        filtered.append(row)
+    return filtered
 
 
 def _is_partial_result(order: dict, result: dict) -> bool:
@@ -497,6 +789,7 @@ def _reconciliation_order_identity(order: dict) -> tuple[str, str]:
 
 
 def _diagnostic_context(order: dict, result: dict) -> dict[str, Any]:
+    evidence = _reconciliation_fill_timestamp_evidence(order, result)
     return {
         "client_id": str(order.get("client_id") or ""),
         "execution_mode": str(order.get("execution_mode") or "unknown").lower(),
@@ -508,7 +801,15 @@ def _diagnostic_context(order: dict, result: dict) -> dict[str, Any]:
         ),
         "filled_qty": _int(result.get("filled_qty"), _int(order.get("filled_qty"))),
         "fill_price": _float(result.get("fill_price"), _float(order.get("fill_price"))),
-        "filled_ts": str(result.get("filled_ts") or order.get("filled_ts") or ""),
+        "filled_ts": str(evidence.get("filled_ts") or ""),
+        "fill_timestamp_quality": evidence.get("quality"),
+        "fill_timestamp_source": evidence.get("source"),
+        "fill_timestamp_key": evidence.get("key"),
+        "broker_order_updated_at": (
+            evidence.get("broker_order_updated_at").isoformat()
+            if isinstance(evidence.get("broker_order_updated_at"), datetime)
+            else evidence.get("broker_order_updated_at")
+        ),
         "recorded_by": "canonical_exit_fill_reconciler",
     }
 
@@ -735,12 +1036,12 @@ def _run_reconciliation_attempt(
     attempt_count: int,
 ) -> dict:
     client_id = str(order.get("client_id") or "").strip()
-    raw_fill_ts = result.get("filled_ts") or order.get("filled_ts")
-    fill_ts = parse_broker_fill_timestamp(raw_fill_ts)
-    if fill_ts is None:
+    fill_evidence = _reconciliation_fill_timestamp_evidence(order, result)
+    if not _fill_evidence_usable(fill_evidence):
         raise LifecycleProjectionError(
-            "EXACT_BROKER_FILL_TIMESTAMP_MISSING_OR_INVALID"
+            "BROKER_FILL_TIMESTAMP_MISSING_OR_INVALID"
         )
+    fill_ts = fill_evidence.get("observed_at")
 
     def _tx() -> dict:
         with conn() as c:
@@ -800,6 +1101,32 @@ def _run_reconciliation_attempt(
                     "pending_exit_broker_order_id": None,
                 }
             )
+            terminal_updates: dict[str, Any] = {}
+            if projection.closed:
+                terminal_updates = {
+                    "status": "CLOSED",
+                    "exit_ts": (
+                        projection.final_fill_ts
+                        if projection.fill_timestamp_quality == FILL_TIMESTAMP_QUALITY_EXACT
+                        else None
+                    ),
+                }
+                if "exit_observed_at" in position_columns:
+                    terminal_updates["exit_observed_at"] = projection.final_observed_at
+                if "exit_timestamp_quality" in position_columns:
+                    terminal_updates["exit_timestamp_quality"] = (
+                        projection.fill_timestamp_quality
+                    )
+                if projection.fill_timestamp_quality != FILL_TIMESTAMP_QUALITY_EXACT:
+                    required_columns = {
+                        "exit_observed_at",
+                        "exit_timestamp_quality",
+                    }
+                    if not required_columns.issubset(position_columns):
+                        missing = sorted(required_columns - position_columns)
+                        raise LifecycleProjectionError(
+                            "projection_schema_missing:" + ",".join(missing)
+                        )
             position_updates = {
                 key: value
                 for key, value in {
@@ -810,7 +1137,7 @@ def _run_reconciliation_attempt(
                     "realized_pnl_pct": projection.realized_pnl_pct,
                     **ownership_updates,
                     "updated_at": datetime.now(timezone.utc),
-                    **({"status": "CLOSED", "exit_ts": projection.final_fill_ts or fill_ts} if projection.closed else {}),
+                    **terminal_updates,
                 }.items()
                 if key in position_columns
             }
@@ -856,6 +1183,7 @@ def _run_reconciliation_attempt(
                     entry_fill_price=entry_fill_price,
                     exit_fill_price=projection.weighted_exit_price,
                     synthetic_entry=synthetic_entry,
+                    fill_timestamp_quality=projection.fill_timestamp_quality,
                 )
                 live_mode = mode == "live"
                 proof_updates = {
@@ -869,6 +1197,7 @@ def _run_reconciliation_attempt(
                         "broker_exit_order_id": final_exit_broker_id or None,
                         "broker_entry_fill_ts": entry_order.get("filled_ts"),
                         "broker_exit_fill_ts": projection.final_fill_ts,
+                        "fill_timestamp_quality": projection.fill_timestamp_quality,
                         "broker_entry_filled_qty": entry_filled_qty or None,
                         "broker_exit_filled_qty": projection.exited_qty,
                         "entry_price_source": (
@@ -917,6 +1246,9 @@ def _run_reconciliation_attempt(
                 "proof_rows_updated": proof_updated,
                 "proof_reconciliation": proof_reconciliation,
                 "official_live_performance_eligible": eligible,
+                "fill_timestamp_quality": projection.fill_timestamp_quality,
+                "filled_ts": projection.final_fill_ts,
+                "broker_order_updated_at": projection.final_observed_at,
             }
 
     try:
@@ -1005,6 +1337,26 @@ def retry_exit_fill_reconciliation(*, client_id: str, local_order_id: str) -> di
         "fill_price": order.get("fill_price"),
         "filled_ts": order.get("filled_ts"),
     }
+    durable_evidence = _durable_fill_timestamp_evidence(order)
+    result.update(
+        {
+            "fill_timestamp_quality": (
+                durable_evidence.get("quality")
+                if durable_evidence.get("quality")
+                != FILL_TIMESTAMP_QUALITY_UNAVAILABLE
+                else None
+            ),
+            "fill_timestamp_source": durable_evidence.get("source"),
+            "fill_timestamp_key": durable_evidence.get("key"),
+            "broker_order_updated_at": (
+                durable_evidence.get("broker_order_updated_at").isoformat()
+                if isinstance(
+                    durable_evidence.get("broker_order_updated_at"), datetime
+                )
+                else durable_evidence.get("broker_order_updated_at")
+            ),
+        }
+    )
     if _is_bot_owned_exit_order(order):
         convergence = _converge_bot_owned_exit_order(order)
         disposition = str(getattr(convergence, "disposition", "") or "")

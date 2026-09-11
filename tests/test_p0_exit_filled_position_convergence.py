@@ -803,6 +803,10 @@ def test_osm_exit_filled_without_broker_timestamp_stays_unprojected(
     postgres_harness,
     monkeypatch,
 ):
+    """PR #605: OSM fail-closes before durable EXIT fill mutation when
+    timezone-aware broker filled_ts is missing. The row must remain
+    nonterminal/pollable and the position must stay unprojected.
+    """
     import ap.order_state_machine as osm_module
     from ap.order_state_machine import APOrderStateMachine, OrderStatus
 
@@ -821,15 +825,22 @@ def test_osm_exit_filled_without_broker_timestamp_stays_unprojected(
     # the prior tests exercise that handler's ordering directly.
     osm._handle_exit_engine_hooks = MagicMock()
 
+    before_order = _read_order(harness, exit_id)
+    before = _read_position(harness, position_id)
     assert osm.transition(
         exit_id,
         OrderStatus.EXIT_FILLED,
-        broker_order_id=_read_order(harness, exit_id)["broker_order_id"],
+        broker_order_id=before_order["broker_order_id"],
         filled_qty=1,
         fill_price=1.17,
-    ) is True
-    assert _read_order(harness, exit_id)["filled_ts"] is None
-    before = _read_position(harness, position_id)
+    ) is False
+    after_order = _read_order(harness, exit_id)
+    assert after_order["status"] == "EXIT_PARTIAL_FILL"
+    assert after_order["filled_ts"] is None
+    assert after_order["filled_qty"] == before_order["filled_qty"]
+    event_kwargs = osm._emit_transition_event.call_args.kwargs
+    assert event_kwargs["decision"] == "HOLD"
+    assert event_kwargs["reason_code"] == "EXIT_FILL_TIMESTAMP_MISSING_OR_INVALID"
     result = APPositionManager(CLIENT_ID).converge_position_from_durable_exit_order(
         exit_local_order_id=exit_id,
         expected_execution_mode="live",
@@ -887,7 +898,7 @@ def test_exit_timestamp_before_entry_holds_before_position_mutation(postgres_har
     assert _read_position(harness, position_id) == before
 
 
-def test_fill_monitor_carries_only_explicit_broker_fill_timestamp():
+def test_fill_monitor_does_not_treat_tradier_transaction_date_as_fill_timestamp():
     from ap.fill_monitor import check_order_with_broker
 
     class _Broker:
@@ -907,11 +918,12 @@ def test_fill_monitor_carries_only_explicit_broker_fill_timestamp():
         "status": "FILLED",
         "exec_quantity": 1,
         "avg_fill_price": 1.17,
+        "remaining_quantity": 0,
         "transaction_date": FILLED_TS.isoformat(),
     }
     result = check_order_with_broker(_Broker(raw), order)
     assert result["status"] == "EXIT_FILLED"
-    assert result["filled_ts"] == FILLED_TS.isoformat()
+    assert result["filled_ts"] is None
 
     partial_raw = dict(raw)
     partial_raw["status"] = "PARTIALLY_FILLED"

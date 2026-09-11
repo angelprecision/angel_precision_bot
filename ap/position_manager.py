@@ -32,7 +32,16 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from ap.db import conn, run_with_retry
-from ap.manual_close_reconciliation import parse_broker_fill_timestamp
+from ap.manual_close_reconciliation import (
+    BROKER_FILL_TIMESTAMP_SOURCE,
+    BROKER_FILL_TIMESTAMP_KEYS,
+    BROKER_ORDER_UPDATED_AT_KEY,
+    BROKER_ORDER_UPDATED_AT_SOURCE,
+    FILL_TIMESTAMP_QUALITY_EXACT,
+    FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY,
+    FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+    parse_broker_fill_timestamp,
+)
 from ap.utils import now_utc_iso
 
 log = logging.getLogger("ap.position_manager")
@@ -62,6 +71,10 @@ class ConvergenceResult:
     applied_delta_price: Optional[float] = None
     realized_pnl: Optional[float] = None
     realized_pnl_pct: Optional[float] = None
+    fill_timestamp_quality: str = ""
+    fill_timestamp_source: str = ""
+    fill_timestamp_key: str = ""
+    broker_order_updated_at: Optional[datetime] = None
     reason: str = ""
     proof_pending: bool = False
 
@@ -87,6 +100,93 @@ _PLACEHOLDER_BROKER_IDS = {
 
 def _convergence_hold(disposition: str, reason: str = "", **kwargs) -> ConvergenceResult:
     return ConvergenceResult(disposition=disposition, reason=reason, **kwargs)
+
+
+def _durable_exit_timestamp_evidence(order: dict, meta: dict) -> dict:
+    """Read the durable fill chronology contract without fabricating time.
+
+    Exact execution timestamps remain the stronger chronology authority. A
+    documented Tradier row may instead carry an explicit order-update marker;
+    that marker authorizes quantity/price convergence but never populates
+    ``filled_ts`` or claims an execution instant.
+    """
+    fill_dt, fill_ts = _exact_aware_timestamp(order.get("filled_ts"))
+    quality = str(meta.get("exit_fill_timestamp_quality") or "").strip()
+    source = str(meta.get("exit_fill_timestamp_source") or "").strip()
+    key = str(meta.get("exit_fill_timestamp_key") or "").strip()
+
+    if fill_dt is not None and fill_ts is not None:
+        if quality not in {"", FILL_TIMESTAMP_QUALITY_EXACT}:
+            return {
+                "quality": FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+                "filled_at": None,
+                "filled_ts": None,
+                "broker_order_updated_at": None,
+                "reason": "filled_ts_quality_conflict",
+            }
+        if quality == "":
+            quality = FILL_TIMESTAMP_QUALITY_EXACT
+        source = source or BROKER_FILL_TIMESTAMP_SOURCE
+        key = key or "filled_ts"
+        if source != BROKER_FILL_TIMESTAMP_SOURCE or key not in BROKER_FILL_TIMESTAMP_KEYS:
+            return {
+                "quality": FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+                "filled_at": None,
+                "filled_ts": None,
+                "broker_order_updated_at": None,
+                "source": source,
+                "key": key,
+                "reason": "exact_fill_timestamp_provenance_invalid",
+            }
+        return {
+            "quality": quality,
+            "filled_at": fill_dt,
+            "filled_ts": fill_ts,
+            "broker_order_updated_at": parse_broker_fill_timestamp(
+                meta.get("broker_order_updated_at")
+            ),
+            "source": source,
+            "key": key,
+            "reason": "exact_execution_timestamp",
+        }
+
+    if quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY:
+        updated_at = parse_broker_fill_timestamp(
+            meta.get("broker_order_updated_at")
+        )
+        if (
+            source == BROKER_ORDER_UPDATED_AT_SOURCE
+            and key == BROKER_ORDER_UPDATED_AT_KEY
+            and updated_at is not None
+        ):
+            return {
+                "quality": quality,
+                "filled_at": None,
+                "filled_ts": None,
+                "broker_order_updated_at": updated_at,
+                "source": source,
+                "key": key,
+                "reason": "order_update_timestamp_only",
+            }
+        return {
+            "quality": FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+            "filled_at": None,
+            "filled_ts": None,
+            "broker_order_updated_at": updated_at,
+            "source": source,
+            "key": key,
+            "reason": "order_update_timestamp_provenance_invalid",
+        }
+
+    return {
+        "quality": FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+        "filled_at": None,
+        "filled_ts": None,
+        "broker_order_updated_at": None,
+        "source": source,
+        "key": key,
+        "reason": "missing_or_invalid_exact_fill_timestamp",
+    }
 
 
 def _resolve_entry_cost_basis(
@@ -191,24 +291,29 @@ def _resolve_entry_cost_basis(
         )
         return None
 
-    # Both timestamps must be explicit broker execution timestamps.  The
-    # shared parser rejects missing, malformed, naive, and otherwise
-    # non-authoritative values; no local fallback or fabrication is allowed.
+    # The ENTRY timestamp is always required.  An EXIT order may be proven by
+    # broker quantity/price while chronology is only an order-update marker;
+    # in that case ``exit_filled_ts`` is intentionally absent and there is no
+    # execution-time comparison to perform.  Never substitute local time.
     entry_dt = parse_broker_fill_timestamp(row.get("filled_ts"))
-    exit_dt = parse_broker_fill_timestamp(exit_filled_ts)
+    exit_dt = (
+        parse_broker_fill_timestamp(exit_filled_ts)
+        if exit_filled_ts not in (None, "")
+        else None
+    )
     if entry_dt is None:
         log.warning(
             "[%s] _resolve_entry_cost_basis: invalid ENTRY filled_ts pos=%s",
             client_id, position_id,
         )
         return None
-    if exit_dt is None:
+    if exit_filled_ts not in (None, "") and exit_dt is None:
         log.warning(
             "[%s] _resolve_entry_cost_basis: invalid EXIT filled_ts pos=%s",
             client_id, position_id,
         )
         return None
-    if entry_dt > exit_dt:
+    if exit_dt is not None and entry_dt > exit_dt:
         log.warning(
             "[%s] _resolve_entry_cost_basis: ENTRY filled_ts after EXIT pos=%s",
             client_id, position_id,
@@ -299,6 +404,11 @@ def _exact_aware_timestamp(value) -> tuple[Optional[datetime], Optional[str]]:
     except (TypeError, ValueError, OverflowError):
         return None, None
     return normalized, normalized.isoformat()
+
+
+def _normalize_broker_filled_ts(value) -> Optional[str]:
+    """Normalize a broker timestamp for durable writes without inventing time."""
+    return _exact_aware_timestamp(value)[1]
 
 
 def _projection_meta(raw_meta) -> tuple[Optional[dict], str]:
@@ -463,9 +573,32 @@ def _validate_persisted_terminal_truth(row: dict) -> tuple[bool, str]:
     if not _math.isfinite(pnl_pct):
         return False, "non_finite_pnl_pct"
     entry_ts_str = str(row.get("entry_ts") or "").strip()
+    if not entry_ts_str:
+        return False, "missing_entry_timestamp"
+    timestamp_quality = str(row.get("exit_timestamp_quality") or "").strip()
+    if timestamp_quality not in {
+        "",
+        FILL_TIMESTAMP_QUALITY_EXACT,
+        FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY,
+    }:
+        return False, "invalid_exit_timestamp_quality"
+
     exit_ts_str = str(row.get("exit_ts") or "").strip()
-    if not entry_ts_str or not exit_ts_str:
-        return False, "missing_timestamps"
+    observed_ts_str = str(row.get("exit_observed_at") or "").strip()
+    if timestamp_quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY:
+        # An order update is an observation boundary, not an execution instant.
+        # It must be kept in its separate column and must never be promoted to
+        # the canonical exact ``exit_ts`` field.
+        if exit_ts_str:
+            return False, "nonexact_exit_has_exact_timestamp"
+        if not observed_ts_str:
+            return False, "missing_exit_observed_timestamp"
+        chronology_ts_str = observed_ts_str
+    else:
+        if not exit_ts_str:
+            return False, "missing_exit_timestamp"
+        chronology_ts_str = exit_ts_str
+
     # PR #386 amendment 2: normalize timestamps to timezone-aware UTC so a
     # naive/aware mismatch never raises inside the comparison. Any parse
     # failure returns a stable validation failure rather than propagating.
@@ -478,7 +611,7 @@ def _validate_persisted_terminal_truth(row: dict) -> tuple[bool, str]:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     entry_dt = _to_utc(entry_ts_str)
-    exit_dt = _to_utc(exit_ts_str)
+    exit_dt = _to_utc(chronology_ts_str)
     if entry_dt is None or exit_dt is None:
         return False, "unparseable_timestamps"
     try:
@@ -1122,14 +1255,29 @@ class APPositionManager:
                 fill_price = _strict_decimal(order.get("fill_price"), positive=True)
                 if fill_price is None:
                     return _convergence_hold("HOLD_ECONOMICS", "invalid_order_fill_price")
-                fill_dt, fill_ts = _exact_aware_timestamp(order.get("filled_ts"))
-                if fill_dt is None or fill_ts is None:
+                timestamp_evidence = _durable_exit_timestamp_evidence(order, meta)
+                timestamp_quality = str(
+                    timestamp_evidence.get("quality") or ""
+                ).strip()
+                fill_dt = timestamp_evidence.get("filled_at")
+                fill_ts = timestamp_evidence.get("filled_ts")
+                broker_order_updated_at = timestamp_evidence.get(
+                    "broker_order_updated_at"
+                )
+                timestamp_source = str(
+                    timestamp_evidence.get("source") or ""
+                ).strip()
+                timestamp_key = str(
+                    timestamp_evidence.get("key") or ""
+                ).strip()
+                if timestamp_quality == FILL_TIMESTAMP_QUALITY_UNAVAILABLE:
                     return _convergence_hold("HOLD_TIMESTAMP", "missing_or_invalid_exact_fill_timestamp")
 
                 watermark_present = _PROJECTION_WATERMARK_KEY in meta
                 previous_qty = 0
                 previous_notional = Decimal("0")
                 previous_fill_dt = None
+                previous_quality = ""
                 if watermark_present:
                     watermark = meta.get(_PROJECTION_WATERMARK_KEY)
                     if not isinstance(watermark, dict):
@@ -1168,11 +1316,58 @@ class APPositionManager:
                         previous_qty > 0 and previous_notional <= 0
                     ):
                         return _convergence_hold("HOLD_WATERMARK", "projection_watermark_qty_notional_mismatch")
+                    previous_quality = str(
+                        watermark.get("last_applied_fill_timestamp_quality") or ""
+                    ).strip()
+                    previous_source = str(
+                        watermark.get("last_applied_fill_timestamp_source") or ""
+                    ).strip()
+                    previous_key = str(
+                        watermark.get("last_applied_fill_timestamp_key") or ""
+                    ).strip()
                     previous_fill_dt, _ = _exact_aware_timestamp(
                         watermark.get("last_applied_filled_ts")
                     )
-                    if previous_qty > 0 and previous_fill_dt is None:
-                        return _convergence_hold("HOLD_WATERMARK", "invalid_projection_watermark_timestamp")
+                    if previous_qty > 0:
+                        if not previous_quality:
+                            previous_quality = (
+                                FILL_TIMESTAMP_QUALITY_EXACT
+                                if previous_fill_dt is not None
+                                else FILL_TIMESTAMP_QUALITY_UNAVAILABLE
+                            )
+                        if previous_quality == FILL_TIMESTAMP_QUALITY_EXACT:
+                            previous_source = previous_source or BROKER_FILL_TIMESTAMP_SOURCE
+                            previous_key = previous_key or "filled_ts"
+                            if (
+                                previous_source != BROKER_FILL_TIMESTAMP_SOURCE
+                                or previous_key not in BROKER_FILL_TIMESTAMP_KEYS
+                            ):
+                                return _convergence_hold(
+                                    "HOLD_WATERMARK",
+                                    "invalid_projection_watermark_timestamp_provenance",
+                                )
+                        if previous_quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY:
+                            previous_source = previous_source or BROKER_ORDER_UPDATED_AT_SOURCE
+                            previous_key = previous_key or BROKER_ORDER_UPDATED_AT_KEY
+                            if (
+                                previous_source != BROKER_ORDER_UPDATED_AT_SOURCE
+                                or previous_key != BROKER_ORDER_UPDATED_AT_KEY
+                            ):
+                                return _convergence_hold(
+                                    "HOLD_WATERMARK",
+                                    "invalid_projection_watermark_order_update_provenance",
+                                )
+                            previous_fill_dt = parse_broker_fill_timestamp(
+                                watermark.get("last_applied_broker_order_updated_at")
+                            )
+                        if previous_quality == FILL_TIMESTAMP_QUALITY_EXACT:
+                            if previous_fill_dt is None:
+                                return _convergence_hold("HOLD_WATERMARK", "invalid_projection_watermark_timestamp")
+                        elif previous_quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY:
+                            if previous_fill_dt is None:
+                                return _convergence_hold("HOLD_WATERMARK", "invalid_projection_watermark_order_update_timestamp")
+                        else:
+                            return _convergence_hold("HOLD_WATERMARK", "invalid_projection_watermark_timestamp_quality")
                     if previous_qty > cumulative_qty:
                         return _convergence_hold("HOLD_WATERMARK", "watermark_qty_exceeds_cumulative_fill")
 
@@ -1182,8 +1377,22 @@ class APPositionManager:
                 if previous_qty == cumulative_qty:
                     if abs(current_notional - previous_notional) > _DECIMAL_EPSILON:
                         return _convergence_hold("HOLD_ECONOMICS", "same_qty_changed_cumulative_notional")
-                if previous_fill_dt is not None and fill_dt < previous_fill_dt:
-                    return _convergence_hold("HOLD_TIMESTAMP", "fill_timestamp_regressed")
+                if (
+                    previous_quality == timestamp_quality
+                    and previous_fill_dt is not None
+                    and (
+                        fill_dt is not None
+                        and fill_dt < previous_fill_dt
+                    )
+                ):
+                    return _convergence_hold(
+                        "HOLD_TIMESTAMP",
+                        (
+                            "fill_timestamp_regressed"
+                            if timestamp_quality == FILL_TIMESTAMP_QUALITY_EXACT
+                            else "order_update_timestamp_regressed"
+                        ),
+                    )
 
                 # The exact position_id is the only position lookup authority.
                 c.execute(
@@ -1321,7 +1530,11 @@ class APPositionManager:
                             "invalid_position_entry_timestamp",
                             position_id=position_id,
                         )
-                    if fill_dt < entry_dt:
+                    if (
+                        timestamp_quality == FILL_TIMESTAMP_QUALITY_EXACT
+                        and fill_dt is not None
+                        and fill_dt < entry_dt
+                    ):
                         return _convergence_hold(
                             "HOLD_TIMESTAMP",
                             "exit_timestamp_before_entry",
@@ -1428,6 +1641,10 @@ class APPositionManager:
                             if persisted_realized_pnl_pct is not None
                             else None
                         ),
+                        fill_timestamp_quality=timestamp_quality,
+                        fill_timestamp_source=timestamp_source,
+                        fill_timestamp_key=timestamp_key,
+                        broker_order_updated_at=broker_order_updated_at,
                     )
                 if delta_qty > remaining_qty:
                     return _convergence_hold(
@@ -1484,6 +1701,11 @@ class APPositionManager:
                     "exit_ts",
                 }
                 missing_position_columns = required_position_columns - position_columns
+                if timestamp_quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY:
+                    missing_position_columns |= {
+                        "exit_observed_at",
+                        "exit_timestamp_quality",
+                    } - position_columns
                 if missing_position_columns or "meta" not in order_columns:
                     return _convergence_hold(
                         "DB_ERROR",
@@ -1535,9 +1757,19 @@ class APPositionManager:
                     "contracts_exited": position_qty - new_remaining,
                     "exit_reason": "exit_filled",
                     "close_source": "durable_exit_fill_convergence",
-                    "close_confidence": "HIGH",
+                    "close_confidence": (
+                        "HIGH"
+                        if timestamp_quality == FILL_TIMESTAMP_QUALITY_EXACT
+                        else "NONEXACT_ORDER_UPDATE"
+                    ),
                     **ownership_updates,
                 }
+                if "exit_observed_at" in position_columns:
+                    optional_position_updates["exit_observed_at"] = (
+                        fill_dt or broker_order_updated_at
+                    )
+                if "exit_timestamp_quality" in position_columns:
+                    optional_position_updates["exit_timestamp_quality"] = timestamp_quality
                 for column, value in optional_position_updates.items():
                     if column in position_columns:
                         position_sets.append(f"{column}=%s")
@@ -1580,7 +1812,31 @@ class APPositionManager:
                     "applied_cumulative_qty": cumulative_applied_qty,
                     "applied_cumulative_notional": float(previous_notional + delta_notional),
                     "last_applied_filled_ts": fill_ts,
+                    "last_applied_fill_timestamp_quality": timestamp_quality,
                 }
+                if broker_order_updated_at is not None:
+                    new_watermark["last_applied_broker_order_updated_at"] = (
+                        broker_order_updated_at.isoformat()
+                    )
+                if timestamp_quality == FILL_TIMESTAMP_QUALITY_EXACT:
+                    new_watermark["last_applied_fill_timestamp_source"] = (
+                        BROKER_FILL_TIMESTAMP_SOURCE
+                    )
+                    # ``fill_ts`` can only be sourced from one of the exact
+                    # broker execution fields after _durable_exit_timestamp_evidence
+                    # has validated the row.  Preserve the source key for
+                    # restart/audit diagnostics without making it an authority
+                    # of its own.
+                    new_watermark["last_applied_fill_timestamp_key"] = str(
+                        timestamp_key or ""
+                    )
+                else:
+                    new_watermark["last_applied_fill_timestamp_source"] = (
+                        BROKER_ORDER_UPDATED_AT_SOURCE
+                    )
+                    new_watermark["last_applied_fill_timestamp_key"] = (
+                        BROKER_ORDER_UPDATED_AT_KEY
+                    )
                 updated_meta = dict(meta)
                 updated_meta[_PROJECTION_WATERMARK_KEY] = new_watermark
                 order_sets = ["meta=%s::jsonb"]
@@ -1629,6 +1885,10 @@ class APPositionManager:
                     applied_delta_price=float(delta_fill_price),
                     realized_pnl=float(realized_pnl),
                     realized_pnl_pct=float(realized_pnl_pct),
+                    fill_timestamp_quality=timestamp_quality,
+                    fill_timestamp_source=timestamp_source,
+                    fill_timestamp_key=timestamp_key,
+                    broker_order_updated_at=broker_order_updated_at,
                 )
 
         try:
@@ -1719,6 +1979,12 @@ class APPositionManager:
                 if "exit_fill_price" in proof_columns:
                     sets.append("exit_fill_price=%s")
                     values.append(float(result.exit_price))
+                if "fill_timestamp_quality" in proof_columns:
+                    sets.append("fill_timestamp_quality=%s")
+                    values.append(
+                        result.fill_timestamp_quality
+                        or FILL_TIMESTAMP_QUALITY_EXACT
+                    )
                 if "option_pnl_pct" in proof_columns:
                     sets.append("option_pnl_pct=%s")
                     values.append(float(result.realized_pnl_pct))
@@ -2217,6 +2483,7 @@ class APPositionManager:
         setup_status: str,
         execution_mode: str = "",
         exit_fill_price: Optional[float] = None,
+        fill_timestamp_quality: str = "",
         synthetic_entry: bool = False,
     ) -> bool:
         identity = self._resolve_terminal_proof_identity(
@@ -2306,6 +2573,7 @@ class APPositionManager:
                 local_order_id=local_order_id or "",
                 execution_mode=resolved_mode,
                 exit_fill_price=(float(exit_fill_price) if exit_fill_price is not None else None),
+                fill_timestamp_quality=fill_timestamp_quality,
             )
         except Exception as exc:
             log.error(
@@ -2387,6 +2655,7 @@ class APPositionManager:
         setup_status: str,
         execution_mode: str = "",
         exit_fill_price: Optional[float] = None,
+        fill_timestamp_quality: str = "",
         allow_fallback_insert: bool,
         missing_reason_code: str,
     ) -> bool:
@@ -2463,6 +2732,7 @@ class APPositionManager:
             setup_status=setup_status,
             execution_mode=str(identity.get("resolved_execution_mode") or execution_mode or "unknown"),
             exit_fill_price=exit_fill_price,
+            fill_timestamp_quality=fill_timestamp_quality,
             synthetic_entry=bool(identity.get("side_quarantined")) or str(identity.get("resolved_execution_mode") or "") not in {"live", "paper"},
         )
         if persisted:
@@ -3263,6 +3533,10 @@ class APPositionManager:
         exit_price: float,
         filled_qty: int,
         filled_ts: Optional[str] = None,
+        fill_timestamp_quality: str = "",
+        fill_timestamp_source: str = "",
+        fill_timestamp_key: str = "",
+        broker_order_updated_at=None,
         local_order_id: str = "",
         broker_order_id: str = "",
         close_source: str = "broker_exit_fill",
@@ -3278,7 +3552,9 @@ class APPositionManager:
         chart price, or estimated option price.
 
         Writes: exit_price, realized_pnl, realized_pnl_pct, quantity_remaining,
-                exit_ts, close_source, close_confidence, status (CLOSED when full).
+                exit_ts (only for exact execution time), separate observation
+                time/quality, close_source, close_confidence, status (CLOSED
+                when full).
 
         Called by:
           - APOrderStateMachine.transition() when EXIT_FILLED succeeds
@@ -3320,7 +3596,72 @@ class APPositionManager:
             )
             return False
 
-        ts = filled_ts or now_utc_iso()
+        timestamp_quality = str(fill_timestamp_quality or "").strip()
+        timestamp_source = str(fill_timestamp_source or "").strip()
+        timestamp_key = str(fill_timestamp_key or "").strip()
+        normalized_filled_ts = _normalize_broker_filled_ts(filled_ts)
+        normalized_updated_at = _normalize_broker_filled_ts(broker_order_updated_at)
+
+        if timestamp_quality == FILL_TIMESTAMP_QUALITY_EXACT:
+            if (
+                normalized_filled_ts is None
+                or timestamp_source != BROKER_FILL_TIMESTAMP_SOURCE
+                or timestamp_key not in BROKER_FILL_TIMESTAMP_KEYS
+            ):
+                log.critical(
+                    "[%s] close_position_from_exit_fill blocked invalid exact timestamp evidence | pos=%s",
+                    self.client_id,
+                    position_id,
+                )
+                return False
+            exit_ts = normalized_filled_ts
+            observed_at = normalized_filled_ts
+        elif timestamp_quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY:
+            if (
+                filled_ts not in (None, "")
+                or normalized_updated_at is None
+                or timestamp_source != BROKER_ORDER_UPDATED_AT_SOURCE
+                or timestamp_key != BROKER_ORDER_UPDATED_AT_KEY
+            ):
+                log.critical(
+                    "[%s] close_position_from_exit_fill blocked invalid nonexact timestamp evidence | pos=%s",
+                    self.client_id,
+                    position_id,
+                )
+                return False
+            exit_ts = None
+            observed_at = normalized_updated_at
+        elif timestamp_quality == FILL_TIMESTAMP_QUALITY_UNAVAILABLE:
+            log.critical(
+                "[%s] close_position_from_exit_fill blocked unavailable timestamp evidence | pos=%s",
+                self.client_id,
+                position_id,
+            )
+            return False
+        elif external_close:
+            # External broker truth must carry an explicit chronology-quality
+            # classification.  This keeps old internal/test callers from
+            # changing semantics while preventing Tradier raw rows from
+            # reaching the money mutation through the local-time fallback.
+            log.critical(
+                "[%s] close_position_from_exit_fill blocked external fill without timestamp quality | pos=%s",
+                self.client_id,
+                position_id,
+            )
+            return False
+        else:
+            # Legacy internal callers may still provide an exact timestamp but
+            # predate the quality field.  Preserve their existing lifecycle
+            # behavior; production broker/external paths above are explicit.
+            if filled_ts not in (None, "") and normalized_filled_ts is None:
+                log.critical(
+                    "[%s] close_position_from_exit_fill blocked malformed legacy timestamp | pos=%s",
+                    self.client_id,
+                    position_id,
+                )
+                return False
+            exit_ts = normalized_filled_ts or now_utc_iso()
+            observed_at = exit_ts
 
         def _fn():
             with conn() as c:
@@ -3400,7 +3741,15 @@ class APPositionManager:
                         "entry_ts": str(pos.get("entry_ts") or ""),
                         "opened_at": str(pos.get("entry_ts") or ""),
                         "exit_ts": str(pos.get("exit_ts") or ""),
-                        "closed_at": str(pos.get("exit_ts") or ""),
+                        "exit_observed_at": str(pos.get("exit_observed_at") or ""),
+                        "exit_timestamp_quality": str(
+                            pos.get("exit_timestamp_quality") or ""
+                        ),
+                        "closed_at": str(
+                            pos.get("exit_ts")
+                            or pos.get("exit_observed_at")
+                            or ""
+                        ),
                         "local_order_id": str(pos.get("local_order_id") or ""),
                         "broker_order_id": str(pos.get("broker_order_id") or ""),
                         "exit_reason": str(pos.get("exit_reason") or ""),
@@ -3437,6 +3786,23 @@ class APPositionManager:
                         self.client_id, position_id,
                     )
                     return False, "external_close_exit_owner_present"
+
+                if timestamp_quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY:
+                    # A non-exact chronology must never be accepted into a
+                    # legacy schema that has nowhere to retain its quality
+                    # and observation boundary.  Otherwise the write would
+                    # silently collapse order-update evidence into an
+                    # apparently ordinary close.
+                    missing_projection_columns = [
+                        column
+                        for column in ("exit_observed_at", "exit_timestamp_quality")
+                        if not self._has_position_column(column)
+                    ]
+                    if missing_projection_columns:
+                        return False, (
+                            "projection_schema_missing:"
+                            + ",".join(missing_projection_columns)
+                        )
 
                 avg_fill = float(pos.get("avg_fill") or pos.get("entry_price") or 0)
                 qty      = int(pos.get("qty") or 0)
@@ -3479,7 +3845,9 @@ class APPositionManager:
                 _add("realized_pnl",       realized_pnl)
                 _add("realized_pnl_pct",   realized_pnl_pct)
                 _add("quantity_remaining", new_remaining)
-                _add("exit_ts",            ts)
+                _add("exit_ts",            exit_ts)
+                _add("exit_observed_at",   observed_at)
+                _add("exit_timestamp_quality", timestamp_quality)
                 _add("exit_reason",        exit_reason)
                 _add("close_source",       close_source)
                 _add("close_confidence",   close_confidence)
@@ -3517,9 +3885,11 @@ class APPositionManager:
                     "qty": int(pos.get("qty") or 0),
                     "avg_fill": avg_fill,
                     "entry_ts": str(pos.get("entry_ts") or ""),
-                    "exit_ts": str(ts),
+                    "exit_ts": str(exit_ts or ""),
+                    "exit_observed_at": str(observed_at or ""),
+                    "exit_timestamp_quality": timestamp_quality,
                     "opened_at": str(pos.get("entry_ts") or ""),
-                    "closed_at": str(ts),
+                    "closed_at": str(observed_at),
                     "entry_option_price": avg_fill,
                     "local_order_id": str(pos.get("local_order_id") or ""),
                     "exit_local_order_id": str(local_order_id or ""),
@@ -3557,7 +3927,12 @@ class APPositionManager:
                         ),
                         side=str(persisted.get("side") or persisted.get("direction") or ""),
                         opened_at=str(persisted.get("opened_at") or persisted.get("entry_ts") or ""),
-                        closed_at=str(persisted.get("closed_at") or persisted.get("exit_ts") or ""),
+                        closed_at=str(
+                            persisted.get("closed_at")
+                            or persisted.get("exit_observed_at")
+                            or persisted.get("exit_ts")
+                            or ""
+                        ),
                         entry_option_price=float(
                             persisted.get("entry_option_price") or persisted.get("avg_fill") or 0
                         ),
@@ -3568,6 +3943,9 @@ class APPositionManager:
                         setup_status=str(persisted.get("close_source") or ""),
                         execution_mode=str(persisted.get("execution_mode") or ""),
                         exit_fill_price=float(persisted.get("exit_price") or 0),
+                        fill_timestamp_quality=str(
+                            persisted.get("exit_timestamp_quality") or ""
+                        ),
                         allow_fallback_insert=True,
                         missing_reason_code="MANUAL_CLOSE_IDEMPOTENT_PROOF_REPAIR",
                     ),
@@ -3708,7 +4086,12 @@ class APPositionManager:
                         underlying=str(detail.get("underlying") or detail.get("contract") or ""),
                         side=str(detail.get("side") or detail.get("direction") or ""),
                         opened_at=str(detail.get("opened_at") or detail.get("entry_ts") or ""),
-                        closed_at=str(detail.get("closed_at") or detail.get("exit_ts") or ""),
+                        closed_at=str(
+                            detail.get("closed_at")
+                            or detail.get("exit_observed_at")
+                            or detail.get("exit_ts")
+                            or ""
+                        ),
                         entry_option_price=float(detail.get("entry_option_price") or detail.get("avg_fill") or 0),
                         exit_option_price=float(detail.get("exit_price") or exit_px),
                         contracts=int(detail.get("qty") or 0),
@@ -3717,6 +4100,9 @@ class APPositionManager:
                         setup_status=str(detail.get("close_source") or close_source or "broker_exit_fill"),
                         execution_mode=str(detail.get("execution_mode") or ""),
                         exit_fill_price=float(detail.get("exit_price") or exit_px),
+                        fill_timestamp_quality=str(
+                            detail.get("exit_timestamp_quality") or ""
+                        ),
                         allow_fallback_insert=True,
                         missing_reason_code="BROKER_TRUTH_CLOSE_PROOF_WRITE_FAILED",
                     ),
@@ -3847,7 +4233,12 @@ class APPositionManager:
                 ),
                 side=str(persisted.get("side") or persisted.get("direction") or ""),
                 opened_at=str(persisted.get("entry_ts") or persisted.get("opened_at") or ""),
-                closed_at=str(persisted.get("exit_ts") or persisted.get("closed_at") or ""),
+                closed_at=str(
+                    persisted.get("exit_ts")
+                    or persisted.get("exit_observed_at")
+                    or persisted.get("closed_at")
+                    or ""
+                ),
                 entry_option_price=float(
                     persisted.get("avg_fill") or persisted.get("entry_price") or 0
                 ),
@@ -3858,6 +4249,9 @@ class APPositionManager:
                 setup_status=str(persisted.get("close_source") or ""),
                 execution_mode=str(persisted.get("execution_mode") or ""),
                 exit_fill_price=float(persisted.get("exit_price") or 0),
+                fill_timestamp_quality=str(
+                    persisted.get("exit_timestamp_quality") or ""
+                ),
                 allow_fallback_insert=True,
                 missing_reason_code="TERMINAL_PROOF_RESTART_RECOVERY",
             ),

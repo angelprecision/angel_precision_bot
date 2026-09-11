@@ -63,6 +63,15 @@ from ap.exit_safety import (
     _exit_position_terminal_state,
     _normalize_contract,
 )
+from ap.manual_close_reconciliation import (
+    BROKER_FILL_TIMESTAMP_KEYS,
+    BROKER_FILL_TIMESTAMP_SOURCE,
+    BROKER_ORDER_UPDATED_AT_KEY,
+    BROKER_ORDER_UPDATED_AT_SOURCE,
+    FILL_TIMESTAMP_QUALITY_EXACT,
+    FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY,
+    FILL_TIMESTAMP_QUALITY_UNAVAILABLE,
+)
 try:
     from psycopg2 import errors as pg_errors
 except ImportError:
@@ -91,6 +100,25 @@ def _normalize_broker_submitted_ts(value) -> str | None:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("broker_submitted_ts must be timezone-aware")
     return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _normalize_broker_filled_ts(value) -> str | None:
+    """Normalize an exact timezone-aware broker execution timestamp."""
+    if value is None or str(value).strip() == "":
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    try:
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return None
 
 # P0 client-parity (2026-06-04): canonical_signal_id groups the same
 # market opportunity across every active eligible client account so the
@@ -444,7 +472,15 @@ class APOrderStateMachine:
         try:
             return method(*args, **kwargs)
         except TypeError:
-            for drop_key in ("identity_quarantine", "reconciled", "status"):
+            for drop_key in (
+                "identity_quarantine",
+                "reconciled",
+                "status",
+                "fill_timestamp_quality",
+                "fill_timestamp_source",
+                "fill_timestamp_key",
+                "broker_order_updated_at",
+            ):
                 kwargs.pop(drop_key, None)
             try:
                 return method(*args, **kwargs)
@@ -1089,6 +1125,10 @@ class APOrderStateMachine:
         last_error=None,
         submitted_ts=None,
         filled_ts=None,
+        fill_timestamp_quality=None,
+        fill_timestamp_source=None,
+        fill_timestamp_key=None,
+        broker_order_updated_at=None,
         position_id=None,
         allow_submit_owner_terminalization: bool = False,
     ) -> bool:
@@ -1109,6 +1149,7 @@ class APOrderStateMachine:
         old_status  = str(current.get("status") or "")
         kind        = str(current.get("kind") or "")
         prev_filled = self._safe_int(current.get("filled_qty"), 0)
+        incoming_filled = None
         same_state_fill_update = False
         same_state_identity_update = False
 
@@ -1129,6 +1170,124 @@ class APOrderStateMachine:
                     fill_price=fill_price, last_error=last_error,
                 )
                 return False
+
+        effective_filled = incoming_filled if incoming_filled is not None else prev_filled
+        # EXIT fill chronology is status-authority: enforce even if kind is
+        # missing/mis-tagged so EXIT_* fill statuses cannot durable-mutate
+        # without either an exact execution timestamp or an explicit,
+        # timezone-aware Tradier order-update evidence classification.
+        if (
+            new_status in (OrderStatus.EXIT_PARTIAL_FILL, OrderStatus.EXIT_FILLED)
+            and effective_filled > 0
+        ):
+            timestamp_quality = str(fill_timestamp_quality or "").strip()
+            timestamp_source = str(fill_timestamp_source or "").strip()
+            timestamp_key = str(fill_timestamp_key or "").strip()
+            normalized_filled_ts = _normalize_broker_filled_ts(filled_ts)
+            normalized_order_updated_at = _normalize_broker_filled_ts(
+                broker_order_updated_at
+            )
+            current_filled_ts = _normalize_broker_filled_ts(
+                current.get("filled_ts")
+            )
+            current_meta = current.get("meta") or {}
+            if isinstance(current_meta, str):
+                try:
+                    current_meta = json.loads(current_meta)
+                except Exception:
+                    current_meta = {}
+            if not isinstance(current_meta, dict):
+                current_meta = {}
+            if not timestamp_quality:
+                # Existing exact callers predate the quality argument. A
+                # valid filled_ts remains exact legacy evidence.
+                timestamp_quality = FILL_TIMESTAMP_QUALITY_EXACT
+                timestamp_source = timestamp_source or BROKER_FILL_TIMESTAMP_SOURCE
+                timestamp_key = timestamp_key or "filled_ts"
+            elif (
+                timestamp_quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY
+                and current_filled_ts is not None
+                and effective_filled <= prev_filled
+                and str(
+                    current_meta.get("exit_fill_timestamp_quality") or ""
+                ).strip()
+                in {"", FILL_TIMESTAMP_QUALITY_EXACT}
+            ):
+                # A weaker repeat poll must not erase an already-proven exact
+                # chronology when cumulative economics did not advance.
+                timestamp_quality = FILL_TIMESTAMP_QUALITY_EXACT
+                timestamp_source = (
+                    str(current_meta.get("exit_fill_timestamp_source") or "").strip()
+                    or BROKER_FILL_TIMESTAMP_SOURCE
+                )
+                timestamp_key = (
+                    str(current_meta.get("exit_fill_timestamp_key") or "").strip()
+                    or "filled_ts"
+                )
+                filled_ts = current_filled_ts
+                normalized_filled_ts = current_filled_ts
+            evidence_valid = (
+                timestamp_quality == FILL_TIMESTAMP_QUALITY_EXACT
+                and normalized_filled_ts is not None
+                and timestamp_source == BROKER_FILL_TIMESTAMP_SOURCE
+                and timestamp_key in BROKER_FILL_TIMESTAMP_KEYS
+            ) or (
+                timestamp_quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY
+                and filled_ts in (None, "")
+                and normalized_order_updated_at is not None
+                and timestamp_source == BROKER_ORDER_UPDATED_AT_SOURCE
+                and timestamp_key == BROKER_ORDER_UPDATED_AT_KEY
+            )
+            if not evidence_valid:
+                reason = "EXIT_FILL_TIMESTAMP_MISSING_OR_INVALID"
+                log.critical(
+                    "[%s] %s | order=%s broker=%s position=%s contract=%s "
+                    "status=%s->%s filled_qty=%s fill_price=%s action=HOLD "
+                    "position_mutated=false order_terminalized=false",
+                    self.client_id, reason, local_order_id,
+                    broker_order_id or current.get("broker_order_id") or "?",
+                    position_id or current.get("position_id") or "?",
+                    current.get("contract") or current.get("symbol") or "?",
+                    old_status, new_status, effective_filled, fill_price,
+                )
+                self._emit_transition_event(
+                    local_order_id=local_order_id,
+                    old_status=old_status,
+                    new_status=new_status,
+                    order=current,
+                    decision="HOLD",
+                    reason_code=reason,
+                    explanation=(
+                        "Refusing positive EXIT fill before durable mutation: "
+                        "exact execution time or explicit non-exact order-update "
+                        "evidence is required."
+                    ),
+                    broker_order_id=broker_order_id,
+                    filled_qty=effective_filled,
+                    fill_price=fill_price,
+                    last_error=last_error,
+                    extra_inputs={
+                        "position_id": position_id or current.get("position_id"),
+                        "action": "HOLD",
+                        "position_mutated": False,
+                        "order_terminalized": False,
+                    },
+                )
+                return False
+            if timestamp_quality == FILL_TIMESTAMP_QUALITY_EXACT:
+                filled_ts = normalized_filled_ts
+            else:
+                filled_ts = None
+            # Make the validated values available to the durable metadata
+            # merge below.  The raw order-update time never enters filled_ts.
+            fill_timestamp_quality = timestamp_quality
+            fill_timestamp_source = timestamp_source
+            fill_timestamp_key = timestamp_key
+            broker_order_updated_at = (
+                normalized_order_updated_at.isoformat()
+                if normalized_order_updated_at is not None
+                else None
+            )
 
         if old_status == new_status:
             if new_status in (OrderStatus.PARTIAL_FILL, OrderStatus.EXIT_PARTIAL_FILL):
@@ -1196,13 +1355,42 @@ class APOrderStateMachine:
             # must remain NULL so the durable position converger can HOLD
             # instead of turning processing time into execution time.
             updates.append("filled_ts=%s"); params.append(filled_ts or now_utc_iso())
-        elif new_status in (OrderStatus.EXIT_PARTIAL_FILL, OrderStatus.EXIT_FILLED) and filled_ts:
-            updates.append("filled_ts=%s"); params.append(filled_ts)
-        if kind.upper() == "ENTRY" and OrderStatus.is_terminal(new_status):
-            updates.append(
-                "meta=COALESCE(meta, '{}'::jsonb) "
-                "|| '{\"selector_recovery_cursor_v1\":null}'::jsonb"
+        elif new_status in (OrderStatus.EXIT_PARTIAL_FILL, OrderStatus.EXIT_FILLED):
+            updates.append("filled_ts=%s")
+            params.append(
+                filled_ts
+                if fill_timestamp_quality == FILL_TIMESTAMP_QUALITY_EXACT
+                else None
             )
+        meta_patch = {}
+        if (
+            kind.upper() == "EXIT"
+            and effective_filled > 0
+            and fill_timestamp_quality
+        ):
+            # Persist chronology quality beside the broker fill economics. For
+            # an exact fill this is diagnostic provenance; for Tradier's
+            # transaction_date-only shape it is the explicit non-exact
+            # authorization consumed by the durable converger.
+            current_filled_ts = _normalize_broker_filled_ts(
+                current.get("filled_ts")
+            )
+            meta_patch.update(
+                {
+                    "exit_fill_timestamp_quality": fill_timestamp_quality,
+                    "exit_fill_timestamp_source": str(fill_timestamp_source or ""),
+                    "exit_fill_timestamp_key": str(fill_timestamp_key or ""),
+                }
+            )
+            if broker_order_updated_at is not None:
+                meta_patch["broker_order_updated_at"] = broker_order_updated_at
+        if kind.upper() == "ENTRY" and OrderStatus.is_terminal(new_status):
+            meta_patch["selector_recovery_cursor_v1"] = None
+        if meta_patch:
+            updates.append(
+                "meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb"
+            )
+            params.append(json.dumps(meta_patch, separators=(",", ":"), sort_keys=True))
         # COMPARE-AND-SWAP: guard the UPDATE on the status we read above.
         # Without this, two concurrent callers (fill_monitor / order_monitor /
         # reconciler all run in separate threads) can both pass the Python-side
@@ -1395,7 +1583,7 @@ class APOrderStateMachine:
                 reason_code="EXIT_CONVERGENCE_HOLD",
                 explanation=(
                     "Durable EXIT fill was persisted but canonical position "
-                    "convergence did not prove exact fill authority."
+                    "convergence did not prove fill occurrence authority."
                 ),
                 broker_order_id=broker_order_id,
                 filled_qty=filled_qty,
@@ -1426,6 +1614,11 @@ class APOrderStateMachine:
         client_id: str | None = None,
         broker_submitted_ts=None,
         source: str = "broker_owned_exit_request_recovery",
+        fill_timestamp_quality: str | None = None,
+        fill_timestamp_source: str | None = None,
+        fill_timestamp_key: str | None = None,
+        filled_ts=None,
+        broker_order_updated_at=None,
     ) -> dict:
         """Adopt one exact broker-owned EXIT_REQUESTED row into EXIT_SUBMITTED.
 
@@ -1453,6 +1646,43 @@ class APOrderStateMachine:
         ).strip()
         expected_position = str(position_id or "").strip()
         source_text = str(source or "").strip()
+        timestamp_quality = str(fill_timestamp_quality or "").strip()
+        timestamp_source = str(fill_timestamp_source or "").strip()
+        timestamp_key = str(fill_timestamp_key or "").strip()
+        normalized_filled_ts = _normalize_broker_filled_ts(filled_ts)
+        normalized_order_updated_at = _normalize_broker_filled_ts(
+            broker_order_updated_at
+        )
+        timestamp_evidence_supplied = any(
+            value not in (None, "")
+            for value in (
+                fill_timestamp_quality,
+                fill_timestamp_source,
+                fill_timestamp_key,
+                filled_ts,
+                broker_order_updated_at,
+            )
+        )
+        if timestamp_evidence_supplied and not timestamp_quality:
+            # Preserve the pre-quality API contract for an explicit valid
+            # broker execution timestamp, while never guessing from a local
+            # lifecycle time or from transaction_date.
+            if normalized_filled_ts is not None:
+                timestamp_quality = FILL_TIMESTAMP_QUALITY_EXACT
+                timestamp_source = timestamp_source or BROKER_FILL_TIMESTAMP_SOURCE
+                timestamp_key = timestamp_key or "filled_ts"
+        timestamp_evidence_valid = not timestamp_evidence_supplied or (
+            timestamp_quality == FILL_TIMESTAMP_QUALITY_EXACT
+            and normalized_filled_ts is not None
+            and timestamp_source == BROKER_FILL_TIMESTAMP_SOURCE
+            and timestamp_key in BROKER_FILL_TIMESTAMP_KEYS
+        ) or (
+            timestamp_quality == FILL_TIMESTAMP_QUALITY_ORDER_UPDATE_ONLY
+            and filled_ts in (None, "")
+            and normalized_order_updated_at is not None
+            and timestamp_source == BROKER_ORDER_UPDATED_AT_SOURCE
+            and timestamp_key == BROKER_ORDER_UPDATED_AT_KEY
+        )
         # Binding audit correction (Blocker 3): reject anything that is not
         # an exact positive integer.  ``bool`` inherits from ``int`` in
         # Python and is rejected explicitly.  Strings, floats, ``None``,
@@ -1503,6 +1733,15 @@ class APOrderStateMachine:
                 "order": order,
                 "broker_submitted_ts": normalized_broker_submitted_ts,
                 "broker_submitted_ts_source": submitted_ts_source,
+                "fill_timestamp_quality": timestamp_quality,
+                "fill_timestamp_source": timestamp_source,
+                "fill_timestamp_key": timestamp_key,
+                "filled_ts": (
+                    normalized_filled_ts
+                    if timestamp_quality == FILL_TIMESTAMP_QUALITY_EXACT
+                    else None
+                ),
+                "broker_order_updated_at": normalized_order_updated_at,
             }
 
         if (
@@ -1522,11 +1761,16 @@ class APOrderStateMachine:
             # mandatory positive-integer identity.  ``None`` here means the
             # caller omitted it or supplied a non-positive/non-integer.
             or expected_qty_value is None
+            or not timestamp_evidence_valid
         ):
             return _result(
                 "IDENTITY_MISMATCH",
                 reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
-                error="invalid_recovery_identity",
+                error=(
+                    "invalid_fill_timestamp_evidence"
+                    if timestamp_evidence_supplied and not timestamp_evidence_valid
+                    else "invalid_recovery_identity"
+                ),
             )
         if invalid_submitted_ts_error:
             return _result(
@@ -1574,6 +1818,20 @@ class APOrderStateMachine:
             diagnostic_payload["broker_submitted_ts"] = (
                 normalized_broker_submitted_ts
             )
+        if timestamp_evidence_supplied:
+            diagnostic_payload.update(
+                {
+                    "exit_fill_timestamp_quality": timestamp_quality,
+                    "exit_fill_timestamp_source": timestamp_source,
+                    "exit_fill_timestamp_key": timestamp_key,
+                }
+            )
+            if normalized_filled_ts is not None:
+                diagnostic_payload["filled_ts"] = normalized_filled_ts
+            if normalized_order_updated_at is not None:
+                diagnostic_payload["broker_order_updated_at"] = (
+                    normalized_order_updated_at
+                )
 
         diagnostic = json.dumps(
             diagnostic_payload
@@ -1702,6 +1960,10 @@ class APOrderStateMachine:
                     "stale_age_reference": diagnostic_payload[
                         "broker_ownership_stale_age_reference"
                     ],
+                    "fill_timestamp_quality": timestamp_quality,
+                    "fill_timestamp_source": timestamp_source,
+                    "fill_timestamp_key": timestamp_key,
+                    "broker_order_updated_at": normalized_order_updated_at,
                 },
             )
             self._handle_exit_engine_hooks(
@@ -1992,6 +2254,24 @@ class APOrderStateMachine:
                 if _durable_result is not None
                 else 0
             )
+            _fill_timestamp_kwargs = {}
+            if _durable_result is not None and getattr(
+                _durable_result, "fill_timestamp_quality", ""
+            ):
+                _fill_timestamp_kwargs = {
+                    "fill_timestamp_quality": getattr(
+                        _durable_result, "fill_timestamp_quality", ""
+                    ),
+                    "fill_timestamp_source": getattr(
+                        _durable_result, "fill_timestamp_source", ""
+                    ),
+                    "fill_timestamp_key": getattr(
+                        _durable_result, "fill_timestamp_key", ""
+                    ),
+                    "broker_order_updated_at": getattr(
+                        _durable_result, "broker_order_updated_at", None
+                    ),
+                }
 
             # ── EXIT_SUBMITTED ─────────────────────────────────────────────
             if new_status == OrderStatus.EXIT_SUBMITTED:
@@ -2036,6 +2316,7 @@ class APOrderStateMachine:
                         local_order_id=str(_local_id or ""),
                         broker_order_id=str(_broker_id or ""),
                         cumulative_filled=_cum_filled,
+                        **_fill_timestamp_kwargs,
                     )
                 elif (
                     _durable_result is not None
@@ -2050,6 +2331,7 @@ class APOrderStateMachine:
                         local_order_id=str(_local_id or ""),
                         broker_order_id=str(_broker_id or ""),
                         cumulative_filled=_cum_filled,
+                        **_fill_timestamp_kwargs,
                     )
                 return
 
@@ -2065,6 +2347,7 @@ class APOrderStateMachine:
                         local_order_id=str(_local_id or ""),
                         broker_order_id=str(_broker_id or ""),
                         cumulative_filled=_cum_filled,
+                        **_fill_timestamp_kwargs,
                     )
                     return
                 if (
@@ -2115,6 +2398,7 @@ class APOrderStateMachine:
                     local_order_id=str(_local_id or ""),
                     broker_order_id=str(_broker_id or ""),
                     cumulative_filled=_cum_filled,
+                    **_fill_timestamp_kwargs,
                 )
                 return
 
@@ -2182,6 +2466,10 @@ class APOrderStateMachine:
         fill_price=None,
         broker_order_id=None,
         filled_ts=None,
+        fill_timestamp_quality=None,
+        fill_timestamp_source=None,
+        fill_timestamp_key=None,
+        broker_order_updated_at=None,
     ) -> bool:
         order = self._get_order(local_order_id)
         if not order:
@@ -2205,6 +2493,10 @@ class APOrderStateMachine:
             filled_qty=cumulative_filled,
             fill_price=fill_price,
             filled_ts=filled_ts,
+            fill_timestamp_quality=fill_timestamp_quality,
+            fill_timestamp_source=fill_timestamp_source,
+            fill_timestamp_key=fill_timestamp_key,
+            broker_order_updated_at=broker_order_updated_at,
         )
 
     def increment_retry(self, local_order_id: str):

@@ -139,6 +139,9 @@ class _FakeCursor:
                 if f"{column}=%s" in set_clause:
                     updates[column] = params[index]
                     index += 1
+            if "meta=COALESCE(meta" in set_clause:
+                updates["meta"] = json.loads(params[index])
+                index += 1
             local_id = str(params[index])
             client_id = str(params[index + 1])
             expected_status = params[index + 2]
@@ -159,7 +162,10 @@ class _FakeCursor:
                 )
             )
             if matches:
+                meta_patch = updates.pop("meta", None)
                 row.update(updates)
+                if meta_patch is not None:
+                    row["meta"] = {**(row.get("meta") or {}), **meta_patch}
                 row["updated_ts"] = "updated-ts"
                 self.rowcount = 1
             else:
