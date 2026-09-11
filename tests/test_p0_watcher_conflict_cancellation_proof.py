@@ -32,6 +32,7 @@ class FakeOSM:
         self.meta_expected_statuses = []
         self.meta_expected_execution_modes = []
         self.meta_expected_signal_ids = []
+        self.meta_expected_canonical_signal_ids = []
 
     def has_order(self, local_order_id):
         return local_order_id in self.rows
@@ -63,11 +64,15 @@ class FakeOSM:
         expected_status=None,
         expected_execution_mode=None,
         expected_signal_id=None,
+        expected_canonical_signal_id=None,
+        expected_new_trigger_authority=False,
+        expected_existing_trigger_authority=False,
     ):
         self.meta_calls.append((local_order_id, dict(patch)))
         self.meta_expected_statuses.append(expected_status)
         self.meta_expected_execution_modes.append(expected_execution_mode)
         self.meta_expected_signal_ids.append(expected_signal_id)
+        self.meta_expected_canonical_signal_ids.append(expected_canonical_signal_id)
         if self.observer:
             self.observer("meta", local_order_id)
         result = self.meta_results.get(local_order_id, True)
@@ -93,6 +98,29 @@ class FakeOSM:
             != str(expected_signal_id).strip()
         ):
             return False
+        if (
+            expected_canonical_signal_id is not None
+            and str(
+                self.rows[local_order_id].get("canonical_signal_id")
+                or self.rows[local_order_id].get("meta", {}).get("canonical_signal_id")
+                or ""
+            ).strip()
+            != str(expected_canonical_signal_id).strip()
+        ):
+            return False
+        if expected_new_trigger_authority:
+            current_meta = self.rows[local_order_id].get("meta") or {}
+            if "trigger_crossed_at" in current_meta or "trigger_crossed_at_provenance" in current_meta:
+                return False
+        if expected_existing_trigger_authority:
+            current_meta = self.rows[local_order_id].get("meta") or {}
+            if (
+                current_meta.get("trigger_crossed_at")
+                != patch.get("trigger_crossed_at")
+                or current_meta.get("trigger_crossed_at_provenance")
+                != patch.get("trigger_crossed_at_provenance")
+            ):
+                return False
         self.rows[local_order_id].setdefault("meta", {}).update(dict(patch))
         return True
 
@@ -1058,9 +1086,11 @@ def test_confirmed_call_wins_and_cancels_prebreach_put_before_callback():
     assert osm.cancel_calls == [
         ("put-lo", "confirmed_breach_direction_claim_lost")
     ]
-    assert osm.meta_expected_statuses == ["PENDING_TRIGGER"]
-    assert osm.meta_expected_execution_modes == ["paper"]
-    assert osm.meta_expected_signal_ids == ["call"]
+    # The winner is first claimed before loser cancellation and then
+    # re-CASed before downstream callback execution.
+    assert osm.meta_expected_statuses == ["PENDING_TRIGGER", "PENDING_TRIGGER"]
+    assert osm.meta_expected_execution_modes == ["paper", "paper"]
+    assert osm.meta_expected_signal_ids == ["call", "call"]
     assert osm.rows["put-lo"]["status"] == "CANCELED"
     assert watcher.has_order("put-lo") is False
     assert watcher.has_order("call-lo") is False

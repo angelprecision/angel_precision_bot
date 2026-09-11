@@ -81,11 +81,54 @@ class _MockOSM:
             "execution_mode": "paper",
         }
 
-    def update_order_meta(self, local_order_id: str, meta_patch: dict) -> bool:
+    def update_order_meta(
+        self,
+        local_order_id: str,
+        meta_patch: dict,
+        **_expected,
+    ) -> bool:
         self.meta_writes.append((local_order_id, dict(meta_patch)))
         self._ensure(local_order_id)
         self._row_meta[local_order_id].update(meta_patch)
         return True
+
+    def read_trigger_confirmation_authority(
+        self,
+        local_order_id: str,
+        *,
+        client_id: str,
+        execution_mode: str,
+        signal_id: str,
+        canonical_signal_id: str,
+        expected_materialization_generation=None,
+    ) -> dict | None:
+        row = self.get_order(local_order_id)
+        meta = row.get("meta") or {}
+        provenance = meta.get("trigger_crossed_at_provenance")
+        if (
+            row.get("status") != "PENDING_TRIGGER"
+            or str(row.get("client_id") or "").lower() != str(client_id).lower()
+            or str(row.get("execution_mode") or "").lower() != str(execution_mode).lower()
+            or str(row.get("signal_id") or signal_id) != signal_id
+            or meta.get("trigger_crossed_at") is None
+            or not isinstance(provenance, dict)
+            or provenance != {
+                "canonical_signal_id": canonical_signal_id,
+                "client_id": str(client_id).lower(),
+                "execution_mode": str(execution_mode).lower(),
+                "local_order_id": local_order_id,
+            }
+        ):
+            return None
+        generation = meta.get("materialization_generation")
+        if expected_materialization_generation is not None and generation != expected_materialization_generation:
+            return None
+        return {
+            "proven": True,
+            "trigger_crossed_at": meta["trigger_crossed_at"],
+            "trigger_crossed_at_provenance": dict(provenance),
+            "materialization_generation": generation,
+        }
 
     def cancel_pending_entry(self, local_order_id: str, *, reason: str = "") -> bool:
         self.cancel_calls.append((local_order_id, reason))
@@ -254,12 +297,12 @@ class TestPreBreachStopActivationPut:
         events: list[str] = []
         osm_write_orig = osm.update_order_meta
 
-        def _tracing_meta_write(oid: str, patch: dict) -> bool:
+        def _tracing_meta_write(oid: str, patch: dict, **expected) -> bool:
             # Only mark ordering on the trigger-timestamp write; later
             # audit writes are noise for this ordering assertion.
             if "trigger_crossed_at" in patch:
                 events.append("meta_write")
-            return osm_write_orig(oid, patch)
+            return osm_write_orig(oid, patch, **expected)
         osm.update_order_meta = _tracing_meta_write  # type: ignore[assignment]
 
         def _on_trigger(ws: WatchedSignal):
@@ -658,7 +701,7 @@ def test_live_timestamp_persistence_retry_requires_durable_write_before_callback
     persist_attempts: list[dict] = []
     fail_persistence = True
 
-    def _meta_write(oid, patch):
+    def _meta_write(oid, patch, **_expected):
         nonlocal fail_persistence
         osm.meta_writes.append((oid, dict(patch)))
         persist_attempts.append(dict(patch))
@@ -824,6 +867,8 @@ def test_restart_plan_json_roundtrip_reaches_watcher_with_active_stop():
     assert armed.signal["local_order_id"] == "lo-restart-407"
     assert armed.signal["canonical_signal_id"] == "canonical-restart-407"
     assert armed.signal["materialization_generation"] == 7
+    assert armed._trigger_authority_persisted is True
+    assert armed._durable_trigger_crossed_at_raw == "2026-08-03T16:00:00+00:00"
     assert armed.trigger_crossed_at == datetime.fromisoformat(
         "2026-08-03T16:00:00+00:00"
     )

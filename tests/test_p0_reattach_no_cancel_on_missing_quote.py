@@ -78,8 +78,39 @@ def _make_watcher_for_reattach(monkeypatch, *, quote_bid=0, quote_ask=0):
 
     # Spy on the OSM cancel_pending_entry call — must be 0 for the fix.
     cancel_spy = MagicMock()
+    durable_authority = {}
+
+    def _read_trigger_confirmation_authority(
+        local_order_id,
+        *,
+        client_id,
+        execution_mode,
+        signal_id,
+        canonical_signal_id,
+        expected_materialization_generation=None,
+    ):
+        authority = durable_authority.get(local_order_id)
+        if not authority:
+            return None
+        if (
+            authority["client_id"].lower() != str(client_id or "").strip().lower()
+            or authority["execution_mode"].lower()
+            != str(execution_mode or "").strip().lower()
+            or authority["signal_id"] != str(signal_id or "").strip()
+            or authority["canonical_signal_id"] != str(canonical_signal_id or "").strip()
+        ):
+            return None
+        if (
+            expected_materialization_generation is not None
+            and authority.get("materialization_generation")
+            != expected_materialization_generation
+        ):
+            return None
+        return dict(authority)
+
     w.order_state_machine = SimpleNamespace(
         cancel_pending_entry=cancel_spy,
+        read_trigger_confirmation_authority=_read_trigger_confirmation_authority,
     )
     # Return the fake PENDING_TRIGGER order shape for recovery classifier.
     def _get_order(oid):
@@ -93,6 +124,26 @@ def _make_watcher_for_reattach(monkeypatch, *, quote_bid=0, quote_ask=0):
             "trigger_generation": 1,
         }
     w.order_state_machine.get_order = _get_order
+
+    _orig_watch = w.watch
+
+    def _watch_with_durable_fixture(plan, local_order_id, **kwargs):
+        meta = getattr(plan, "metadata", {}) or {}
+        provenance = meta.get("trigger_crossed_at_provenance")
+        if isinstance(provenance, dict) and meta.get("trigger_crossed_at"):
+            durable_authority[local_order_id] = {
+                "proven": True,
+                "trigger_crossed_at": meta["trigger_crossed_at"],
+                "trigger_crossed_at_provenance": dict(provenance),
+                "materialization_generation": meta.get("materialization_generation"),
+                "client_id": provenance.get("client_id", ""),
+                "execution_mode": provenance.get("execution_mode", ""),
+                "signal_id": str(getattr(plan, "signal_id", "") or "").strip(),
+                "canonical_signal_id": provenance.get("canonical_signal_id", ""),
+            }
+        return _orig_watch(plan, local_order_id, **kwargs)
+
+    w.watch = _watch_with_durable_fixture
 
     # Force the quote fetch to the requested (bid, ask).
     monkeypatch.setattr(w, "_get_quote", lambda _t: {"bid": quote_bid, "ask": quote_ask})
@@ -136,7 +187,6 @@ def _reattach_plan(*, local_order_id="local-existing-1", confirmed=False):
             "client_id": "jason@example.com",
             "execution_mode": "live",
             "local_order_id": local_order_id,
-            "materialization_generation": 1,
         }
     return SimpleNamespace(
         signal_id="sig-reattach-1",

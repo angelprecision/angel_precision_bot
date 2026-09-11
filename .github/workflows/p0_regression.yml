@@ -20,6 +20,7 @@ env:
     tests/test_p0_trade_flow_contracts.py
     tests/test_p0_fresh_sync_live_submit_quote.py
     tests/test_p0_canonical_live_entry_confirmation.py
+    tests/test_p0_trigger_confirmation_provenance_atomicity.py
     tests/test_p0_deferred_breach_lifecycle_completion.py
     tests/test_p0_amendment10_recovery_full_wiring.py
     tests/test_p0_amendment11_ownership_through_cleanup.py
