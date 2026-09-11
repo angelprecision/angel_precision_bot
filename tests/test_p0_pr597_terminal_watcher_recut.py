@@ -130,6 +130,15 @@ def test_legacy_materialization_reason_is_accepted_but_cannot_conflict():
     ) == ("TERMINAL_DURABLE", None)
 
 
+def test_materialization_reason_alone_is_legacy_terminal_authority():
+    row = _row(last_error=None, meta={"materialization_reason": TERMINAL_REASON})
+    watcher, watched, _, _ = _setup(row)
+
+    assert watcher._resolve_trigger_callback_disposition(
+        watched, {"disposition": "SUBMITTED"}
+    ) == ("TERMINAL_DURABLE", None)
+
+
 @pytest.mark.parametrize(
     "meta",
     [{}, {"watcher_audit": {"reason_code": "trigger_ready"}}],
@@ -206,6 +215,8 @@ def test_identity_mismatch_keeps_exact_watcher_and_suppresses_callback(row_patch
         {"meta": {"broker_submit_payload_hash": "hash"}},
         {"meta": {"broker_ready": True}},
         {"meta": {"materialization": {"broker_ready": True}}},
+        {"meta": {"submit_intent_owner": "watcher:terminal-convergence"}},
+        {"meta": {"recovery_submit_owner": "recovery:terminal-convergence"}},
     ],
 )
 def test_terminal_broker_handoff_evidence_is_reconciliation_hold(row_patch):
