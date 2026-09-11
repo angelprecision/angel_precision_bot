@@ -86,6 +86,52 @@ def _valid_dispatch_timestamp(value) -> bool:
     return parsed.tzinfo is not None
 
 
+# A process may die after installing CLAIMED but before it can install the
+# CALLBACK_STARTED fence.  Keep that narrow pre-callback window reclaimable,
+# while leaving the side-effect boundary (CALLBACK_STARTED) non-reclaimable.
+# This is a lease on the durable claim, not a callback retry scheduler.
+_RECOVERY_TRIGGER_DISPATCH_CLAIM_LEASE_SECONDS = 60
+
+
+def recovery_trigger_dispatch_claim_is_stale(
+    claimed_at,
+    lease_until=None,
+    *,
+    now: datetime | None = None,
+) -> bool | None:
+    """Return stale/fresh for a durable CLAIMED dispatch marker.
+
+    ``None`` means the marker is not safe to interpret.  Older markers may
+    predate the explicit lease field, so their valid ``claimed_at`` is used
+    with the same bounded policy.  An explicitly present malformed lease is
+    unknown authority and fails closed.
+    """
+    if not _valid_dispatch_timestamp(claimed_at):
+        return None
+    try:
+        claimed_dt = datetime.fromisoformat(str(claimed_at).replace("Z", "+00:00"))
+        if claimed_dt.tzinfo is None or claimed_dt.utcoffset() is None:
+            return None
+        if lease_until is None:
+            expiry_dt = claimed_dt + timedelta(
+                seconds=_RECOVERY_TRIGGER_DISPATCH_CLAIM_LEASE_SECONDS
+            )
+        else:
+            if not _valid_dispatch_timestamp(lease_until):
+                return None
+            expiry_dt = datetime.fromisoformat(
+                str(lease_until).replace("Z", "+00:00")
+            )
+            if expiry_dt.tzinfo is None or expiry_dt.utcoffset() is None:
+                return None
+        now_dt = now or datetime.now(timezone.utc)
+        if now_dt.tzinfo is None or now_dt.utcoffset() is None:
+            return None
+        return expiry_dt.astimezone(timezone.utc) <= now_dt.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _normalize_broker_submitted_ts(value) -> str | None:
     """Normalize an explicitly broker-sourced acceptance timestamp.
 
@@ -2691,10 +2737,12 @@ class APOrderStateMachine:
 
         This is the final durable TOCTOU fence for PR #580.  The exact ENTRY
         row is locked, all identity and generation authorities are proved, and
-        a durable claim marker is installed in one transaction.  A competing
-        broker/materializer owner therefore either appears before this claim
-        (and recovery HOLDs) or after it (and canonical downstream ownership
-        must reconcile without a second callback).
+        a durable claim marker is installed in one transaction.  A stale
+        pre-callback CLAIMED marker may be replaced once, with a new attempt
+        token, but CALLBACK_STARTED and downstream ownership remain held.
+        A competing broker/materializer owner therefore either appears before
+        this claim (and recovery HOLDs) or after it (and canonical downstream
+        ownership must reconcile without a second callback).
         """
         values = {
             "local_order_id": local_order_id,
@@ -2933,6 +2981,9 @@ class APOrderStateMachine:
                 existing_claimed_at = metadata.get(
                     "recovery_trigger_dispatch_claimed_at"
                 )
+                existing_lease_until = metadata.get(
+                    "recovery_trigger_dispatch_lease_until"
+                )
                 existing_state = str(
                     metadata.get("recovery_trigger_dispatch_state") or ""
                 ).strip().upper()
@@ -2960,13 +3011,27 @@ class APOrderStateMachine:
                         or prior_generation != prior_trigger_generation
                     ):
                         return False
-                    # Claim-once for a trigger generation.  A completed,
-                    # consumed, or ambiguous old attempt may be replaced only
-                    # after the durable trigger generation advances.
-                    if (
+                    if existing_attempt == dispatch_attempt_id:
+                        # A process/reconstruction must never reuse the exact
+                        # durable attempt token as a new claim.
+                        return False
+                    if existing_state == "CLAIMED":
+                        if prior_trigger_generation != candidate_trigger_generation:
+                            return False
+                        # CLAIMED is before the callback side-effect boundary.
+                        # Reclaim only after its bounded durable lease expires;
+                        # a fresh claim remains a hard no-steal.
+                        if recovery_trigger_dispatch_claim_is_stale(
+                            existing_claimed_at,
+                            existing_lease_until,
+                        ) is not True:
+                            return False
+                    elif (
                         prior_trigger_generation == candidate_trigger_generation
                         or existing_state not in terminal_dispatch_states
                     ):
+                        # CALLBACK_STARTED and terminal states remain
+                        # non-reclaimable for the same trigger generation.
                         return False
                 elif existing_owner is not None and existing_owner.strip():
                     # Legacy deterministic-owner claims have no attempt token;
@@ -2979,12 +3044,13 @@ class APOrderStateMachine:
                         existing_generation,
                         existing_trigger_generation,
                         existing_claimed_at,
+                        existing_lease_until,
                         metadata.get("recovery_trigger_dispatch_state"),
                     )
                 ):
                     # A partial dispatch marker is not safe to reinterpret as
-                    # an unclaimed row.  Missing attempt identity/lease data
-                    # makes callback cardinality unknowable.
+                    # an unclaimed row. Missing attempt identity or other
+                    # claim authority makes callback cardinality unknowable.
                     return False
                 if existing_generation is not None:
                     prior_generation = _strict_generation(existing_generation)
@@ -3006,6 +3072,12 @@ class APOrderStateMachine:
                         or existing_state not in terminal_dispatch_states
                     ) and prior_trigger_generation != candidate_trigger_generation:
                         return False
+                _claim_timestamp = datetime.now(timezone.utc)
+                _claim_timestamp_text = _claim_timestamp.isoformat()
+                _claim_lease_until_text = (
+                    _claim_timestamp
+                    + timedelta(seconds=_RECOVERY_TRIGGER_DISPATCH_CLAIM_LEASE_SECONDS)
+                ).isoformat()
                 patch = json.dumps(
                     {
                         "recovery_trigger_dispatch_owner": claim_owner,
@@ -3013,7 +3085,8 @@ class APOrderStateMachine:
                         "recovery_trigger_dispatch_state": "CLAIMED",
                         "recovery_trigger_dispatch_generation": candidate_generation,
                         "recovery_trigger_dispatch_trigger_generation": candidate_trigger_generation,
-                        "recovery_trigger_dispatch_claimed_at": now_utc_iso(),
+                        "recovery_trigger_dispatch_claimed_at": _claim_timestamp_text,
+                        "recovery_trigger_dispatch_lease_until": _claim_lease_until_text,
                         "recovery_trigger_dispatch_finished_at": None,
                     }
                 )
@@ -3040,6 +3113,15 @@ class APOrderStateMachine:
                     "COALESCE(meta->>'recovery_trigger_dispatch_state','') IN "
                     "('CONSUMED','COMPLETED','AMBIGUOUS') "
                     "AND COALESCE(meta->>'recovery_trigger_dispatch_trigger_generation','')<>%s"
+                    ") OR ("
+                    "COALESCE(meta->>'recovery_trigger_dispatch_attempt_id','')=%s "
+                    "AND COALESCE(meta->>'recovery_trigger_dispatch_state','')='CLAIMED' "
+                    "AND COALESCE(meta->>'recovery_trigger_dispatch_trigger_generation','')=%s "
+                    "AND ((NULLIF(meta->>'recovery_trigger_dispatch_lease_until','') "
+                    "IS NOT NULL AND (meta->>'recovery_trigger_dispatch_lease_until')::timestamptz <= NOW()) "
+                    "OR (NULLIF(meta->>'recovery_trigger_dispatch_lease_until','') IS NULL "
+                    "AND (meta->>'recovery_trigger_dispatch_claimed_at')::timestamptz "
+                    "<= NOW() - INTERVAL '60 seconds'))"
                     ")"
                     ")"
                 )
@@ -3048,6 +3130,8 @@ class APOrderStateMachine:
                         local_order_id,
                         client_id,
                         execution_mode,
+                        str(candidate_trigger_generation),
+                        str(existing_attempt or ""),
                         str(candidate_trigger_generation),
                     ]
                 )
@@ -3085,7 +3169,7 @@ class APOrderStateMachine:
         expected_state: str,
         next_state: str,
     ) -> bool:
-        """Atomically advance one claim-once callback state.
+        """Atomically advance one durable recovery callback state.
 
         The claim token and trigger generation are both required.  This helper
         is used before and after the callback so a reconstructed process can

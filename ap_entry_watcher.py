@@ -826,11 +826,13 @@ class WatchedSignal:
             self.state == WatchState.PENDING
             and not self.rearm_mode
             and not self._ownership_quarantine
-            # A recovered TRIGGER_READY cursor is claim-once.  KEEP_WATCHER
-            # leaves the exact watcher in the registry for ownership/diagnostic
+            # A recovered TRIGGER_READY cursor is callback-once after the
+            # durable attempt crosses CALLBACK_STARTED.  KEEP_WATCHER leaves
+            # the exact watcher in the registry for ownership/diagnostic
             # continuity, but it must not re-enter quote polling after its
-            # durable callback attempt has been consumed.  A later durable
-            # trigger generation is admitted as a new recovery object.
+            # durable callback attempt has been consumed.  A stale
+            # pre-callback CLAIMED attempt may be replaced on restart; a later
+            # durable trigger generation is admitted as a new recovery object.
             and not bool(
                 (getattr(self, "signal", {}) or {}).get(
                     "__recovered_trigger_ready"
@@ -8296,8 +8298,8 @@ class APEntryWatcher:
                             self._resolve_trigger_callback_disposition(w, _callback_result)
                         )
                         if _is_recovered_trigger_ready:
-                            # A recovered TRIGGER_READY row has a claim-once
-                            # durable cursor.  The callback result may retain
+                            # A recovered TRIGGER_READY row has a durable
+                            # attempt-token cursor.  The callback result may retain
                             # the watcher for a future *distinct* generation,
                             # but it can never make this same cursor callable
                             # again.  Persist the outcome before changing

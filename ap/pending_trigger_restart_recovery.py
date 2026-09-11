@@ -36,7 +36,7 @@ It calls ap_entry_watcher.APEntryWatcher.watch(recovery_rearm=True), which:
      ap_lifecycle API. Ordinary recovery restores NONE -> ADOPTED ->
      WATCHING; an exact durable TRIGGER_READY row restores the same
      trigger-ready lifecycle and is dispatched only through the durable
-     claim-once fence.
+     attempt-token fence.
 
 Ordinary (non-recovery) admissions do not carry the marker and are
 not touched by the bridge. See:
@@ -53,6 +53,7 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 from ap.logger import get_logger
+from ap.order_state_machine import recovery_trigger_dispatch_claim_is_stale
 from ap_entry_watcher import (
     RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
     recovery_trigger_evidence_identity_is_proven,
@@ -807,22 +808,62 @@ class PendingTriggerRestartRecovery:
                     "trigger_generation",
                     row.get("trigger_generation"),
                 )
+                _dispatch_states = {
+                    "CLAIMED", "CALLBACK_STARTED", "CONSUMED",
+                    "COMPLETED", "AMBIGUOUS",
+                }
                 if (
-                    _dispatch_state in {
-                        "CLAIMED", "CALLBACK_STARTED", "CONSUMED",
-                        "COMPLETED", "AMBIGUOUS",
-                    }
+                    _dispatch_state in _dispatch_states
                     and str(_dispatch_generation) == str(_current_generation)
                 ):
-                    # A claim-once state is durable proof that this trigger
-                    # cursor has already been consumed or is intentionally
-                    # held. Re-registering it would create a second watcher
-                    # with no legal new attempt.
+                    if _dispatch_state == "CLAIMED":
+                        _claim_stale = recovery_trigger_dispatch_claim_is_stale(
+                            _meta.get("recovery_trigger_dispatch_claimed_at"),
+                            _meta.get("recovery_trigger_dispatch_lease_until"),
+                        )
+                        if _claim_stale is True:
+                            # CLAIMED is before CALLBACK_STARTED.  A stale
+                            # pre-callback claim may be reattached; the OSM
+                            # CAS will atomically replace its attempt token.
+                            log.info(
+                                "RESTART_RECOVERY_STALE_DISPATCH_CLAIM_REARM "
+                                "local=%s generation=%s",
+                                local_oid, _current_generation,
+                            )
+                        elif _claim_stale is None:
+                            self._mark_failure(
+                                local_oid,
+                                "recovery_trigger_dispatch_claim_authority_invalid",
+                            )
+                            return _RowOutcome.UNRESOLVED
+                        else:
+                            self._mark_failure(
+                                local_oid,
+                                "recovery_trigger_dispatch_claim_not_stale",
+                            )
+                            return _RowOutcome.SKIPPED
+                    else:
+                        # CALLBACK_STARTED and terminal states are durable
+                        # proof that this cursor is already in/after the
+                        # callback side-effect boundary. Never replay them.
+                        self._mark_failure(
+                            local_oid,
+                            "recovery_trigger_dispatch_already_recorded",
+                        )
+                        return _RowOutcome.SKIPPED
+                elif (
+                    _dispatch_state in {"CLAIMED", "CALLBACK_STARTED"}
+                    and str(_dispatch_generation) != str(_current_generation)
+                ):
+                    # An active attempt from another generation cannot be
+                    # reinterpreted as the current trigger. Hold before
+                    # watcher admission; only terminal prior generations may
+                    # be superseded by a genuinely new durable cursor.
                     self._mark_failure(
                         local_oid,
-                        "recovery_trigger_dispatch_already_recorded",
+                        "recovery_trigger_dispatch_generation_mismatch",
                     )
-                    return _RowOutcome.SKIPPED
+                    return _RowOutcome.UNRESOLVED
                 if watcher_owned is True:
                     proof = self._verify_registry_ownership(local_oid, row)
                     if proof and proof.get("dedup_held"):
@@ -1747,7 +1788,7 @@ class PendingTriggerRestartRecovery:
                 # A proven durable TRIGGER_READY row is intentionally
                 # reconstructed as an in-memory TRIGGERED watcher.  It is
                 # still watcher-owned for registry/dedup purposes, but it is
-                # dispatched only through the durable claim-once fence.
+                # dispatched only through the durable attempt-token fence.
                 if _wsig.get("__recovered_trigger_ready"):
                     _valid_states.add("TRIGGERED")
                 if _w_state.upper() not in _valid_states:

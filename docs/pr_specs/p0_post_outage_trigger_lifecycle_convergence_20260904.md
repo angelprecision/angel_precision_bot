@@ -47,10 +47,14 @@ used as a gate.
 The recovery dispatch marker uses a unique `recovery_trigger_dispatch_attempt_id`
 as the callback-attempt fence. The deterministic recovery owner identifies the
 lifecycle only; it is not a uniqueness key. The first blank claim for a
-generation wins, and `CLAIMED`, `CALLBACK_STARTED`, `CONSUMED`, `COMPLETED`,
-and `AMBIGUOUS` are non-reclaimable for that same generation. A process death
-after claim is a conservative recovery HOLD with replay suppressed; no
-same-generation lease or retry subsystem is introduced here.
+generation wins. A `CLAIMED` marker is reclaimable only after its bounded
+60-second `recovery_trigger_dispatch_lease_until` expires (older markers fall
+back to `claimed_at` plus the same interval); a fresh claim cannot be stolen.
+The reclaimer installs a new attempt token in the same row-lock/CAS boundary,
+so the abandoned process cannot later cross the start fence. `CALLBACK_STARTED`,
+`CONSUMED`, `COMPLETED`, and `AMBIGUOUS` remain non-reclaimable for that same
+generation. Handoff, materialization ownership, or newer-generation evidence
+always blocks reclaim.
 
 ### `KEEP_WATCHER` / `RETRY_WAIT`
 

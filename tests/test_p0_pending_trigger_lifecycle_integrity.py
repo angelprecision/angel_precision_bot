@@ -422,6 +422,22 @@ class TestPR580PostgresRecoveryContract:
         )
 
     @staticmethod
+    def _age_dispatch_claim(pg, signal):
+        """Simulate process death past the durable pre-callback lease."""
+        expired = (datetime.now(timezone.utc) - timedelta(seconds=61)).isoformat()
+        patch = json.dumps(
+            {
+                "recovery_trigger_dispatch_claimed_at": expired,
+                "recovery_trigger_dispatch_lease_until": expired,
+            }
+        )
+        pg["exec"](
+            "UPDATE orders SET meta=meta || %s::jsonb, "
+            "metadata=metadata || %s::jsonb WHERE local_order_id=%s",
+            (patch, patch, signal["local_order_id"]),
+        )
+
+    @staticmethod
     def _new_osm(signal):
         import ap.order_state_machine as osm_module
 
@@ -718,6 +734,155 @@ class TestPR580PostgresRecoveryContract:
         watcher3._poll_active_signals(False)
         watcher3.on_trigger.assert_called_once()
         self._assert_no_broker_calls(broker3)
+
+    def test_actual_startup_restart_reclaims_stale_claim_once(self, pg):
+        """The real startup caller reattaches a stale pre-callback claim."""
+        import uuid
+
+        signal = self._ready_signal()
+        self._insert_row(pg, self._ready_row(signal))
+        owner = f"recovery:{signal['local_order_id']}:{signal['signal_id']}"
+
+        # Process 1 dies after the durable claim and before CALLBACK_STARTED.
+        osm1 = self._new_osm(signal)
+        first_attempt = uuid.uuid4().hex
+        assert osm1.claim_recovery_trigger_dispatch(
+            **self._claim_kwargs(signal, owner=owner, attempt=first_attempt)
+        ) is True
+        self._age_dispatch_claim(pg, signal)
+
+        # A fresh process cannot steal a live claim, but the actual startup
+        # recovery caller can reconstruct the watcher once the lease is stale.
+        osm2, watcher2, broker2 = self._runtime(signal)
+        result = self._run_startup_reseed(signal, watcher2, osm2, broker2)
+        assert result["pending_trigger_watchers_rearmed"] == 1
+        assert len(watcher2._pending) == 1
+        registered2 = watcher2._pending[0]
+        watcher2._poll_active_signals(False)
+        watcher2.on_trigger.assert_called_once_with(registered2)
+
+        durable = pg["read"](
+            "SELECT meta FROM orders WHERE local_order_id=%s",
+            (signal["local_order_id"],),
+        )
+        assert durable["meta"]["recovery_trigger_dispatch_attempt_id"] != first_attempt
+        assert durable["meta"]["recovery_trigger_dispatch_state"] == "CONSUMED"
+        assert osm1.start_recovery_trigger_dispatch(
+            **self._transition_kwargs(
+                signal,
+                owner=owner,
+                attempt=first_attempt,
+            )
+        ) is False
+        self._assert_no_broker_calls(broker2)
+
+        # Restart after consumption does not recreate the same callback.
+        osm3, watcher3, broker3 = self._runtime(signal)
+        result3 = self._run_startup_reseed(signal, watcher3, osm3, broker3)
+        assert result3["pending_trigger_watchers_rearmed"] == 0
+        assert watcher3._pending == []
+        watcher3.on_trigger.assert_not_called()
+        self._assert_no_broker_calls(broker3)
+
+    def test_postgres_stale_claim_race_has_one_reclaimer_and_callback(self, pg):
+        """Two fresh processes can replace a stale claim only once."""
+        import uuid
+
+        signal = self._ready_signal()
+        self._insert_row(pg, self._ready_row(signal))
+        owner = f"recovery:{signal['local_order_id']}:{signal['signal_id']}"
+        first = self._new_osm(signal)
+        first_attempt = uuid.uuid4().hex
+        assert first.claim_recovery_trigger_dispatch(
+            **self._claim_kwargs(signal, owner=owner, attempt=first_attempt)
+        ) is True
+        self._age_dispatch_claim(pg, signal)
+
+        results, callbacks = self._run_postgres_claim_race(
+            pg, signal, [owner, owner]
+        )
+        assert results.count(True) == 1
+        assert len(callbacks) == 1
+
+    @pytest.mark.parametrize("authority", ["broker_handoff", "materialization", "newer_generation"])
+    def test_postgres_stale_claim_does_not_cross_newer_authority(
+        self, pg, authority,
+    ):
+        """Only an unadvanced, broker-free stale CLAIMED row is reclaimable."""
+        import uuid
+
+        signal = self._ready_signal()
+        self._insert_row(pg, self._ready_row(signal))
+        owner = f"recovery:{signal['local_order_id']}:{signal['signal_id']}"
+        first = self._new_osm(signal)
+        first_attempt = uuid.uuid4().hex
+        assert first.claim_recovery_trigger_dispatch(
+            **self._claim_kwargs(signal, owner=owner, attempt=first_attempt)
+        ) is True
+        self._age_dispatch_claim(pg, signal)
+
+        candidate = copy.deepcopy(signal)
+        if authority == "broker_handoff":
+            patch = {"broker_ready": True}
+            pg["exec"](
+                "UPDATE orders SET meta=meta || %s::jsonb, "
+                "metadata=metadata || %s::jsonb WHERE local_order_id=%s",
+                (json.dumps(patch), json.dumps(patch), signal["local_order_id"]),
+            )
+        elif authority == "materialization":
+            patch = {
+                "lifecycle_state": "MATERIALIZING",
+                "materialization_status": "RUNNING",
+                "materialization_in_flight": True,
+                "materialization_owner": "materializer-process",
+                "materialization_lease_until": (
+                    datetime.now(timezone.utc) + timedelta(minutes=5)
+                ).isoformat(),
+            }
+            pg["exec"](
+                "UPDATE orders SET meta=meta || %s::jsonb, "
+                "metadata=metadata || %s::jsonb WHERE local_order_id=%s",
+                (json.dumps(patch), json.dumps(patch), signal["local_order_id"]),
+            )
+        else:
+            candidate["materialization_generation"] = 8
+            candidate["trigger_generation"] = 8
+            candidate["metadata"] = copy.deepcopy(signal["metadata"])
+            candidate["metadata"].update(
+                {"materialization_generation": 8, "trigger_generation": 8}
+            )
+            pg["exec"](
+                "UPDATE orders SET materialization_generation=%s, "
+                "trigger_generation=%s, meta=meta || %s::jsonb, "
+                "metadata=metadata || %s::jsonb WHERE local_order_id=%s",
+                (
+                    "8",
+                    "8",
+                    json.dumps({
+                        "materialization_generation": 8,
+                        "trigger_generation": 8,
+                    }),
+                    json.dumps({
+                        "materialization_generation": 8,
+                        "trigger_generation": 8,
+                    }),
+                    signal["local_order_id"],
+                ),
+            )
+
+        assert first.claim_recovery_trigger_dispatch(
+            **self._claim_kwargs(
+                candidate,
+                owner=owner,
+                attempt=uuid.uuid4().hex,
+            )
+        ) is False
+        durable = pg["read"](
+            "SELECT meta FROM orders WHERE local_order_id=%s",
+            (signal["local_order_id"],),
+        )
+        assert durable["meta"]["recovery_trigger_dispatch_attempt_id"] == first_attempt
+        assert durable["meta"]["recovery_trigger_dispatch_state"] == "CLAIMED"
 
     def test_actual_startup_restart_merges_empty_meta_with_metadata_authority(
         self, pg,
@@ -1193,9 +1358,9 @@ class TestPR580PostgresRecoveryContract:
                     callback_count += 1
                     # Process death occurs after the durable start fence and
                     # before the callback can report an outcome.  The durable
-                    # CALLBACK_STARTED state is intentionally non-reclaimable
-                    # under claim-once semantics; a fresh process must hold,
-                    # never blindly invoke the callback again.
+                    # CALLBACK_STARTED is intentionally non-reclaimable; a
+                    # fresh process must hold and never blindly invoke the
+                    # callback again.
                     expected_state = "CALLBACK_STARTED"
                 else:
                     callback_count += 1
