@@ -271,6 +271,21 @@ def test_fail_first_15m_cache_crossing_completed_boundary_refetches(monkeypatch)
     assert second[-1]["time"] == "2026-09-11T14:00:00+00:00"
 
 
+def test_tradier_naive_local_time_is_normalized_before_pit_filter(monkeypatch):
+    # Tradier timesales uses exchange-local ISO timestamps without an offset.
+    # At 13:30 ET, the 13:15 bar is complete and the 13:30 bar is not.
+    rows = [
+        {"time": "2026-09-11T13:15:00", "open": 100, "high": 101, "low": 99, "close": 100.5},
+        {"time": "2026-09-11T13:30:00", "open": 100.5, "high": 102, "low": 100, "close": 101.5},
+    ]
+    broker = _Broker(lambda _params, _call_number: rows)
+    monkeypatch.setattr(fvg, "_resolve_base_url", lambda _broker: "https://api.tradier.com")
+
+    bars = fvg.fetch_15m_bars("SPY", broker, now=AS_OF)
+
+    assert [row["time"] for row in bars] == ["2026-09-11T13:15:00-04:00"]
+
+
 def test_5m_and_15m_cache_namespaces_cannot_collide(monkeypatch):
     fetch_5m = getattr(fvg, "fetch_5m_bars", None)
     assert callable(fetch_5m), "#435-A must expose the bounded 5m compatibility wrapper"

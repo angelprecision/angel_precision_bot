@@ -146,7 +146,7 @@ def _cache_key(
 
 
 def _aware_bar_datetime(value: Any) -> Optional[datetime]:
-    raw = str(value or "")
+    raw = str(value or "").strip()
     if not raw:
         return None
     try:
@@ -154,8 +154,25 @@ def _aware_bar_datetime(value: Any) -> Optional[datetime]:
     except (TypeError, ValueError):
         return None
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        return None
+        # Tradier timesales returns exchange-local ISO timestamps without an
+        # offset.  Normalize that provider form at the transport boundary;
+        # frozen signal evidence is filtered separately and remains strict.
+        parsed = parsed.replace(tzinfo=ET)
     return parsed
+
+
+def _normalize_provider_bars(bars: Any) -> list[dict[str, Any]]:
+    """Normalize valid Tradier bar timestamps before PIT completion filtering."""
+    normalized: list[dict[str, Any]] = []
+    for bar in bars if isinstance(bars, list) else []:
+        if not isinstance(bar, Mapping):
+            continue
+        item = dict(bar)
+        parsed = _aware_bar_datetime(item.get("time"))
+        if parsed is not None:
+            item["time"] = parsed.isoformat()
+        normalized.append(item)
+    return normalized
 
 
 def _filter_completed_bars(
@@ -340,6 +357,7 @@ def _fetch_intraday_bars_network(
                 })
             except (KeyError, TypeError, ValueError):
                 continue
+        bars = _normalize_provider_bars(bars)
         if now is not None:
             bars = _filter_completed_bars(
                 bars, interval_minutes=interval_minutes, as_of=now
