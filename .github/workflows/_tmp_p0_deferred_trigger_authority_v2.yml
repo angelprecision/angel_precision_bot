@@ -1,9 +1,12 @@
-name: TEMP P0 deferred trigger authority v2 proof
+name: TEMP P0 deferred trigger authority v2 final proof
 
 on:
   push:
     branches:
       - fix/p0-deferred-trigger-authority-v2-scratch
+
+permissions:
+  contents: write
 
 jobs:
   focused-proof:
@@ -12,15 +15,38 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: fix/p0-deferred-trigger-authority-v2-scratch
+          fetch-depth: 1
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install test dependencies
+      - name: Harden legacy timestamp predicate
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('ap/order_state_machine.py')
+          text = path.read_text()
+          old = "                            AND (meta->>'trigger_crossed_at')::timestamptz = %s::timestamptz\n"
+          new = "                            AND meta->>'trigger_crossed_at' = %s\n"
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one timestamp cast predicate, found {text.count(old)}')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          python -m py_compile ap/order_state_machine.py
+          git diff --check
+      - name: Install focused test dependencies
         run: |
           python -m pip install --upgrade pip
+          pip install pytest
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
       - name: Focused atomic trigger authority proof
         run: |
-          python -m py_compile ap/order_state_machine.py
           pytest -q tests/test_p0_claim_deferred_requires_trigger_authority.py
-          git diff --check
+      - name: Commit proven source hardening
+        shell: bash
+        run: |
+          git config user.name "angelprecision-bot"
+          git config user.email "251777092+angelprecision@users.noreply.github.com"
+          git add ap/order_state_machine.py
+          git commit -m "P0: fail closed on contradictory trigger authority"
+          git push origin HEAD:fix/p0-deferred-trigger-authority-v2-scratch
