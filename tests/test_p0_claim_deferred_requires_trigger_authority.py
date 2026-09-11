@@ -80,7 +80,8 @@ def test_claim_persists_trigger_authority_as_one_atomic_pair(monkeypatch):
     sql = capture["sql"]
     assert "? 'trigger_crossed_at'" in sql
     assert "? 'trigger_crossed_at_provenance'" in sql
-    assert "(meta->>'trigger_crossed_at')::timestamptz = %s::timestamptz" in sql
+    assert "meta->>'trigger_crossed_at' = %s" in sql
+    assert "::timestamptz" not in sql
     assert "trigger_crossed_at_provenance' = %s::jsonb" in sql
     assert TRIGGER_TS in params
     assert expected_provenance in _json_params(params)
