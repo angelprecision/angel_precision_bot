@@ -1,0 +1,170 @@
+name: TEMP P0 deferred trigger authority v2
+
+on:
+  push:
+    branches:
+      - fix/p0-deferred-trigger-authority-v2-scratch
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/p0-deferred-trigger-authority-v2-scratch
+          fetch-depth: 1
+      - name: Apply atomic trigger authority pair patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("ap/order_state_machine.py")
+          text = path.read_text()
+          start_marker = "    def claim_deferred_materialization(\n"
+          end_marker = "    def persist_selector_recovery_cursor(\n"
+          if text.count(start_marker) != 1 or text.count(end_marker) != 1:
+              raise SystemExit("claim block markers are not unique")
+          start = text.index(start_marker)
+          end = text.index(end_marker, start)
+          block = text[start:end]
+
+          def lines(*items):
+              return "\n".join(items) + "\n"
+
+          old_validation = lines(
+              '        if not _owner or not _signal_id or _mode not in ("live", "paper"):',
+              '            return False',
+              '',
+              '        _now = now_utc_iso()',
+          )
+          new_validation = lines(
+              '        if not _owner or not _signal_id or _mode not in ("live", "paper"):',
+              '            return False',
+              '',
+              '        # Trigger evidence is one atomic authority pair: timestamp + identity.',
+              '        # Never fabricate a breach time and never persist timestamp-only state.',
+              '        _crossed_at = str(trigger_crossed_at or "").strip()',
+              '        if not _crossed_at:',
+              '            return False',
+              '        try:',
+              '            _crossed_dt = datetime.fromisoformat(',
+              '                _crossed_at[:-1] + "+00:00"',
+              '                if _crossed_at.endswith(("Z", "z"))',
+              '                else _crossed_at',
+              '            )',
+              '        except (TypeError, ValueError, OverflowError):',
+              '            return False',
+              '        if _crossed_dt.tzinfo is None or _crossed_dt.utcoffset() is None:',
+              '            return False',
+              '',
+              '        _local_order_id = str(local_order_id or "").strip()',
+              '        _client_key = str(self.client_id or "").strip().lower()',
+              '        _canonical_signal_id = str(',
+              '            build_canonical_signal_id(_signal_id) or ""',
+              '        ).strip()',
+              '        if not _local_order_id or not _client_key or not _canonical_signal_id:',
+              '            return False',
+              '        _trigger_provenance = {',
+              '            "canonical_signal_id": _canonical_signal_id,',
+              '            "client_id": _client_key,',
+              '            "execution_mode": _mode,',
+              '            "local_order_id": _local_order_id,',
+              '        }',
+              '',
+              '        _now = now_utc_iso()',
+          )
+
+          old_trigger_write = lines(
+              '            "trigger_crossed_at": str(trigger_crossed_at or _now),',
+          )
+          new_trigger_write = lines(
+              '            "trigger_crossed_at": _crossed_at,',
+              '            "trigger_crossed_at_provenance": _trigger_provenance,',
+          )
+
+          old_json = lines(
+              '        try:',
+              '            _patch_json = _json_local.dumps(_patch, default=str)',
+              '        except Exception:',
+              '            return False',
+          )
+          new_json = lines(
+              '        try:',
+              '            _patch_json = _json_local.dumps(_patch, default=str)',
+              '            _trigger_provenance_json = _json_local.dumps(',
+              '                _trigger_provenance, default=str',
+              '            )',
+              '        except Exception:',
+              '            return False',
+          )
+
+          old_where = lines(
+              '                      AND (',
+              "                            COALESCE(meta->>'lifecycle_state','') IN ('', 'RETRY_WAIT')",
+              "                         OR COALESCE(meta->>'materialization_lease_until','') < %s",
+              '                      )',
+              "                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s",
+          )
+          new_where = lines(
+              '                      AND (',
+              "                            COALESCE(meta->>'lifecycle_state','') IN ('', 'RETRY_WAIT')",
+              "                         OR COALESCE(meta->>'materialization_lease_until','') < %s",
+              '                      )',
+              '                      AND (',
+              "                            (NOT (COALESCE(meta, '{}'::jsonb) ? 'trigger_crossed_at')",
+              "                             AND NOT (COALESCE(meta, '{}'::jsonb) ? 'trigger_crossed_at_provenance'))",
+              '                         OR (',
+              "                                NULLIF(meta->>'trigger_crossed_at', '') IS NOT NULL",
+              "                            AND meta->>'trigger_crossed_at' ~* '(z|[+-][0-9]{2}:?[0-9]{2})$'",
+              "                            AND (meta->>'trigger_crossed_at')::timestamptz = %s::timestamptz",
+              '                            AND jsonb_typeof(',
+              "                                  COALESCE(meta, '{}'::jsonb)->'trigger_crossed_at_provenance'",
+              "                                ) = 'object'",
+              "                            AND COALESCE(meta, '{}'::jsonb)->'trigger_crossed_at_provenance' = %s::jsonb",
+              '                         )',
+              '                      )',
+              "                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s",
+          )
+
+          old_params = lines(
+              '                        _signal_id, _mode, _now, _expected_previous_generation,',
+              '                        *_attempt_params,',
+          )
+          new_params = lines(
+              '                        _signal_id, _mode, _now,',
+              '                        _crossed_at, _trigger_provenance_json,',
+              '                        _expected_previous_generation,',
+              '                        *_attempt_params,',
+          )
+
+          replacements = [
+              (old_validation, new_validation, "validation"),
+              (old_trigger_write, new_trigger_write, "atomic trigger authority patch"),
+              (old_json, new_json, "provenance serialization"),
+              (old_where, new_where, "authority pair CAS"),
+              (old_params, new_params, "authority pair params"),
+          ]
+          for old, new, label in replacements:
+              count = block.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match in claim block, found {count}")
+              block = block.replace(old, new, 1)
+
+          path.write_text(text[:start] + block + text[end:])
+          PY
+
+          python -m py_compile ap/order_state_machine.py
+          git diff --check
+          git diff -- ap/order_state_machine.py
+      - name: Commit source patch
+        shell: bash
+        run: |
+          git config user.name "angelprecision-bot"
+          git config user.email "251777092+angelprecision@users.noreply.github.com"
+          git add ap/order_state_machine.py
+          git commit -m "P0: atomically persist deferred trigger authority"
+          git push origin HEAD:fix/p0-deferred-trigger-authority-v2-scratch
