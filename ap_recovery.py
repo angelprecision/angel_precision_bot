@@ -40,7 +40,10 @@ from ap_entry_watcher import (
     RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
     recovery_trigger_evidence_identity_is_proven,
 )
-from ap.pending_trigger_classifier import is_active_materialization_in_flight
+from ap.pending_trigger_classifier import (
+    has_canonical_materialization_retry_authority,
+    is_active_materialization_in_flight,
+)
 from ap.pending_trigger_restart_recovery import _RecoveryPlan
 from ap.manual_close_reconciliation import order_filled_at
 
@@ -1966,7 +1969,7 @@ class APStartupRecovery:
             with conn() as c:
                 c.execute(
                     """
-                    SELECT local_order_id, client_id, signal_id, plan_id,
+                    SELECT local_order_id, client_id, signal_id, kind, plan_id,
                            symbol, contract, direction, score, tier,
                            trigger_price, stop_underlying, target_underlying,
                            pattern, timeframe, execution_mode, qty, limit_price,
@@ -2396,8 +2399,14 @@ class APStartupRecovery:
             # evidence and continue as pre-breach.
             _evidence_row = dict(order)
             _evidence_row["meta"] = meta
-            if not recovery_trigger_evidence_identity_is_proven(
-                _evidence_row, local_order_id
+            _canonical_retry_after_trigger = (
+                has_canonical_materialization_retry_authority(_evidence_row)
+            )
+            if (
+                not recovery_trigger_evidence_identity_is_proven(
+                    _evidence_row, local_order_id
+                )
+                and not _canonical_retry_after_trigger
             ):
                 log.critical(
                     "[%s] %s local_order_id=%s — preserving order unchanged",

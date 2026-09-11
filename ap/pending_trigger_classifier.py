@@ -756,6 +756,218 @@ def _parse_iso_classifier(raw) -> Optional[datetime]:
         return None
 
 
+def has_canonical_materialization_retry_authority(row: dict) -> bool:
+    """Recognize the exact durable post-breach RETRY_PENDING handoff.
+
+    This function is PURE and READ-ONLY.  It proves retry authority only; the
+    existing recovery executor owns due-time evaluation and the CAS/consumer
+    handoff.
+    """
+    if not isinstance(row, dict):
+        return False
+
+    if str(row.get("status") or "").strip().upper() != "PENDING_TRIGGER":
+        return False
+    if str(row.get("kind") or "").strip().upper() != "ENTRY":
+        return False
+
+    local_order_id = str(row.get("local_order_id") or "").strip()
+    client_id = str(row.get("client_id") or "").strip()
+    execution_mode = str(row.get("execution_mode") or "").strip().lower()
+    signal_id = str(row.get("signal_id") or "").strip()
+
+    if not local_order_id or not client_id or not signal_id:
+        return False
+    if execution_mode not in {"live", "paper"}:
+        return False
+
+    if not _persisted_value_is_absent(row.get("broker_order_id")):
+        return False
+    if not _persisted_value_is_absent(row.get("submitted_ts")):
+        return False
+
+    meta = _coerce_classifier_meta(row.get("meta"))
+    if not meta:
+        return False
+
+    top_level_canonical_signal_id = str(
+        row.get("canonical_signal_id") or ""
+    ).strip()
+    metadata_canonical_signal_id = str(
+        meta.get("canonical_signal_id") or ""
+    ).strip()
+    if (
+        top_level_canonical_signal_id
+        and metadata_canonical_signal_id
+        and top_level_canonical_signal_id != metadata_canonical_signal_id
+    ):
+        return False
+
+    # Metadata identity is a duplicate authority surface.  The legacy
+    # missing-provenance exception may not select top-level identity over a
+    # conflicting durable metadata value.
+    for field, expected, normalize_lower in (
+        ("client_id", client_id, True),
+        ("client_email", client_id, True),
+        ("execution_mode", execution_mode, True),
+        ("signal_id", signal_id, False),
+        ("local_order_id", local_order_id, False),
+    ):
+        if field not in meta:
+            continue
+        raw = meta.get(field)
+        if _persisted_value_is_absent(raw):
+            return False
+        actual = str(raw).strip()
+        if normalize_lower:
+            actual = actual.lower()
+        if actual != (expected.lower() if normalize_lower else expected):
+            return False
+
+    watcher_audit = meta.get("watcher_audit")
+    if not isinstance(watcher_audit, dict):
+        return False
+    if str(watcher_audit.get("reason_code") or "").strip().lower() != "trigger_ready":
+        return False
+
+    if str(meta.get("lifecycle_state") or "").strip().upper() != "RETRY_WAIT":
+        return False
+    if str(meta.get("materialization_status") or "").strip().upper() != "RETRY_PENDING":
+        return False
+
+    outcome = str(meta.get("materialization_outcome") or "").strip().upper()
+    if outcome not in _RETRY_MATERIALIZATION_OUTCOMES:
+        return False
+
+    contract = str(row.get("contract") or "").strip().upper()
+    if contract:
+        if not contract.startswith("DEFERRED:"):
+            return False
+    elif meta.get("contract_deferred") is not True:
+        return False
+
+    if meta.get("broker_ready") is not False:
+        return False
+    if meta.get("materialization_in_flight") is not False:
+        return False
+    if has_broker_handoff_evidence(row):
+        return False
+
+    attempts = meta.get("materialization_attempts")
+    retry_attempt = meta.get("retry_attempt")
+    breach_attempt_count = meta.get("breach_attempt_count")
+    generation = meta.get("materialization_generation")
+    max_attempts = meta.get("retry_max_attempts")
+
+    counters = (
+        attempts,
+        retry_attempt,
+        breach_attempt_count,
+        generation,
+        max_attempts,
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in counters
+    ):
+        return False
+
+    if attempts < 1:
+        return False
+    if retry_attempt != attempts:
+        return False
+    if breach_attempt_count != attempts:
+        return False
+    if generation < 1:
+        return False
+    if max_attempts < attempts:
+        return False
+
+    selector_failure = meta.get("materialization_selector_failure")
+    if not isinstance(selector_failure, dict):
+        return False
+    retry_reason = str(selector_failure.get("reason_code") or "").strip()
+    if not retry_reason:
+        return False
+
+    # Use the existing canonical retry taxonomy. Unknown/terminal reasons must
+    # never gain retry authority through this helper.
+    from ap.selector_retry_policy import is_retryable_selector_reason
+
+    if not is_retryable_selector_reason(retry_reason):
+        return False
+
+    def _aware_timestamp(raw):
+        parsed = _parse_iso_classifier(raw)
+        if parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+
+    # The canonical schedule must exist. Do not decide due/not-due here; the
+    # existing recovery executor owns time.
+    retry_at = _aware_timestamp(meta.get("materialization_next_retry_at"))
+    if retry_at is None:
+        return False
+
+    if _aware_timestamp(meta.get("materialization_last_failure_at")) is None:
+        return False
+    if _aware_timestamp(meta.get("trigger_crossed_at")) is None:
+        return False
+    if _aware_timestamp(meta.get("absolute_entry_deadline")) is None:
+        return False
+
+    # Legacy exception: provenance may be absent on the stranded production
+    # shape. If it is PRESENT, however, it is authority and must match exactly.
+    if "trigger_crossed_at_provenance" in meta:
+        provenance = meta.get("trigger_crossed_at_provenance")
+        if not isinstance(provenance, dict):
+            return False
+        EXPECTED_PROVENANCE_KEYS = {
+            "canonical_signal_id",
+            "client_id",
+            "execution_mode",
+            "local_order_id",
+        }
+        if set(provenance) != EXPECTED_PROVENANCE_KEYS:
+            return False
+
+        try:
+            from ap_canonical_signal import build_canonical_signal_id
+
+            expected_canonical_signal_id = str(
+                row.get("canonical_signal_id")
+                or meta.get("canonical_signal_id")
+                or build_canonical_signal_id(signal_id)
+            ).strip()
+        except Exception:
+            return False
+
+        expected = {
+            "canonical_signal_id": expected_canonical_signal_id,
+            "client_id": client_id.lower(),
+            "execution_mode": execution_mode,
+            "local_order_id": local_order_id,
+        }
+        actual = {
+            "canonical_signal_id": str(
+                provenance.get("canonical_signal_id") or ""
+            ).strip(),
+            "client_id": str(
+                provenance.get("client_id") or ""
+            ).strip().lower(),
+            "execution_mode": str(
+                provenance.get("execution_mode") or ""
+            ).strip().lower(),
+            "local_order_id": str(
+                provenance.get("local_order_id") or ""
+            ).strip(),
+        }
+        if actual != expected:
+            return False
+
+    return True
+
+
 def _active_materialization_proof(meta: dict) -> bool:
     """Return True ONLY when durable, unexpired, current materialization proof exists.
 
@@ -1006,6 +1218,8 @@ def classify_pending_trigger_row(
         if watcher_reason == "trigger_ready":
             if is_active_materialization_in_flight(row):
                 return PendingTriggerClassification.MATERIALIZATION_IN_FLIGHT
+            if has_canonical_materialization_retry_authority(row):
+                return PendingTriggerClassification.WAITING_RETRYABLE
             return PendingTriggerClassification.STUCK_TRIGGER_READY
 
         # ── Priority 2: real invalidation reason ──
