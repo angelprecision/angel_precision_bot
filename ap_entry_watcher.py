@@ -44,6 +44,7 @@ try:
         LEDGER as _EW_LEDGER,
         SignalState as _EW_SS,
         LifecycleOwner as _EW_LO,
+        signal_adopted,
         signal_watching,
         signal_invalidated,
         signal_cancelled,
@@ -738,6 +739,9 @@ class WatchedSignal:
 
         self.score = float(signal.get("score") or 0)
         self.grade = signal.get("grade", "B")
+        self._signal_id_was_supplied = bool(
+            str(signal.get("signal_id") or "").strip()
+        )
         self.signal_id = str(signal.get("signal_id") or uuid.uuid4())
         self.signal["signal_id"] = self.signal_id
 
@@ -3465,6 +3469,66 @@ class APEntryWatcher:
         """Return whether legacy same-side arbitration applies."""
         return True
 
+    def _restore_recovered_watcher_lifecycle(self, watched) -> bool:
+        """Restore the legal process-local lifecycle for a recovered watcher."""
+        if not isinstance(watched, WatchedSignal):
+            return False
+        signal = getattr(watched, "signal", {}) or {}
+        if not isinstance(signal, dict):
+            return False
+        if not signal.get("__recovery_rearm"):
+            return True
+        if signal.get("__materialization_resume"):
+            return True  # #607 owns deferred retry adoption.
+        if not getattr(watched, "_signal_id_was_supplied", False):
+            return False
+
+        try:
+            signal_id = str(signal.get("signal_id") or "").strip()
+            ticker = str(
+                getattr(watched, "ticker", "") or signal.get("ticker") or ""
+            ).strip().upper()
+            if not signal_id or not ticker or not _EW_LIFECYCLE_OK:
+                return False
+
+            state = _EW_LEDGER.current_state(signal_id)
+            if state is None:
+                signal_adopted(
+                    signal_id,
+                    ticker,
+                    owner=_EW_LO.RECOVERY,
+                    reason="restart_recovery_loaded_existing_signal",
+                )
+                if _EW_LEDGER.current_state(signal_id) != _EW_SS.ADOPTED:
+                    return False
+                signal_watching(
+                    signal_id,
+                    ticker,
+                    owner=_EW_LO.WATCHER,
+                    reason="restored_to_watching_after_restart",
+                )
+                return _EW_LEDGER.current_state(signal_id) == _EW_SS.WATCHING
+
+            if state == _EW_SS.ADOPTED:
+                signal_watching(
+                    signal_id,
+                    ticker,
+                    owner=_EW_LO.WATCHER,
+                    reason="restored_to_watching_after_restart",
+                )
+                return _EW_LEDGER.current_state(signal_id) == _EW_SS.WATCHING
+
+            if state == _EW_SS.WATCHING:
+                return True
+
+            return False
+        except Exception:
+            log.exception(
+                "[%s] recovered watcher lifecycle restoration failed",
+                getattr(watched, "ticker", ""),
+            )
+            return False
+
     def add_signal(
         self, signal: dict, *, registration_provenance_out: Optional[dict] = None,
     ) -> bool:
@@ -3947,6 +4011,19 @@ class APEntryWatcher:
                     watched._registration_token
                 )
 
+            if (
+                watched.signal.get("__recovery_rearm")
+                and not watched.signal.get("__materialization_resume")
+                and not self._restore_recovered_watcher_lifecycle(watched)
+            ):
+                self._pending = [item for item in self._pending if item is not watched]
+                if dedup_key:
+                    self._dedup_set.discard(dedup_key)
+                if registration_provenance_out is not None:
+                    registration_provenance_out["created_by_this_call"] = False
+                    registration_provenance_out["registration_token"] = None
+                return False
+
             # P0-W2: consume rearm marker placed by watch() arm-time path.
             # The marker is a private key in watched.signal (which IS signal_dict
             # by reference). Pop it so it never propagates downstream.
@@ -4056,6 +4133,16 @@ class APEntryWatcher:
         if not isinstance(_plan_metadata, dict):
             _plan_metadata = {}
         _plan_signal_id = str(getattr(plan, "signal_id", "") or "").strip()
+        if _recovery_rearm and not _materialization_resume and not _plan_signal_id:
+            self._last_reject_reason = RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+            log.critical(
+                "[%s] %s local_order_id=%s — refusing recovery rearm; "
+                "durable plan signal_id is missing",
+                str(getattr(plan, "ticker", "") or "?").upper(),
+                RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+                local_order_id or "?",
+            )
+            return False
         _plan_canonical_signal_id = str(
             getattr(plan, "canonical_signal_id", "")
             or _plan_metadata.get("canonical_signal_id")

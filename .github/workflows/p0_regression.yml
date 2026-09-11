@@ -62,6 +62,7 @@ env:
     tests/test_p0_seam4_e2e_deferred_lifecycle.py
     tests/test_p0_intelligence_postgres.py
     tests/test_p0_pending_trigger_restart_recovery.py
+    tests/test_p0_live_recovered_watcher_lifecycle_msft.py
     tests/test_p0_pr597_terminal_watcher_recut.py
     tests/test_entry_watcher_audit.py
     tests/test_p0_watcher_invalidation_ownership.py
@@ -527,3 +528,182 @@ jobs:
         run: |
           echo "Rollback fail-first complete."
           echo "Expected: position remains OPEN on pre-#579 base (defect confirmed)."
+
+  p0-612-rollback-failfirst:
+    # PR #612 rollback proof: run the real restart-recovery caller and two
+    # confirmed CALL polls on the exact pre-fix main SHA.  The old base must
+    # leave lifecycle state at NONE, record an illegal NONE -> TRIGGER_READY,
+    # and therefore produce zero successful trigger callbacks.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: intelligence_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d intelligence_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 7a07f11a4e16a6d16ac0248cea4614559d5a054e
+
+      - name: Assert PR #612 rollback base SHA
+        run: |
+          expected="7a07f11a4e16a6d16ac0248cea4614559d5a054e"
+          actual="$(git rev-parse HEAD)"
+          echo "PR #612 rollback base: $actual"
+          test "$actual" = "$expected"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install minimal test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas
+
+      - name: Run PR #612 rollback fail-first proof
+        env:
+          PGSSLMODE: "disable"
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
+        run: |
+          python - << 'PYEOF'
+          from copy import deepcopy
+          from unittest.mock import MagicMock
+
+          import ap_entry_watcher as ew
+          import ap_lifecycle
+          from ap.pending_trigger_restart_recovery import (
+              PendingTriggerRestartRecovery,
+              _RowOutcome,
+          )
+
+          SIGNAL_ID = "c493c9dc-ceaa-4c86-8b62-08c3cc8bad5c"
+          LOCAL_ORDER_ID = "d6dd2c80-d0a1-45ca-bda9-4813ba7e64ba"
+          CLIENT_ID = "jasoncosby1@gmail.com"
+          ROW = {
+              "local_order_id": LOCAL_ORDER_ID,
+              "client_id": CLIENT_ID,
+              "execution_mode": "live",
+              "kind": "ENTRY",
+              "status": "PENDING_TRIGGER",
+              "signal_id": SIGNAL_ID,
+              "canonical_signal_id": SIGNAL_ID,
+              "symbol": "MSFT",
+              "ticker": "MSFT",
+              "contract": "DEFERRED:MSFT",
+              "direction": "CALL",
+              "entry_price": 494.52,
+              "stop_price": 489.44,
+              "target_price": 505.00,
+              "broker_order_id": None,
+              "submitted_ts": None,
+              "meta": {
+                  "client_id": CLIENT_ID,
+                  "execution_mode": "live",
+                  "signal_id": SIGNAL_ID,
+                  "canonical_signal_id": SIGNAL_ID,
+                  "side": "CALL",
+                  "direction": "CALL",
+                  "trigger_price": 494.52,
+                  "stop_price": 489.44,
+                  "target_price": 505.00,
+              },
+          }
+
+          class RollbackOSM:
+              def __init__(self):
+                  self.row = deepcopy(ROW)
+                  self.meta_writes = []
+                  self.cancel_calls = []
+                  self.submit_calls = []
+
+              def get_order(self, local_order_id):
+                  return deepcopy(self.row) if local_order_id == LOCAL_ORDER_ID else None
+
+              def update_order_meta(self, local_order_id, patch, **kwargs):
+                  self.meta_writes.append((local_order_id, deepcopy(patch), kwargs))
+                  self.row["meta"].update(dict(patch))
+                  return True
+
+              def cancel_pending_entry(self, local_order_id, **kwargs):
+                  self.cancel_calls.append((local_order_id, kwargs))
+                  return True
+
+              def submit_existing_entry(self, local_order_id, **kwargs):
+                  self.submit_calls.append((local_order_id, kwargs))
+                  return True
+
+          osm = RollbackOSM()
+          watcher = ew.APEntryWatcher(
+              MagicMock(), order_state_machine=osm,
+              require_on_trigger=False, mode="LIVE",
+          )
+          watcher._persist_watcher_audit = MagicMock()
+          watcher._is_regular_session_now = MagicMock(return_value=False)
+          watcher._is_past_entry_cutoff_now = MagicMock(return_value=False)
+          watcher._get_quote = MagicMock(
+              return_value={"bid": 494.50, "ask": 494.51}
+          )
+
+          with ap_lifecycle.LEDGER._entry_lock:
+              ap_lifecycle.LEDGER._current_state.pop(SIGNAL_ID, None)
+
+          recovery = PendingTriggerRestartRecovery(
+              client_id=CLIENT_ID,
+              execution_mode="live",
+              osm=osm,
+              entry_watcher=watcher,
+              broker=MagicMock(),
+              quote_check_fn=lambda *_args: False,
+              caller_source="p0_612_rollback_failfirst",
+          )
+          assert recovery.recover_one_row(ROW) == _RowOutcome.WATCHER_OWNED
+          assert len(watcher._pending) == 1
+          assert ap_lifecycle.LEDGER.current_state(SIGNAL_ID) is None
+
+          callback_calls = []
+          successful_callbacks = []
+
+          def on_trigger(watched):
+              callback_calls.append(watched.signal_id)
+              if ap_lifecycle.LEDGER.current_state(SIGNAL_ID) != ap_lifecycle.SignalState.TRIGGER_READY:
+                  # This is the production failure boundary: the old base
+                  # cannot authorize downstream entry work from NONE.
+                  return None
+              successful_callbacks.append(watched.signal_id)
+              return {"disposition": "KEEP_WATCHER"}
+
+          watcher.on_trigger = on_trigger
+          watcher._fetch_quotes = MagicMock(
+              return_value={"MSFT": {"bid": 494.50, "ask": 494.53}}
+          )
+          watcher._poll_active_signals(False)
+          watcher._poll_active_signals(False)
+
+          assert len(callback_calls) == 1
+          assert successful_callbacks == [], (
+              "rollback base unexpectedly reached a valid trigger callback"
+          )
+          assert ap_lifecycle.LEDGER.current_state(SIGNAL_ID) is None
+          assert any(
+              entry.to_state == ap_lifecycle.SignalState.ERROR
+              for entry in ap_lifecycle.LEDGER.history(SIGNAL_ID)
+          ), "rollback base did not record the illegal NONE -> TRIGGER_READY"
+          assert osm.cancel_calls == []
+          assert osm.submit_calls == []
+          print(
+              "PASS: PR #612 fail-first reproduced on pinned base — "
+              "NONE -> TRIGGER_READY stayed illegal and no successful callback ran."
+          )
+          PYEOF
