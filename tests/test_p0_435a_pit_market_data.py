@@ -307,6 +307,26 @@ def test_production_shaped_breach_result_uses_only_frozen_breach_authority(monke
     assert quote_calls == []
 
 
+def test_breach_snapshot_excludes_candle_completed_after_trigger():
+    trigger = datetime(2026, 9, 11, 10, 2, tzinfo=timezone.utc)
+    confirmation_as_of = datetime(2026, 9, 11, 10, 5, tzinfo=timezone.utc)
+    candle = _bar(datetime(2026, 9, 11, 10, 0, tzinfo=timezone.utc), price=130.50)
+    signal = _breach_signal(
+        trigger_crossed_at=trigger.isoformat(),
+        candles_5m=[candle],
+    )
+
+    breach_snapshot = imd.collect_point_in_time_context(
+        signal, broker=None, phase="BREACH"
+    )
+
+    assert breach_snapshot["as_of"] == trigger.isoformat()
+    assert breach_snapshot["data_sources"]["candles"]["5m"] == []
+    assert imd._filter_completed_bars(
+        [candle], interval_minutes=5, as_of=confirmation_as_of
+    ) == [candle]
+
+
 @pytest.mark.parametrize(
     "bad_as_of",
     [None, "", "not-a-timestamp", "2026-09-11T17:30:00"],

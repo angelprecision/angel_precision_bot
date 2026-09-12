@@ -538,7 +538,12 @@ def _collect_breach_context(
 def collect_point_in_time_context(
     signal: dict[str, Any], *, broker: Any = None, phase: str
 ) -> dict[str, Any]:
-    """Fetch and normalize evidence for the existing observe-only evaluators."""
+    """Materialize observe-only evidence, not a post-trigger acceptance gate.
+
+    BREACH is an exact-trigger snapshot keyed by ``trigger_crossed_at``.  A
+    later confirmation snapshot and the synchronous acceptance hot path are
+    separate responsibilities.
+    """
     ticker = str(signal.get("ticker") or signal.get("symbol") or "").strip().upper()
     now_utc = datetime.now(timezone.utc)
     collected_at = now_utc.isoformat()

@@ -106,6 +106,16 @@ For `phase == "BREACH"`:
 9. Never call the current quote, market quote, or sector quote readers for BREACH.
 10. Underlying BREACH observation may use only already-frozen signal evidence such as `breach_price` / frozen underlying price and must identify that source; no fresh quote may substitute. Generic current or signal-time prices cannot satisfy BREACH observation authority and cannot be used as fallback evidence.
 
+The temporal boundary is binding:
+
+- `trigger_crossed_at` is the immutable event time and remains unchanged for the life of the signal.
+- For the initial BREACH snapshot, `data_as_of` is exactly `trigger_crossed_at`; the current result's `as_of` is that exact trigger-time cutoff.
+- That snapshot is a forensic PIT materialization primitive. It cannot establish post-trigger 5m/15m completion or acceptance evidence; a candle closing after the trigger is correctly absent.
+- A later confirmation snapshot, owned by a future recut such as #615, must retain the original `trigger_crossed_at` separately and use an explicit later `data_as_of` / `confirmation_as_of`. It must never rewrite the event time or silently substitute worker time.
+- For timestamped scalar breach evidence, `source_timestamp` identifies the source observation while `observed_at` identifies the snapshot observation time; they may differ by design.
+
+This collector is not the future synchronous breach-entry gate. Future wiring must follow `breach -> cached structure -> latest completed 5m/15m evidence -> classification -> selector` and consume precomputed/cached structural context rather than synchronously invoking `_collect_breach_context()` to download history and rebuild all context. Precompute, watcher, and acceptance policy are outside #614. Missing or unknown market evidence is observe-only state and is not automatic trade rejection.
+
 For `PRETRIGGER` and `PREOPEN`, preserve current behavior. Do not add the 5m read to those paths in this PR.
 
 ### E. Daily-history as-of bound
