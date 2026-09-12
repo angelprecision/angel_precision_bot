@@ -75,23 +75,26 @@ def _patch_et(mod, hour=9, minute=35):
 
 def test_source_no_quote_high_low_as_session_source():
     src = (_REPO / "ap" / "overnight_daily_validator.py").read_text()
-    # quote["high"] / quote["low"] must no longer be the primary source
+    # quote["high"] / quote["low"] must no longer be the primary source (unchanged)
     assert "session_high = float(quote.get" not in src, (
         "quote.get('high') must not be the source for session_high"
     )
-    assert "_fetch_intraday_bars" in src
-    assert "OVERNIGHT_SESSION_BARS_OK" in src
-    assert "OVERNIGHT_PREMARKET_HILO_ENABLED" in src
+    # PR #181: timesales / _fetch_intraday_bars replaced by Polygon snapshot
+    assert "_fetch_polygon_daily_snapshot" in src, (
+        "_fetch_polygon_daily_snapshot must be in source after PR #181"
+    )
+    assert "POLYGON_API_KEY" in src
+    assert "OVERNIGHT_POLYGON_SNAPSHOT_OK" in src
 
 def test_source_has_all_required_log_strings():
     src = (_REPO / "ap" / "overnight_daily_validator.py").read_text()
+    # PR #181: replaced timesales log strings with Polygon equivalents
     for log_str in [
-        "OVERNIGHT_SNAPSHOT_QUOTE_MISSING_HILO",
-        "OVERNIGHT_SESSION_BARS_OK",
-        "OVERNIGHT_SESSION_BARS_NOT_READY",
-        "OVERNIGHT_SESSION_BARS_UNAVAILABLE",
+        "OVERNIGHT_POLYGON_SNAPSHOT_OK",
+        "OVERNIGHT_POLYGON_SNAPSHOT_NO_HILO",
+        "OVERNIGHT_SESSION_BARS_NOT_READY",    # kept — still emitted on RETRY_LATER
     ]:
-        assert log_str in src, f"Log string missing: {log_str}"
+        assert log_str in src, f"Log string missing after PR #181: {log_str}"
 
 
 # ── AC1: Quote has no high/low → RETRY_LATER, signal stays WATCHING ───────────
@@ -124,30 +127,32 @@ def test_ac1_quote_missing_hilo_returns_none():
 
 def test_ac2_bars_compute_session_high_low():
     """
-    After 09:30 ET with bars available.
-    PUT: invalidates only if session_high > prior_day_high.
-    CALL: invalidates only if session_low < prior_day_low.
+    PR #181: session high/low now come from Polygon day.h / day.l (daily bar),
+    not from computing max/min over 1-minute timesales bars.
+    This test verifies the same invariant — PUT/CALL invalidation logic —
+    using the Polygon snapshot mock.
     """
     mod = _import_validator()
-    bars = [
-        {"time": "2026-06-10T09:31:00", "open": 469, "high": 471, "low": 468, "close": 470},
-        {"time": "2026-06-10T09:32:00", "open": 470, "high": 473, "low": 469, "close": 472},
-        {"time": "2026-06-10T09:33:00", "open": 472, "high": 474, "low": 471, "close": 473},
-    ]
-    broker = _broker_stub(bars=bars)
 
-    fake_et = _et_now(9, 34)
-    with patch("datetime.datetime") as mock_dt:
-        mock_dt.now.return_value = fake_et.astimezone(timezone.utc)
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        snap = mod.fetch_market_snapshot("SPY", broker)
+    r = MagicMock()
+    r.status_code = 200
+    r.json.return_value = {
+        "ticker": {
+            "day": {"h": 474.0, "l": 468.0, "c": 473.0},
+            "lastTrade": {"p": 473.0},
+        }
+    }
+    with patch.object(mod, "POLYGON_API_KEY", "test-key"), \
+         patch.object(mod, "requests") as mock_requests:
+        mock_requests.get.return_value = r
+        snap = mod.fetch_market_snapshot("SPY", broker=None)
 
     assert snap is not None
-    assert snap.session_high_so_far == pytest.approx(474.0)
-    assert snap.session_low_so_far  == pytest.approx(468.0)
-    assert snap.last_price          == pytest.approx(473.0)  # last bar close
+    assert snap.session_high_so_far == 474.0
+    assert snap.session_low_so_far  == 468.0
+    assert snap.last_price          == 473.0
 
-    # PUT: session_high=474 > prior_high=475 → VALID (not breached)
+    # PUT: session_high=474 < prior_high=475 → VALID
     v_put = mod.validate_overnight_daily_signal(
         ticker="SPY", side="PUT",
         prior_day_high=475.0, prior_day_low=460.0, snapshot=snap
@@ -162,7 +167,7 @@ def test_ac2_bars_compute_session_high_low():
     assert not v_put_bad.valid
     assert "PRIOR_HIGH_BREACHED" in v_put_bad.reason_code
 
-    # CALL: session_low=468 < prior_low=465 → VALID (not breached)
+    # CALL: session_low=468 > prior_low=465 → VALID
     v_call = mod.validate_overnight_daily_signal(
         ticker="SPY", side="CALL",
         prior_day_high=480.0, prior_day_low=465.0, snapshot=snap
@@ -227,6 +232,10 @@ def test_ac4_after_open_no_bars_retry_later():
 
 # ── AC5: Premarket bars — default OFF, RETRY_LATER, no invalidation ───────────
 
+@pytest.mark.skip(
+    reason="PR #181: OVERNIGHT_PREMARKET_HILO_ENABLED logic removed — "
+           "Polygon day.h/day.l are regular-session values; no separate premarket gate needed."
+)
 def test_ac5_premarket_bars_default_no_invalidation():
     """
     Premarket bars exist but regular session (09:30) has not started.
@@ -305,6 +314,12 @@ def _load_v2():
     return mod
 
 
+@pytest.mark.skip(
+    reason="PR #181: _fetch_intraday_bars / Tradier timesales removed from "
+           "fetch_market_snapshot. URL routing tests superseded by Polygon. "
+           "_resolve_market_data_base_url still exists but is no longer called "
+           "in the snapshot path. See test_pr181_overnight_polygon_daily.py."
+)
 class TestLiveMarketDataURL:
     """Spec: overnight validation must never call sandbox.tradier.com."""
 
@@ -364,52 +379,57 @@ class TestLiveMarketDataURL:
         return broker
 
     def test_no_base_url_broker_uses_api_tradier_com(self):
-        """Required test 1: no base_url/cfg → calls api.tradier.com, not sandbox."""
-        mod = _load_v2()
-        captured = []
-        broker = self._broker_no_base_url(captured)
+        """
+        PR #181: _fetch_intraday_bars (Tradier timesales) is removed from
+        fetch_market_snapshot.  The URL resolver still exists for historical
+        reference but is no longer called in the snapshot path.
 
-        # Confirm the resolver returns the live endpoint
+        This test now only verifies the resolver itself still returns the
+        live Tradier URL — the timesales call assertion is superseded by
+        test_pr181_overnight_polygon_daily.py which proves Polygon is used.
+        """
+        mod = _load_v2()
+        import unittest.mock as mock
+        broker = mock.MagicMock()
+        del broker.market_data_base_url
+        del broker.quote_base_url
+        del broker.cfg
+        broker.base_url = None
+
+        # Resolver still returns live endpoint — kept for audit
         resolved = mod._resolve_market_data_base_url(broker)
         assert resolved == "https://api.tradier.com", (
             f"Expected https://api.tradier.com, got {resolved!r}"
         )
-
-        # Call _fetch_intraday_bars and confirm the URL hit
-        mod._fetch_intraday_bars("NVDA", broker, "2026-06-11T09:30:00", "2026-06-11T10:00:00")
-        timesales_urls = [u for u in captured if "timesales" in u]
-        assert len(timesales_urls) >= 1
-        for url in timesales_urls:
-            assert "api.tradier.com" in url, (
-                f"Expected api.tradier.com in URL, got {url!r}"
-            )
-            assert "sandbox" not in url, (
-                f"sandbox.tradier.com must NOT be called for market-data, got {url!r}"
-            )
+        # _fetch_intraday_bars no longer exists on this module (PR #181)
+        assert not hasattr(mod, "_fetch_intraday_bars"), (
+            "_fetch_intraday_bars must be removed after PR #181"
+        )
 
     def test_paper_sandbox_broker_still_uses_live_market_data_url(self):
-        """Required test 2: paper broker (sandbox base_url) → live market-data URL."""
-        mod = _load_v2()
-        captured = []
-        broker = self._broker_paper_sandbox(captured)
+        """
+        PR #181: The root cause of HTTP 401 was that paper accounts'
+        sandbox token was sent to api.tradier.com timesales.
+        Fixed by switching to Polygon (no broker token needed).
 
-        # The resolver must NOT use broker.base_url (sandbox) for market data.
-        # market_data_base_url / quote_base_url not set → falls through to live.
+        This test still verifies _resolve_market_data_base_url behavior
+        but no longer asserts timesales was called (it isn't anymore).
+        """
+        mod = _load_v2()
+        import unittest.mock as mock
+        broker = mock.MagicMock()
+        broker.base_url = "https://sandbox.tradier.com"
+        del broker.market_data_base_url
+        del broker.quote_base_url
+        del broker.cfg
+
         resolved = mod._resolve_market_data_base_url(broker)
         assert resolved == "https://api.tradier.com", (
             f"Paper broker should resolve to api.tradier.com, got {resolved!r}"
         )
         assert "sandbox" not in resolved
-
-        # Confirm actual HTTP calls go to live endpoint
-        mod._fetch_intraday_bars("SPY", broker, "2026-06-11T09:30:00", "2026-06-11T10:00:00")
-        timesales_urls = [u for u in captured if "timesales" in u]
-        assert len(timesales_urls) >= 1
-        for url in timesales_urls:
-            assert "sandbox" not in url, (
-                f"Paper broker must NOT use sandbox for market-data validation: {url!r}"
-            )
-            assert "api.tradier.com" in url
+        # timesales is gone; fetch_market_snapshot now uses Polygon.
+        # See test_pr181_overnight_polygon_daily.py for the paper-account proof.
 
     def test_broker_with_market_data_base_url_uses_it(self):
         """broker.market_data_base_url is respected (priority 1)."""
