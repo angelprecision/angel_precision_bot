@@ -85,11 +85,25 @@ class APFeedbackLoop:
         synthetic_entry:      bool = False,
     ):
         """Call this every time a position closes."""
-        ticker      = signal.get("ticker", "")
-        pattern     = signal.get("pattern", "")
-        side        = signal.get("side", "CALL")
-        timeframe   = signal.get("timeframe", "1d")
-        score       = float(signal.get("score", 0) or 0)
+        # INTELLIGENCE CAPTURE (docs/pr_specs/intelligence_outcome_capture_20260903.md):
+        # scoring metadata (pattern/score/side/timeframe/regime/...) is produced at
+        # signal-creation time but was arriving NULL here because the exit-time
+        # ``signal`` dict had lost it. Prefer a ``signal_meta`` snapshot carried
+        # from stage time when the top-level field is absent. This never fabricates
+        # a value: if neither source has it, the original default is used.
+        _meta = signal.get("signal_meta") if isinstance(signal.get("signal_meta"), dict) else {}
+
+        def _carried(key: str, default):
+            v = signal.get(key)
+            if v in (None, "", 0) and key in _meta and _meta.get(key) not in (None, ""):
+                return _meta.get(key)
+            return v if v not in (None, "") else default
+
+        ticker      = _carried("ticker", "")
+        pattern     = _carried("pattern", "")
+        side        = _carried("side", "CALL")
+        timeframe   = _carried("timeframe", "1d")
+        score       = float(_carried("score", 0) or 0)
         backtest_wr = float(signal.get("win_rate", 0) or 0)
         # MED-002: normalize win_rate to percentage (0-100) if provided as ratio (0-1)
         if 0 < backtest_wr <= 1.0:
