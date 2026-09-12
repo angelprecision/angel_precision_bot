@@ -1,0 +1,97 @@
+name: P1 Massive 4H Market Data
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "ap/massive_market_data.py"
+      - "tests/test_p1_massive_market_data.py"
+      - "scripts/massive_4h_canary.py"
+      - "docs/pr_specs/p1_massive_canonical_4h_implementation_20260912.md"
+      - ".github/workflows/p1_massive_market_data.yml"
+
+jobs:
+  exact-head:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: massive_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d massive_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Assert exact PR head
+        run: test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install focused dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas
+
+      - name: Run Massive transport and geometry proof
+        env:
+          PGSSLMODE: disable
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/massive_test?sslmode=disable
+        run: |
+          python -m pytest tests/test_p1_massive_market_data.py -v --tb=short
+          python -m py_compile ap/massive_market_data.py scripts/massive_4h_canary.py
+          git diff --check
+
+  merge-ref:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: massive_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d massive_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+
+      - name: Assert synthetic merge ref
+        run: test "$(git rev-parse HEAD)" = "${{ github.sha }}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install focused dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas
+
+      - name: Run identical Massive transport and geometry proof
+        env:
+          PGSSLMODE: disable
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/massive_test?sslmode=disable
+        run: |
+          python -m pytest tests/test_p1_massive_market_data.py -v --tb=short
+          python -m py_compile ap/massive_market_data.py scripts/massive_4h_canary.py
+          git diff --check
