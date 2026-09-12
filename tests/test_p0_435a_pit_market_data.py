@@ -84,9 +84,11 @@ class _Broker:
 def _clear_fvg_cache():
     # Both the historical and recut implementations use these process caches.
     getattr(fvg, "_candle_cache", {}).clear()
+    getattr(fvg, "_pit_snapshot_authoritative", set()).clear()
     getattr(fvg, "_inflight", {}).clear()
     yield
     getattr(fvg, "_candle_cache", {}).clear()
+    getattr(fvg, "_pit_snapshot_authoritative", set()).clear()
     getattr(fvg, "_inflight", {}).clear()
 
 
@@ -393,6 +395,24 @@ def test_breach_frozen_rows_exclude_incomplete_5m_and_15m_and_derive_htf():
     assert all(row["time"] != AS_OF.isoformat() for row in candles["5m"])
 
 
+@pytest.mark.parametrize(("bucket_minutes", "count"), [(60, 4), (240, 16)])
+def test_derived_htf_requires_every_expected_15m_constituent(bucket_minutes, count):
+    start = datetime(2026, 9, 11, 13, 30, tzinfo=timezone.utc)
+    rows = _series(start, count=count, minutes=15)
+    as_of = start + timedelta(minutes=bucket_minutes)
+
+    complete = imd._completed_intraday(
+        rows, bucket_minutes=bucket_minutes, now=as_of
+    )
+    assert len(complete) == 1
+
+    missing = list(rows)
+    missing.pop(count // 2)
+    assert imd._completed_intraday(
+        missing, bucket_minutes=bucket_minutes, now=as_of
+    ) == []
+
+
 def test_breach_network_rows_are_refiltered_even_if_transport_returns_partial(monkeypatch):
     fifteen = [
         _bar(datetime(2026, 9, 11, 17, 0, tzinfo=timezone.utc)),
@@ -466,6 +486,31 @@ def test_fail_first_15m_cache_crossing_completed_boundary_refetches(monkeypatch)
     )
     assert first[-1]["time"] == "2026-09-11T13:45:00+00:00"
     assert second[-1]["time"] == "2026-09-11T14:00:00+00:00"
+
+
+def test_successful_empty_pit_snapshot_reuses_same_bucket(monkeypatch):
+    broker = _Broker(lambda _params, _call_number: [])
+    monkeypatch.setattr(fvg, "_resolve_base_url", lambda _broker: "https://api.tradier.com")
+
+    first_as_of = datetime(2026, 9, 11, 13, 32, tzinfo=timezone.utc)
+    second_as_of = datetime(2026, 9, 11, 13, 34, tzinfo=timezone.utc)
+
+    assert fvg.fetch_5m_bars("SPY", broker, now=first_as_of) == []
+    assert fvg.fetch_5m_bars("SPY", broker, now=second_as_of) == []
+    assert len(broker.session.calls) == 1
+
+
+def test_failed_pit_request_is_not_cached_as_authoritative_empty(monkeypatch):
+    def responder(_params, _call_number):
+        raise RuntimeError("provider down")
+
+    broker = _Broker(responder)
+    monkeypatch.setattr(fvg, "_resolve_base_url", lambda _broker: "https://api.tradier.com")
+    as_of = datetime(2026, 9, 11, 13, 32, tzinfo=timezone.utc)
+
+    assert fvg.fetch_5m_bars("SPY", broker, now=as_of) == []
+    assert fvg.fetch_5m_bars("SPY", broker, now=as_of) == []
+    assert len(broker.session.calls) == 2
 
 
 def test_tradier_naive_local_time_is_normalized_before_pit_filter(monkeypatch):
