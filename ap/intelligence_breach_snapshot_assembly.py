@@ -340,15 +340,19 @@ def _normalize_trigger(source: Any, *, errors: list[str]) -> Optional[str]:
 
 
 def _canonical_signal_id(signal_id: str, source: Any = None) -> str:
-    """Derive a canonical signal ID without accepting an unsafe fallback."""
+    """Resolve canonical signal authority through the current-main helper."""
     try:
         from ap_canonical_signal import build_canonical_signal_id
 
-        # The helper's explicit-payload shortcut is intentionally bypassed.
-        # The caller validates an explicit value against this raw-signal
-        # derivation, rather than allowing the value being checked to bless
-        # itself as the helper result.
-        derived = build_canonical_signal_id(signal_id, None)
+        canonical_payload = next(
+            (
+                mapping
+                for mapping in _source_mappings(source)
+                if "canonical_signal_id" in mapping
+            ),
+            None,
+        )
+        derived = build_canonical_signal_id(signal_id, canonical_payload)
     except Exception as exc:
         raise _CanonicalSignalError("canonical_signal_derivation_failed") from exc
     if not isinstance(derived, str) or not derived.strip():
@@ -469,9 +473,8 @@ def normalize_breach_identity(
     if explicit_canonical:
         if derived_canonical is None:
             errors.append("canonical_signal_id_unproven")
-        elif explicit_canonical != derived_canonical:
-            errors.append("canonical_signal_id_mismatch")
-        canonical = explicit_canonical
+        else:
+            canonical = derived_canonical
     else:
         canonical = derived_canonical or ""
     if not canonical:
@@ -631,6 +634,18 @@ def _expected_identity(
     values["local_order_id"] = _normalize_text_values(
         raw, ("local_order_id",), field="local_order_id", errors=errors
     )
+    values["trigger_crossed_at"] = _normalize_optional_trigger(raw, errors=errors)
+    values["model_version"] = _normalize_text_values(
+        raw,
+        (
+            "model_version",
+            "intelligence_model_version",
+            "breach_model_version",
+            "identity_model_version",
+        ),
+        field="model_version",
+        errors=errors,
+    )
     values["ticker"] = _normalize_text_values(
         raw, ("ticker", "symbol"), field="ticker", errors=errors, required=True, uppercase=True
     )
@@ -691,6 +706,84 @@ def _parent_normalized_text(
     if len(distinct) > 1:
         errors.append(f"{field}_conflict")
     return distinct[0] if distinct else ""
+
+
+def _normalize_optional_trigger(source: Any, *, errors: list[str]) -> Optional[str]:
+    """Normalize an expected trigger when supplied, without requiring it."""
+    values, _ = _timestamp_values(source)
+    if not values:
+        return None
+    normalized: list[str] = []
+    for value in values:
+        local_errors: list[str] = []
+        parsed = _parse_aware_timestamp(
+            value, field="trigger_crossed_at", errors=local_errors
+        )
+        if parsed is None:
+            errors.extend(local_errors)
+        else:
+            normalized.append(parsed)
+    distinct = sorted(set(normalized))
+    if len(distinct) > 1:
+        errors.append("trigger_crossed_at_conflict")
+    return distinct[0] if distinct else None
+
+
+def _parent_trigger(
+    snapshot: Mapping[str, Any], *, phase: str, errors: list[str]
+) -> Optional[str]:
+    """Validate every present parent trigger assertion without requiring it."""
+    normalized: list[str] = []
+    for mapping in _source_mappings(snapshot):
+        for key in ("trigger_crossed_at", "breach_at", "trigger_at"):
+            if key not in mapping:
+                continue
+            local_errors: list[str] = []
+            parsed = _parse_aware_timestamp(
+                mapping.get(key),
+                field=f"{phase}_trigger_crossed_at",
+                errors=local_errors,
+            )
+            if parsed is None:
+                errors.extend(local_errors)
+            else:
+                normalized.append(parsed)
+    distinct = sorted(set(normalized))
+    if len(distinct) > 1:
+        errors.append(f"{phase}_trigger_crossed_at_conflict")
+    return distinct[0] if distinct else None
+
+
+def _parent_model_version(
+    snapshot: Mapping[str, Any], *, phase: str, errors: list[str]
+) -> Optional[str]:
+    """Validate every present durable parent model-version assertion."""
+    values: list[str] = []
+    aliases = (
+        "model_version",
+        "intelligence_model_version",
+        "breach_model_version",
+        "identity_model_version",
+    )
+    for mapping in _source_mappings(snapshot):
+        for key in aliases:
+            if key not in mapping:
+                continue
+            value = mapping.get(key)
+            if value in (None, ""):
+                errors.append(f"{phase}_model_version_missing")
+            elif not isinstance(value, str):
+                errors.append(f"{phase}_model_version_invalid_type")
+            else:
+                normalized = value.strip()
+                if normalized:
+                    values.append(normalized)
+                else:
+                    errors.append(f"{phase}_model_version_missing")
+    distinct = sorted(set(values))
+    if len(distinct) > 1:
+        errors.append(f"{phase}_model_version_conflict")
+    return distinct[0] if distinct else None
 
 
 def _parent_generation(snapshot: Mapping[str, Any], *, errors: list[str]) -> Optional[int]:
@@ -1009,6 +1102,12 @@ def validate_breach_parent_snapshot(
             snapshot, ("local_order_id",), field="local_order_id", errors=errors
         ),
     }
+    actual["trigger_crossed_at"] = _parent_trigger(
+        snapshot, phase=requested_phase, errors=errors
+    )
+    actual["model_version"] = _parent_model_version(
+        snapshot, phase=requested_phase, errors=errors
+    )
     actual["materialization_generation"] = _parent_generation(snapshot, errors=errors)
     actual_context_revision = _normalize_optional_revision(snapshot, errors=errors)
 
@@ -1044,6 +1143,16 @@ def validate_breach_parent_snapshot(
         errors.append("PRETRIGGER_local_order_id_mismatch")
     elif actual_local and not expected_local:
         errors.append("PRETRIGGER_local_order_id_unexpected")
+
+    expected_trigger = expected.get("trigger_crossed_at")
+    actual_trigger = actual.get("trigger_crossed_at")
+    if expected_trigger and actual_trigger and actual_trigger != expected_trigger:
+        errors.append(f"{requested_phase}_trigger_crossed_at_mismatch")
+
+    expected_model = expected.get("model_version") or ""
+    actual_model = actual.get("model_version") or ""
+    if expected_model and actual_model and actual_model != expected_model:
+        errors.append(f"{requested_phase}_model_version_mismatch")
 
     expected_generation = expected.get("materialization_generation")
     actual_generation = actual.get("materialization_generation")

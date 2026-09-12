@@ -39,8 +39,8 @@ def _signal(**updates: object) -> dict:
         "client_id": "client@example.com",
         "execution_mode": "PAPER",
         "signal_id": "signal-breach-1",
-        # Plain signal IDs canonicalize to themselves; distinct canonical
-        # values are covered by the REEVAL normalization tests below.
+        # Plain signal IDs canonicalize to themselves unless current-main's
+        # explicit canonical payload authority supplies another value.
         "canonical_signal_id": "signal-breach-1",
         "ticker": "SPY",
         "side": "CALL",
@@ -208,16 +208,72 @@ def test_canonical_helper_exception_fails_closed(monkeypatch):
     assert "REEVAL:603bce5b-352e-44e0-b00b-6baa826ca2c9" not in str(result)
 
 
-def test_explicit_canonical_must_match_raw_signal_derivation():
-    matching = normalize_breach_identity(_reeval_signal())
-    conflicting = normalize_breach_identity(
-        _reeval_signal(canonical_signal_id="REEVAL:603bce5b-352e-44e0-b00b-6baa826ca2c9:other")
+def test_canonical_helper_unusable_output_fails_closed(monkeypatch):
+    import ap_canonical_signal
+
+    monkeypatch.setattr(
+        ap_canonical_signal, "build_canonical_signal_id", lambda *_args, **_kwargs: ""
     )
-    plain = normalize_breach_identity(_signal(canonical_signal_id="signal-breach-1"))
-    assert matching["ok"] is True
-    assert conflicting["ok"] is False
-    assert "canonical_signal_id_mismatch" in conflicting["errors"]
-    assert plain["ok"] is True
+    result = normalize_breach_identity(_signal())
+    assert result["ok"] is False
+    assert result["identity"] is None
+    assert "canonical_signal_derivation_unusable" in result["errors"]
+
+
+def test_explicit_current_main_canonical_signal_is_authoritative():
+    result = normalize_breach_identity(
+        _signal(signal_id="sig-123", canonical_signal_id="canon-123")
+    )
+    assert result["ok"] is True
+    assert result["canonical_signal_id"] == "canon-123"
+    assert result["identity"]["canonical_signal_id"] == "canon-123"
+
+
+def test_explicit_canonical_value_is_preserved_in_identity_hash():
+    explicit = _identity(signal_id="sig-123", canonical_signal_id="canon-123")
+    raw_derived = _identity(signal_id="sig-123", canonical_signal_id="sig-123")
+    assert explicit["canonical_signal_id"] == "canon-123"
+    assert hash_breach_identity(explicit) != hash_breach_identity(raw_derived)
+    assert hash_breach_snapshot_input(explicit, _evidence()) != hash_breach_snapshot_input(
+        raw_derived, _evidence()
+    )
+
+
+def test_current_327_explicit_canonical_parent_is_accepted():
+    identity = _identity(
+        local_order_id="local-order-1",
+        signal_id="sig-123",
+        canonical_signal_id="canon-123",
+    )
+    result = validate_breach_parent_snapshot(
+        _parent(
+            "PREOPEN",
+            local_order_id="local-order-1",
+            signal_id="sig-123",
+            canonical_signal_id="canon-123",
+        ),
+        identity=identity,
+        phase="PREOPEN",
+    )
+    assert result["ok"] is True
+    assert result["accepted"] is True
+
+
+def test_reeval_without_explicit_canonical_still_strips_suffix():
+    source = _reeval_signal()
+    del source["canonical_signal_id"]
+    result = normalize_breach_identity(source)
+    assert result["ok"] is True
+    assert result["canonical_signal_id"] == "REEVAL:603bce5b-352e-44e0-b00b-6baa826ca2c9"
+
+
+def test_contradictory_explicit_canonical_values_reject():
+    source = _signal(signal_id="sig-123", canonical_signal_id="canon-123")
+    source["payload"] = {"canonical_signal_id": "canon-456"}
+    result = normalize_breach_identity(source)
+    assert result["ok"] is False
+    assert result["identity"] is None
+    assert "canonical_signal_id_conflict" in result["errors"]
 
 
 @pytest.mark.parametrize(
@@ -270,6 +326,73 @@ def test_local_order_and_generation_are_exact_parent_authority():
     assert any("local_order_id_mismatch" in error for error in wrong_local["errors"])
     assert wrong_generation["accepted"] is False
     assert any("generation_mismatch" in error for error in wrong_generation["errors"])
+
+
+def test_parent_trigger_and_model_are_optional_when_absent():
+    parent = _parent("PREOPEN", local_order_id="local-order-1")
+    del parent["payload"]["signal"]["trigger_crossed_at"]
+    del parent["payload"]["signal"]["model_version"]
+    result = validate_breach_parent_snapshot(
+        parent,
+        identity=_identity(local_order_id="local-order-1"),
+        phase="PREOPEN",
+    )
+    assert result["ok"] is True
+    assert result["accepted"] is True
+
+
+def test_matching_present_parent_trigger_and_model_are_accepted():
+    result = validate_breach_parent_snapshot(
+        _parent("PREOPEN", local_order_id="local-order-1"),
+        identity=_identity(local_order_id="local-order-1"),
+        phase="PREOPEN",
+    )
+    assert result["ok"] is True
+    assert result["accepted"] is True
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    ["2026-09-11T17:31:00+00:00", "2026-09-11T17:30:00", "not-a-timestamp"],
+)
+def test_conflicting_or_malformed_present_parent_trigger_is_rejected(trigger):
+    parent = _parent("PREOPEN", local_order_id="local-order-1")
+    parent["payload"]["signal"]["trigger_crossed_at"] = trigger
+    result = validate_breach_parent_snapshot(
+        parent,
+        identity=_identity(local_order_id="local-order-1"),
+        phase="PREOPEN",
+    )
+    assert result["ok"] is False
+    assert result["accepted"] is False
+    assert result["status"] == "REJECTED"
+    assert any("trigger_crossed_at" in error for error in result["errors"])
+
+
+def test_conflicting_present_parent_model_is_rejected():
+    parent = _parent("PREOPEN", local_order_id="local-order-1")
+    parent["payload"]["signal"]["model_version"] = "model-other"
+    result = validate_breach_parent_snapshot(
+        parent,
+        identity=_identity(local_order_id="local-order-1"),
+        phase="PREOPEN",
+    )
+    assert result["ok"] is False
+    assert result["status"] == "REJECTED"
+    assert "PREOPEN_model_version_mismatch" in result["errors"]
+
+
+def test_conflicting_nested_parent_model_versions_are_rejected():
+    parent = _parent("PREOPEN", local_order_id="local-order-1")
+    parent["payload"]["model_version"] = "model-other"
+    result = validate_breach_parent_snapshot(
+        parent,
+        identity=_identity(local_order_id="local-order-1"),
+        phase="PREOPEN",
+    )
+    assert result["ok"] is False
+    assert result["status"] == "REJECTED"
+    assert "PREOPEN_model_version_conflict" in result["errors"]
 
 
 @pytest.mark.parametrize("status", ["ERROR", "UNAVAILABLE", "PARTIAL", "STALE", None])
