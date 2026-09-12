@@ -212,6 +212,11 @@ def test_failfirst_recovered_live_msft_production_path_restores_and_dispatches()
     assert osm.position_calls == []
     assert osm.proof_calls == []
 
+    # This replay covers two regular-session breach polls.  Pin that intent
+    # explicitly so the proof does not become runner-wall-clock dependent after
+    # 16:00 ET, when the production watcher correctly queues new arms overnight.
+    watcher._pending[0].overnight = False
+
     callback = MagicMock(return_value={"disposition": "KEEP_WATCHER"})
     watcher.on_trigger = callback
     watcher._fetch_quotes = MagicMock(

@@ -32,6 +32,7 @@ env:
     tests/test_p1_selector_identity_assertion_mode_fallback.py
     tests/test_p1_intelligence_admission_policy.py
     tests/test_p1_intel_admission_e2e_final_gate.py
+    tests/test_p0_435a_pit_market_data.py
     tests/test_p0_forward_regime_advisory_flow.py
     tests/test_p0_strict_direct_quote_cache.py
     tests/test_p0_selector_direct_quote_budget_authority.py
@@ -672,6 +673,10 @@ jobs:
           assert recovery.recover_one_row(ROW) == _RowOutcome.WATCHER_OWNED
           assert len(watcher._pending) == 1
           assert ap_lifecycle.LEDGER.current_state(SIGNAL_ID) is None
+          # This fail-first replay models two regular-session polls.  Keep the
+          # rollback proof independent of the GitHub runner's wall clock; the
+          # production path correctly gates post-session watchers overnight.
+          watcher._pending[0].overnight = False
 
           callback_calls = []
           successful_callbacks = []

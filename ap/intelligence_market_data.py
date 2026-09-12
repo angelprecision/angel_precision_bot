@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
@@ -114,18 +115,27 @@ def _quote(symbol: str, broker: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
-def _history(symbol: str, broker: Any, *, days: int = 400) -> list[dict[str, Any]]:
+def _history(
+    symbol: str,
+    broker: Any,
+    *,
+    days: int = 400,
+    now: Optional[datetime] = None,
+) -> list[dict[str, Any]]:
     source = _quote_source(broker)
     if not symbol or source is None or not hasattr(source, "_get"):
         return []
-    now = datetime.now(timezone.utc)
+    history_now = now or datetime.now(timezone.utc)
+    if history_now.tzinfo is None or history_now.utcoffset() is None:
+        return []
+    history_et = history_now.astimezone(ET)
     payload = source._get(
         "/v1/markets/history",
         params={
             "symbol": symbol,
             "interval": "daily",
-            "start": (now - timedelta(days=days)).strftime("%Y-%m-%d"),
-            "end": now.strftime("%Y-%m-%d"),
+            "start": (history_et - timedelta(days=days)).strftime("%Y-%m-%d"),
+            "end": history_et.strftime("%Y-%m-%d"),
         },
     )
     rows = ((payload.get("history") or {}).get("day") or []) if isinstance(payload, dict) else []
@@ -182,22 +192,80 @@ def _aggregate_calendar(
 def _completed_intraday(
     rows: list[dict[str, Any]], *, bucket_minutes: int, now: datetime
 ) -> list[dict[str, Any]]:
+    """Aggregate only clock-complete HTF buckets with every 15m constituent."""
     from ap.fvg_telemetry import aggregate_bars
-    aggregated = aggregate_bars(rows, bucket_minutes=bucket_minutes)
-    completed = []
+
+    if (
+        now.tzinfo is None
+        or now.utcoffset() is None
+        or bucket_minutes <= 0
+        or bucket_minutes % 15 != 0
+    ):
+        return []
+
     now_et = now.astimezone(ET)
-    for row in aggregated:
+    groups: dict[tuple[Any, int], dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_time = str(row.get("time") or row.get("timestamp") or "")
         try:
-            start = datetime.fromisoformat(str(row.get("time") or "").replace("Z", "+00:00"))
-            if start.tzinfo is None:
-                start = start.replace(tzinfo=ET)
-            start_et = start.astimezone(ET)
-            session_close = start_et.replace(hour=16, minute=0, second=0, microsecond=0)
-            bucket_end = min(start_et + timedelta(minutes=bucket_minutes), session_close)
-            if now_et >= bucket_end:
-                completed.append(row)
+            opened = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
         except ValueError:
             continue
+        if opened.tzinfo is None or opened.utcoffset() is None:
+            continue
+
+        local = opened.astimezone(ET)
+        session_open = local.replace(hour=9, minute=30, second=0, microsecond=0)
+        session_close = local.replace(hour=16, minute=0, second=0, microsecond=0)
+        if local < session_open or local >= session_close:
+            continue
+        offset_minutes = int((local - session_open).total_seconds() // 60)
+        if offset_minutes % 15 != 0:
+            continue
+
+        bucket_index = offset_minutes // bucket_minutes
+        bucket_start = session_open + timedelta(minutes=bucket_index * bucket_minutes)
+        bucket_end = min(
+            bucket_start + timedelta(minutes=bucket_minutes), session_close
+        )
+        if now_et < bucket_end:
+            continue
+
+        key = (local.date(), bucket_index)
+        group = groups.setdefault(
+            key,
+            {
+                "start": bucket_start,
+                "end": bucket_end,
+                "rows": {},
+                "duplicate": False,
+            },
+        )
+        row_map = group["rows"]
+        if local in row_map:
+            group["duplicate"] = True
+        row_map[local] = row
+
+    completed: list[dict[str, Any]] = []
+    for group in sorted(groups.values(), key=lambda item: item["start"]):
+        if group["duplicate"]:
+            continue
+        bucket_start = group["start"]
+        bucket_end = group["end"]
+        expected_count = int((bucket_end - bucket_start).total_seconds() // (15 * 60))
+        expected_times = [
+            bucket_start + timedelta(minutes=15 * idx)
+            for idx in range(expected_count)
+        ]
+        row_map = group["rows"]
+        if set(row_map) != set(expected_times):
+            continue
+        bucket_rows = [row_map[stamp] for stamp in expected_times]
+        aggregated = aggregate_bars(bucket_rows, bucket_minutes=bucket_minutes)
+        if len(aggregated) == 1:
+            completed.append(aggregated[0])
     return completed
 
 
@@ -249,13 +317,490 @@ def _intraday_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"vwap": vwap, "relative_volume": relative_volume, "total_volume": total_volume}
 
 
+def _parse_breach_as_of(value: Any) -> tuple[Optional[datetime], str]:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None, "malformed"
+    else:
+        return None, "missing"
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None, "timezone_aware_required"
+    return parsed, ""
+
+
+def _filter_completed_bars(
+    rows: Any, *, interval_minutes: int, as_of: datetime
+) -> list[dict[str, Any]]:
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        return []
+    completed: list[dict[str, Any]] = []
+    interval = timedelta(minutes=interval_minutes)
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        raw_time = str(row.get("time") or row.get("timestamp") or "")
+        try:
+            opened = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if opened.tzinfo is None or opened.utcoffset() is None:
+            continue
+        if opened + interval <= as_of:
+            completed.append(dict(row))
+    return completed
+
+
+def _describe_pit_coverage(
+    rows: list[dict[str, Any]],
+    *,
+    interval_minutes: int,
+    as_of: datetime,
+    source: str,
+    authoritative_source: bool,
+    provider_status: Optional[str] = None,
+) -> dict[str, Any]:
+    """Expose whether filtered bars reach the expected RTH close boundary."""
+    from ap.fvg_telemetry import _required_rth_close
+
+    expected_close = _required_rth_close(as_of, interval_minutes=interval_minutes)
+    interval = timedelta(minutes=interval_minutes)
+    latest_close: Optional[datetime] = None
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        raw_time = str(row.get("time") or row.get("timestamp") or "")
+        try:
+            opened = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if opened.tzinfo is None or opened.utcoffset() is None:
+            continue
+        close = opened + interval
+        if close > as_of:
+            continue
+        if latest_close is None or close > latest_close:
+            latest_close = close
+
+    if expected_close is None:
+        status = "NOT_DUE"
+        coverage_complete = True
+    else:
+        coverage_complete = (
+            latest_close is not None and latest_close >= expected_close
+        )
+        status = (
+            "COMPLETE"
+            if coverage_complete
+            else "STALE" if latest_close is not None else "MISSING"
+        )
+    return {
+        "status": status,
+        "coverage_complete": coverage_complete,
+        "authoritative": bool(authoritative_source and coverage_complete),
+        "latest_expected_close": (
+            expected_close.astimezone(ET).isoformat()
+            if expected_close is not None
+            else None
+        ),
+        "latest_observed_close": (
+            latest_close.astimezone(ET).isoformat()
+            if latest_close is not None
+            else None
+        ),
+        "source": source,
+        "provider_status": provider_status,
+    }
+
+
+def _provider_result_succeeded(value: Any) -> bool:
+    status = getattr(value, "provider_succeeded", None)
+    return bool(status) if status is not None else bool(value)
+
+
+def _select_pit_interval_source(
+    provider_bars: list[dict[str, Any]],
+    frozen_bars: list[dict[str, Any]],
+    *,
+    provider_succeeded: bool,
+    provider_coverage: dict[str, Any],
+    frozen_coverage: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any], bool]:
+    """Choose one interval source without merging or inventing evidence."""
+    if provider_succeeded and provider_coverage.get("coverage_complete") is True:
+        return provider_bars, provider_coverage, False
+    if frozen_bars and frozen_coverage.get("coverage_complete") is True:
+        return frozen_bars, frozen_coverage, True
+    if provider_succeeded and provider_bars:
+        return provider_bars, provider_coverage, False
+    if frozen_bars:
+        return frozen_bars, frozen_coverage, True
+    if provider_bars:
+        return provider_bars, provider_coverage, False
+    return provider_bars, provider_coverage, False
+
+
+def _strict_breach_numeric(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _empty_breach_observation() -> dict[str, Any]:
+    return {
+        "price": None,
+        "source": None,
+        "observed_at": None,
+        "source_timestamp": None,
+        "age_seconds": None,
+    }
+
+
+def resolve_frozen_breach_observation(
+    signal: dict[str, Any], as_of: datetime
+) -> dict[str, Any]:
+    """Resolve only explicit, point-in-time breach price evidence."""
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        return _empty_breach_observation()
+
+    scalar_candidates = (
+        ("signal.breach_price", "breach_price", "breach_price_at"),
+        (
+            "signal.frozen_underlying_price",
+            "frozen_underlying_price",
+            "frozen_underlying_price_at",
+        ),
+        ("signal.underlying_at_breach", "underlying_at_breach", "underlying_at_breach_at"),
+        ("signal.price_at_breach", "price_at_breach", "price_at_breach_at"),
+    )
+    for source, field, timestamp_field in scalar_candidates:
+        if field not in signal:
+            continue
+        price = _strict_breach_numeric(signal.get(field))
+        if price is None:
+            continue
+
+        if timestamp_field in signal:
+            source_timestamp = signal.get(timestamp_field)
+            parsed_timestamp, _ = _parse_breach_as_of(source_timestamp)
+            if parsed_timestamp is None or parsed_timestamp > as_of:
+                continue
+            source_timestamp_value = str(source_timestamp)
+        else:
+            source_timestamp_value = as_of.isoformat()
+        return {
+            "price": price,
+            "source": source,
+            "observed_at": as_of.isoformat(),
+            "source_timestamp": source_timestamp_value,
+            "age_seconds": None,
+        }
+
+    evidence = signal.get("breach_evidence")
+    if isinstance(evidence, Mapping):
+        timestamp = None
+        for field in ("as_of", "data_as_of", "timestamp", "observed_at", "time"):
+            if field in evidence:
+                timestamp = evidence.get(field)
+                break
+        parsed_timestamp, _ = _parse_breach_as_of(timestamp)
+        if parsed_timestamp is None or parsed_timestamp > as_of:
+            return _empty_breach_observation()
+
+        price = None
+        for field in ("price", "underlying_price", "breach_price", "value"):
+            if field in evidence:
+                price = _strict_breach_numeric(evidence.get(field))
+                break
+        if price is None:
+            return _empty_breach_observation()
+        return {
+            "price": price,
+            "source": "signal.breach_evidence",
+            "observed_at": as_of.isoformat(),
+            "source_timestamp": str(timestamp),
+            "age_seconds": None,
+        }
+
+    return _empty_breach_observation()
+
+
+def _breach_data_sources(
+    signal: dict[str, Any],
+    *,
+    daily: list[dict[str, Any]],
+    bars_5m: list[dict[str, Any]],
+    bars_15m: list[dict[str, Any]],
+    candles_1h: list[dict[str, Any]],
+    candles_4h: list[dict[str, Any]],
+    now: datetime,
+    observed_price: Optional[float],
+    coverage_5m: dict[str, Any],
+    coverage_15m: dict[str, Any],
+) -> dict[str, Any]:
+    today_et = now.astimezone(ET).date().isoformat()
+    completed_daily = [
+        row
+        for row in daily
+        if isinstance(row, dict) and str(row.get("time") or "")[:10] < today_et
+    ]
+    metrics = _intraday_metrics(bars_15m)
+    return {
+        "candles": {
+            "monthly": _aggregate_calendar(completed_daily, "monthly", now=now),
+            "weekly": _aggregate_calendar(completed_daily, "weekly", now=now),
+            "daily": completed_daily,
+            "5m": bars_5m,
+            "15m": bars_15m,
+            "1h": candles_1h,
+            "4h": candles_4h,
+        },
+        "coverage": {"5m": coverage_5m, "15m": coverage_15m},
+        "trend": {"vwap": metrics.get("vwap"), "current_price": observed_price},
+        "volume": {"relative_volume": metrics.get("relative_volume")},
+        "market": {
+            "symbol": str(signal.get("market_symbol") or "SPY"),
+            "change_pct": None,
+        },
+        "sector": {
+            "sector": signal.get("sector"),
+            "symbol": signal.get("sector_etf"),
+            "change_pct": None,
+        },
+    }
+
+
+def _collect_breach_context(
+    signal: dict[str, Any],
+    *,
+    broker: Any,
+    ticker: str,
+    evidence_now: datetime,
+    collected_at: str,
+) -> dict[str, Any]:
+    errors: list[str] = []
+    daily: list[dict[str, Any]] = []
+    bars_5m: list[dict[str, Any]] = []
+    bars_15m: list[dict[str, Any]] = []
+    provider_attempted_5m = False
+    provider_attempted_15m = False
+    provider_succeeded_5m = False
+    provider_succeeded_15m = False
+    coverage_5m: Optional[dict[str, Any]] = None
+    coverage_15m: Optional[dict[str, Any]] = None
+
+    # BREACH deliberately has no current quote path. Only bounded historical
+    # reads and already-frozen signal evidence are allowed here.
+    if broker is not None and ticker:
+        try:
+            daily = _history(ticker, broker, now=evidence_now)
+        except Exception as exc:
+            errors.append(f"daily_history:{type(exc).__name__}")
+        try:
+            from ap.fvg_telemetry import fetch_15m_bars
+
+            provider_attempted_15m = True
+            bars_15m = fetch_15m_bars(ticker, broker, now=evidence_now)
+            provider_succeeded_15m = _provider_result_succeeded(bars_15m)
+        except Exception as exc:
+            errors.append(f"intraday_history:{type(exc).__name__}")
+        try:
+            from ap.fvg_telemetry import fetch_5m_bars
+
+            provider_attempted_5m = True
+            bars_5m = fetch_5m_bars(ticker, broker, now=evidence_now)
+            provider_succeeded_5m = _provider_result_succeeded(bars_5m)
+        except Exception as exc:
+            errors.append(f"intraday_history_5m:{type(exc).__name__}")
+
+    bars_15m = _filter_completed_bars(
+        bars_15m, interval_minutes=15, as_of=evidence_now
+    )
+    frozen_15m = _filter_completed_bars(
+        extract_candles(signal, "15m"), interval_minutes=15, as_of=evidence_now
+    )
+    provider_coverage_15m = _describe_pit_coverage(
+        bars_15m,
+        interval_minutes=15,
+        as_of=evidence_now,
+        source="provider_response" if provider_attempted_15m else "unavailable",
+        authoritative_source=provider_succeeded_15m,
+        provider_status=(
+            "success" if provider_succeeded_15m else "error"
+        ) if provider_attempted_15m else "unavailable",
+    )
+    frozen_coverage_15m = _describe_pit_coverage(
+        frozen_15m,
+        interval_minutes=15,
+        as_of=evidence_now,
+        source="signal_frozen",
+        authoritative_source=True,
+    )
+    bars_15m, coverage_15m, used_frozen_15m = _select_pit_interval_source(
+        bars_15m,
+        frozen_15m,
+        provider_succeeded=provider_succeeded_15m,
+        provider_coverage=provider_coverage_15m,
+        frozen_coverage=frozen_coverage_15m,
+    )
+
+    bars_5m = _filter_completed_bars(
+        bars_5m, interval_minutes=5, as_of=evidence_now
+    )
+    frozen_5m = _filter_completed_bars(
+        extract_candles(signal, "5m"), interval_minutes=5, as_of=evidence_now
+    )
+    provider_coverage_5m = _describe_pit_coverage(
+        bars_5m,
+        interval_minutes=5,
+        as_of=evidence_now,
+        source="provider_response" if provider_attempted_5m else "unavailable",
+        authoritative_source=provider_succeeded_5m,
+        provider_status=(
+            "success" if provider_succeeded_5m else "error"
+        ) if provider_attempted_5m else "unavailable",
+    )
+    frozen_coverage_5m = _describe_pit_coverage(
+        frozen_5m,
+        interval_minutes=5,
+        as_of=evidence_now,
+        source="signal_frozen",
+        authoritative_source=True,
+    )
+    bars_5m, coverage_5m, used_frozen_5m = _select_pit_interval_source(
+        bars_5m,
+        frozen_5m,
+        provider_succeeded=provider_succeeded_5m,
+        provider_coverage=provider_coverage_5m,
+        frozen_coverage=frozen_coverage_5m,
+    )
+
+    try:
+        candles_1h = _completed_intraday(
+            bars_15m, bucket_minutes=60, now=evidence_now
+        )
+        candles_4h = _completed_intraday(
+            bars_15m, bucket_minutes=240, now=evidence_now
+        )
+    except Exception as exc:
+        errors.append(f"intraday_aggregation:{type(exc).__name__}")
+        candles_1h = []
+        candles_4h = []
+
+    observation = resolve_frozen_breach_observation(signal, evidence_now)
+    data_sources = _breach_data_sources(
+        signal,
+        daily=daily,
+        bars_5m=bars_5m,
+        bars_15m=bars_15m,
+        candles_1h=candles_1h,
+        candles_4h=candles_4h,
+        now=evidence_now,
+        observed_price=observation.get("price"),
+        coverage_5m=coverage_5m,
+        coverage_15m=coverage_15m,
+    )
+    return {
+        "phase": "BREACH",
+        "collected_at": collected_at,
+        "as_of": evidence_now.isoformat(),
+        "data_sources": data_sources,
+        "underlying_observation": observation,
+        "errors": errors,
+        "provenance": {
+            "quote": None,
+            "daily": "tradier_history_daily" if daily else None,
+            "intraday": (
+                "signal_frozen_15min"
+                if used_frozen_15m
+                else "tradier_timesales_15min"
+                if provider_attempted_15m and bars_15m
+                else None
+            ),
+            "intraday_5m": (
+                "signal_frozen_5min"
+                if used_frozen_5m
+                else "tradier_timesales_5min"
+                if provider_attempted_5m and bars_5m
+                else None
+            ),
+            "market": None,
+            "sector": None,
+        },
+    }
+
+
 def collect_point_in_time_context(
     signal: dict[str, Any], *, broker: Any = None, phase: str
 ) -> dict[str, Any]:
-    """Fetch and normalize evidence for the existing observe-only evaluators."""
+    """Materialize observe-only evidence, not a post-trigger acceptance gate.
+
+    BREACH is an exact-trigger snapshot keyed by ``trigger_crossed_at``.  A
+    later confirmation snapshot and the synchronous acceptance hot path are
+    separate responsibilities.
+    """
     ticker = str(signal.get("ticker") or signal.get("symbol") or "").strip().upper()
     now_utc = datetime.now(timezone.utc)
     collected_at = now_utc.isoformat()
+    phase_name = str(phase).upper()
+    if phase_name == "BREACH":
+        evidence_now, reason = _parse_breach_as_of(signal.get("trigger_crossed_at"))
+        if evidence_now is None:
+            return {
+                "phase": "BREACH",
+                "collected_at": collected_at,
+                "as_of": None,
+                "data_sources": {
+                    "candles": {
+                        "monthly": [], "weekly": [], "daily": [],
+                        "5m": [], "15m": [], "1h": [], "4h": [],
+                    },
+                    "trend": {"vwap": None, "current_price": None},
+                    "volume": {"relative_volume": None},
+                    "market": {
+                        "symbol": str(signal.get("market_symbol") or "SPY"),
+                        "change_pct": None,
+                    },
+                    "sector": {
+                        "sector": signal.get("sector"),
+                        "symbol": signal.get("sector_etf"),
+                        "change_pct": None,
+                    },
+                },
+                "underlying_observation": {
+                    "price": None,
+                    "source": None,
+                    "observed_at": None,
+                    "source_timestamp": None,
+                    "age_seconds": None,
+                },
+                "errors": [f"breach_as_of_invalid:{reason}"],
+                "provenance": {
+                    "quote": None,
+                    "daily": None,
+                    "intraday": None,
+                    "intraday_5m": None,
+                    "market": None,
+                    "sector": None,
+                },
+            }
+        return _collect_breach_context(
+            signal,
+            broker=broker,
+            ticker=ticker,
+            evidence_now=evidence_now,
+            collected_at=collected_at,
+        )
+
     errors: list[str] = []
     quote: dict[str, Any] = {}
     daily: list[dict[str, Any]] = []
@@ -321,7 +866,7 @@ def collect_point_in_time_context(
         },
     }
     return {
-        "phase": str(phase).upper(), "collected_at": collected_at,
+        "phase": phase_name, "collected_at": collected_at,
         "data_sources": data_sources, "underlying_observation": observation,
         "errors": errors,
         "provenance": {

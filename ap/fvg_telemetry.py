@@ -66,8 +66,15 @@ CANDLE_TTL_SEC = int(os.getenv("FVG_CANDLE_TTL_SEC", "900"))
 LOOKBACK_DAYS = int(os.getenv("FVG_LOOKBACK_DAYS", "15"))
 _CACHE_MAX_TICKERS = 256
 
+_INTRADAY_INTERVAL_MINUTES = {"5min": 5, "15min": 15}
+_CacheKey = tuple[str, str, Optional[int]]
+
 _cache_lock = threading.Lock()
-_candle_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_candle_cache: dict[_CacheKey, tuple[float, list[dict[str, Any]]]] = {}
+# Exact PIT keys in this set were produced by a successful provider response.
+# They may satisfy a no-current-RTH-bar-yet bucket even when the latest bar is
+# from an earlier session. Transport/provider failures are never marked.
+_pit_snapshot_authoritative: set[_CacheKey] = set()
 
 # ── singleflight (#283 review amendment, round 2) ────────────────────────────
 # The TTL cache alone protects read/write, not IN-FLIGHT fetches: a 50–100
@@ -75,10 +82,24 @@ _candle_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 # bars, producing N simultaneous timesales calls — violating the bounded-spend
 # invariant. Per-ticker singleflight: exactly one leader fetches; followers
 # wait on the leader's Event (bounded by FETCH_WAIT_SEC > request timeout),
-# then re-read the cache. A leader failure releases followers, who observe the
-# empty cache and degrade to 'no candles' — never a second herd.
+# then receive the exact result for a successful flight or re-read the cache
+# after failure. A leader failure releases followers, who observe the empty
+# cache and degrade to 'no candles' — never a second herd.
+class _FetchedBars(list[dict[str, Any]]):
+    def __init__(self, bars: list[dict[str, Any]], *, provider_succeeded: bool):
+        super().__init__(bars)
+        self.provider_succeeded: bool = provider_succeeded
+
+
+class _InFlight:
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.result: Optional[list[dict[str, Any]]] = None
+        self.succeeded = False
+
+
 _inflight_lock = threading.Lock()
-_inflight: dict[str, threading.Event] = {}
+_inflight: dict[_CacheKey, _InFlight] = {}
 FETCH_WAIT_SEC = 12.0  # > 10s request timeout so followers outlast the leader
 
 # Telemetry thread cap: burst threads are cheap under singleflight (they park
@@ -101,7 +122,7 @@ def telemetry_enabled() -> bool:
     return os.getenv(TELEMETRY_ENABLED_ENV, "1").strip() not in ("0", "false", "no")
 
 
-# ── Tradier 15-min history (production market-data shape, cf. #181) ─────────
+# ── Tradier intraday history (production market-data shape, cf. #181) ────────
 
 def _resolve_base_url(broker: Any) -> str:
     try:
@@ -119,55 +140,239 @@ def _resolve_base_url(broker: Any) -> str:
         return base
 
 
-def fetch_15m_bars(ticker: str, broker: Any, *, now: Optional[datetime] = None) -> list[dict[str, Any]]:
-    """15-min RTH bars for the trailing LOOKBACK_DAYS. Cached per ticker,
-    singleflighted per ticker (one in-flight network call max).
+def _as_of_bucket(now: datetime, *, interval_minutes: int) -> Optional[int]:
+    """Return the UTC completed-boundary bucket for an aware as-of value."""
+    if now.tzinfo is None or now.utcoffset() is None:
+        return None
+    bucket_seconds = interval_minutes * 60
+    epoch_seconds = int(now.astimezone(timezone.utc).timestamp())
+    return epoch_seconds - (epoch_seconds % bucket_seconds)
 
-    Returns [] on any failure so callers degrade to 'no candles' — identical
-    to the pre-PR state for that signal.
+
+def _required_rth_close(
+    now: datetime, *, interval_minutes: int
+) -> Optional[datetime]:
+    """Latest RTH candle close that should exist at ``now``.
+
+    ``None`` means no current-session close is expected yet.  Weekends are
+    treated the same way; weekday exchange holidays conservatively remain
+    retryable rather than being guessed as authoritative no-session days.
     """
+    if now.tzinfo is None or now.utcoffset() is None or interval_minutes <= 0:
+        return None
+    now_et = now.astimezone(ET)
+    if now_et.weekday() >= 5:
+        return None
+    session_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    session_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    first_close = session_open + timedelta(minutes=interval_minutes)
+    if now_et < first_close:
+        return None
+    effective = min(now_et, session_close)
+    elapsed_minutes = int((effective - session_open).total_seconds() // 60)
+    completed_intervals = elapsed_minutes // interval_minutes
+    if completed_intervals <= 0:
+        return None
+    return min(
+        session_open + timedelta(minutes=completed_intervals * interval_minutes),
+        session_close,
+    )
+
+
+def _cache_key(
+    ticker: str, interval: str, *, now: Optional[datetime]
+) -> Optional[_CacheKey]:
+    interval_minutes = _INTRADAY_INTERVAL_MINUTES.get(interval)
+    if interval_minutes is None:
+        return None
+    if now is None:
+        return ticker, interval, None
+    bucket = _as_of_bucket(now, interval_minutes=interval_minutes)
+    if bucket is None:
+        return None
+    return ticker, interval, bucket
+
+
+def _aware_bar_datetime(value: Any) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        # Tradier timesales returns exchange-local ISO timestamps without an
+        # offset.  Normalize that provider form at the transport boundary;
+        # frozen signal evidence is filtered separately and remains strict.
+        parsed = parsed.replace(tzinfo=ET)
+    return parsed
+
+
+def _normalize_provider_bars(bars: Any) -> list[dict[str, Any]]:
+    """Normalize valid Tradier bar timestamps before PIT completion filtering."""
+    normalized: list[dict[str, Any]] = []
+    for bar in bars if isinstance(bars, list) else []:
+        if not isinstance(bar, Mapping):
+            continue
+        item = dict(bar)
+        parsed = _aware_bar_datetime(item.get("time"))
+        if parsed is not None:
+            item["time"] = parsed.isoformat()
+        normalized.append(item)
+    return normalized
+
+
+def _filter_completed_bars(
+    bars: list[dict[str, Any]], *, interval_minutes: int, as_of: datetime
+) -> list[dict[str, Any]]:
+    """Keep only bars whose complete close boundary is known at ``as_of``."""
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        return []
+    completed: list[dict[str, Any]] = []
+    interval = timedelta(minutes=interval_minutes)
+    for bar in bars:
+        if not isinstance(bar, Mapping):
+            continue
+        opened = _aware_bar_datetime(bar.get("time"))
+        if opened is None:
+            continue
+        if opened + interval <= as_of:
+            completed.append(dict(bar))
+    return completed
+
+
+def _cache_covers_as_of(
+    bars: list[dict[str, Any]], *, interval_minutes: int, as_of: datetime
+) -> bool:
+    required_boundary = _required_rth_close(
+        as_of, interval_minutes=interval_minutes
+    )
+    if required_boundary is None:
+        return False
+    interval = timedelta(minutes=interval_minutes)
+    latest_close: Optional[datetime] = None
+    for bar in bars:
+        if not isinstance(bar, Mapping):
+            continue
+        opened = _aware_bar_datetime(bar.get("time"))
+        if opened is None or opened + interval > as_of:
+            continue
+        close = opened + interval
+        if latest_close is None or close > latest_close:
+            latest_close = close
+    return latest_close is not None and latest_close >= required_boundary
+
+
+def _cached_bars(
+    cache_key: _CacheKey, *, now: Optional[datetime], interval_minutes: int
+) -> Optional[list[dict[str, Any]]]:
+    with _cache_lock:
+        hit = _candle_cache.get(cache_key)
+        pit_authoritative = cache_key in _pit_snapshot_authoritative
+    if not hit or (time.monotonic() - hit[0]) >= CANDLE_TTL_SEC:
+        return None
+    if now is not None:
+        required_boundary = _required_rth_close(
+            now, interval_minutes=interval_minutes
+        )
+        if required_boundary is None:
+            if not pit_authoritative:
+                return None
+        elif not _cache_covers_as_of(
+            hit[1], interval_minutes=interval_minutes, as_of=now
+        ):
+            return None
+    return hit[1]
+
+
+def _fetch_intraday_bars(
+    ticker: str,
+    broker: Any,
+    *,
+    interval: str,
+    now: Optional[datetime] = None,
+) -> list[dict[str, Any]]:
     key = str(ticker).strip().upper()
-    if not key or broker is None:
+    interval_minutes = _INTRADAY_INTERVAL_MINUTES.get(interval)
+    cache_key = _cache_key(key, interval, now=now) if key else None
+    if not key or broker is None or interval_minutes is None or cache_key is None:
         return []
 
     while True:
-        now_mono = time.monotonic()
-        with _cache_lock:
-            hit = _candle_cache.get(key)
-            if hit and (now_mono - hit[0]) < CANDLE_TTL_SEC:
-                return hit[1]
+        hit = _cached_bars(
+            cache_key, now=now, interval_minutes=interval_minutes
+        )
+        if hit is not None:
+            return hit
 
-        # Leader election for this ticker.
+        # Leader election is scoped to ticker, interval, and as-of bucket.
         with _inflight_lock:
-            evt = _inflight.get(key)
-            if evt is None:
-                evt = threading.Event()
-                _inflight[key] = evt
+            flight = _inflight.get(cache_key)
+            if flight is None:
+                flight = _InFlight()
+                _inflight[cache_key] = flight
                 is_leader = True
             else:
                 is_leader = False
 
         if not is_leader:
-            # Follower: park until the leader finishes (or times out), then
-            # re-read the cache exactly once. Empty cache after wait → degrade.
-            evt.wait(FETCH_WAIT_SEC)
-            with _cache_lock:
-                hit = _candle_cache.get(key)
-                if hit and (time.monotonic() - hit[0]) < CANDLE_TTL_SEC:
-                    return hit[1]
-            return []
+            # Follower: a successful flight hands off the leader's exact
+            # snapshot, including a deliberately stale PIT response. Only a
+            # failed/expired wait falls back to the existing cache check.
+            flight.event.wait(FETCH_WAIT_SEC)
+            with _inflight_lock:
+                if flight.succeeded:
+                    return flight.result if flight.result is not None else []
+            return _cached_bars(
+                cache_key, now=now, interval_minutes=interval_minutes
+            ) or []
 
         try:
-            return _fetch_15m_bars_network(key, broker, now=now)
-        finally:
-            # Release followers and clear in-flight marker even on failure —
-            # a stuck marker would silently disable fetches for the ticker.
+            result = _fetch_intraday_bars_network(
+                key,
+                broker,
+                interval=interval,
+                interval_minutes=interval_minutes,
+                cache_key=cache_key,
+                now=now,
+            )
             with _inflight_lock:
-                _inflight.pop(key, None)
-            evt.set()
+                flight.result = result
+                flight.succeeded = bool(
+                    getattr(result, "provider_succeeded", True)
+                )
+            return result
+        finally:
+            # Release followers and clear the marker even on failure.
+            with _inflight_lock:
+                _inflight.pop(cache_key, None)
+            flight.event.set()
 
 
-def _fetch_15m_bars_network(key: str, broker: Any, *, now: Optional[datetime] = None) -> list[dict[str, Any]]:
+def fetch_15m_bars(
+    ticker: str, broker: Any, *, now: Optional[datetime] = None
+) -> list[dict[str, Any]]:
+    """15-min RTH bars with live TTL or point-in-time cache isolation."""
+    return _fetch_intraday_bars(ticker, broker, interval="15min", now=now)
+
+
+def fetch_5m_bars(
+    ticker: str, broker: Any, *, now: Optional[datetime] = None
+) -> list[dict[str, Any]]:
+    """5-min RTH bars using the same bounded Tradier timesales transport."""
+    return _fetch_intraday_bars(ticker, broker, interval="5min", now=now)
+
+
+def _fetch_intraday_bars_network(
+    key: str,
+    broker: Any,
+    *,
+    interval: str,
+    interval_minutes: int,
+    cache_key: _CacheKey,
+    now: Optional[datetime] = None,
+) -> list[dict[str, Any]]:
     """The actual network fetch. Leader-only; caller owns singleflight."""
     # #283 REVIEW AMENDMENT: prefer the attached data_broker for market-data
     # reads, matching the quote-truth pattern (#248/#227 and #277's resolver).
@@ -175,7 +380,7 @@ def _fetch_15m_bars_network(key: str, broker: Any, *, now: Optional[datetime] = 
     quote_src = getattr(broker, "data_broker", None) or broker
     session = getattr(quote_src, "session", None)
     if session is None or not hasattr(session, "get"):
-        return []
+        return _FetchedBars([], provider_succeeded=False)
 
     now_et = (now or datetime.now(timezone.utc)).astimezone(ET)
     start = (now_et - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%dT09:30:00")
@@ -186,7 +391,7 @@ def _fetch_15m_bars_network(key: str, broker: Any, *, now: Optional[datetime] = 
             f"{_resolve_base_url(quote_src)}/v1/markets/timesales",
             params={
                 "symbol": key,
-                "interval": "15min",
+                "interval": interval,
                 "start": start,
                 "end": end,
                 "session_filter": "open",
@@ -219,15 +424,43 @@ def _fetch_15m_bars_network(key: str, broker: Any, *, now: Optional[datetime] = 
                 })
             except (KeyError, TypeError, ValueError):
                 continue
+        bars = _normalize_provider_bars(bars)
+        if now is not None:
+            bars = _filter_completed_bars(
+                bars, interval_minutes=interval_minutes, as_of=now
+            )
+        fetched = _FetchedBars(bars, provider_succeeded=True)
         with _cache_lock:
-            if len(_candle_cache) >= _CACHE_MAX_TICKERS:
+            if cache_key not in _candle_cache and len(_candle_cache) >= _CACHE_MAX_TICKERS:
                 oldest = min(_candle_cache, key=lambda k: _candle_cache[k][0])
                 _candle_cache.pop(oldest, None)
-            _candle_cache[key] = (time.monotonic(), bars)
-        return bars
+                _pit_snapshot_authoritative.discard(oldest)
+            _candle_cache[cache_key] = (time.monotonic(), fetched)
+            if now is not None:
+                _pit_snapshot_authoritative.add(cache_key)
+            else:
+                _pit_snapshot_authoritative.discard(cache_key)
+        return fetched
     except Exception as exc:
         log.warning("fvg_telemetry: timesales fetch failed for %s: %s", key, exc)
+        return _FetchedBars([], provider_succeeded=False)
+
+
+def _fetch_15m_bars_network(
+    key: str, broker: Any, *, now: Optional[datetime] = None
+) -> list[dict[str, Any]]:
+    """Compatibility shim for older internal callers and diagnostics."""
+    cache_key = _cache_key(key, "15min", now=now)
+    if cache_key is None:
         return []
+    return _fetch_intraday_bars_network(
+        key,
+        broker,
+        interval="15min",
+        interval_minutes=15,
+        cache_key=cache_key,
+        now=now,
+    )
 
 
 # ── session-anchored aggregation ─────────────────────────────────────────────
