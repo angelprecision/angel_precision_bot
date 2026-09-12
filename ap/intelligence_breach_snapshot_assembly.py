@@ -37,9 +37,15 @@ _IDENTITY_FIELDS = (
     "materialization_generation",
     "profile_version",
     "model_version",
-    "context_revision",
     "phase",
 )
+_PARENT_COMPLETE_STATUS = "COMPLETE"
+_PARENT_NON_AUTHORITATIVE_STATUSES = frozenset(
+    {"PARTIAL", "STALE", "UNAVAILABLE", "ERROR"}
+)
+_PARENT_KNOWN_STATUSES = _PARENT_NON_AUTHORITATIVE_STATUSES | {
+    _PARENT_COMPLETE_STATUS
+}
 _VOLATILE_HASH_KEYS = frozenset(
     {
         "collected_at",
@@ -52,6 +58,80 @@ _VOLATILE_HASH_KEYS = frozenset(
         "latency",
     }
 )
+_CANONICAL_CANDLE_KEYS = frozenset(
+    {
+        "time",
+        "timestamp",
+        "start",
+        "end",
+        "datetime",
+        "date",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "vwap",
+        "trade_count",
+    }
+)
+_CANONICAL_CANDLE_INTERVALS = (
+    "monthly",
+    "weekly",
+    "daily",
+    "5m",
+    "15m",
+    "1h",
+    "4h",
+)
+_CANONICAL_COVERAGE_KEYS = frozenset(
+    {
+        "status",
+        "coverage_complete",
+        "latest_expected_close",
+        "latest_observed_close",
+        "provider_status",
+        "authoritative",
+        "source",
+        "provider_attempted",
+        "provider_succeeded",
+        "interval_minutes",
+        "expected_close",
+        "observed_close",
+        "error",
+        "missing_reason",
+    }
+)
+_CANONICAL_PROVENANCE_KEYS = frozenset(
+    {
+        "quote",
+        "daily",
+        "intraday",
+        "intraday_5m",
+        "market",
+        "sector",
+        "source",
+        "provider",
+    }
+)
+_CANONICAL_OBSERVATION_KEYS = frozenset(
+    {
+        "price",
+        "current_price",
+        "underlying_price",
+        "breach_price",
+        "value",
+        "source",
+        "observed_at",
+        "source_timestamp",
+        "as_of",
+        "age_seconds",
+    }
+)
+
+
+class _CanonicalSignalError(ValueError):
+    """Canonical signal derivation failed or returned unusable output."""
 
 
 def _unique(values: list[str]) -> list[str]:
@@ -101,6 +181,13 @@ def _evidence_mappings(source: Any) -> list[Mapping[str, Any]]:
             "frozen_evidence",
             "structure",
             "market_structure",
+            "identity",
+            "payload",
+            "metadata",
+            "meta",
+            "signal",
+            "underlying_observation",
+            "frozen_underlying_observation",
         ):
             nested = current.get(key)
             if isinstance(nested, Mapping):
@@ -181,10 +268,12 @@ def _normalize_optional_generation(
     return normalized[0] if normalized else None
 
 
-def _normalize_optional_revision(source: Any, *, errors: list[str]) -> int:
+def _normalize_optional_revision(
+    source: Any, *, errors: list[str]
+) -> Optional[int]:
     values, _ = _values_for_keys(source, ("context_revision",))
     if not values:
-        return 1
+        return None
     normalized: list[int] = []
     for value in values:
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -193,7 +282,7 @@ def _normalize_optional_revision(source: Any, *, errors: list[str]) -> int:
         normalized.append(value)
     if len(set(normalized)) > 1:
         errors.append("context_revision_conflict")
-    return normalized[0] if normalized else 1
+    return normalized[0] if normalized else None
 
 
 def _parse_aware_timestamp(value: Any, *, field: str, errors: list[str]) -> Optional[str]:
@@ -247,13 +336,21 @@ def _normalize_trigger(source: Any, *, errors: list[str]) -> Optional[str]:
     return distinct[0] if distinct else None
 
 
-def _canonical_signal_id(signal_id: str, source: Any) -> str:
+def _canonical_signal_id(signal_id: str, source: Any = None) -> str:
+    """Derive a canonical signal ID without accepting an unsafe fallback."""
     try:
         from ap_canonical_signal import build_canonical_signal_id
 
-        return str(build_canonical_signal_id(signal_id, source) or "").strip()
-    except Exception:
-        return signal_id
+        # The helper's explicit-payload shortcut is intentionally bypassed.
+        # The caller validates an explicit value against this raw-signal
+        # derivation, rather than allowing the value being checked to bless
+        # itself as the helper result.
+        derived = build_canonical_signal_id(signal_id, None)
+    except Exception as exc:
+        raise _CanonicalSignalError("canonical_signal_derivation_failed") from exc
+    if not isinstance(derived, str) or not derived.strip():
+        raise _CanonicalSignalError("canonical_signal_derivation_unusable")
+    return derived.strip()
 
 
 def _identity_mapping(value: Any) -> Optional[dict[str, Any]]:
@@ -359,7 +456,21 @@ def normalize_breach_identity(
         field="canonical_signal_id",
         errors=errors,
     )
-    canonical = explicit_canonical or _canonical_signal_id(raw_signal_id, base)
+    canonical = ""
+    derived_canonical: Optional[str] = None
+    if raw_signal_id:
+        try:
+            derived_canonical = _canonical_signal_id(raw_signal_id, base)
+        except _CanonicalSignalError as exc:
+            errors.append(str(exc))
+    if explicit_canonical:
+        if derived_canonical is None:
+            errors.append("canonical_signal_id_unproven")
+        elif explicit_canonical != derived_canonical:
+            errors.append("canonical_signal_id_mismatch")
+        canonical = explicit_canonical
+    else:
+        canonical = derived_canonical or ""
     if not canonical:
         errors.append("canonical_signal_id_missing")
 
@@ -430,7 +541,6 @@ def normalize_breach_identity(
             "materialization_generation": generation_value,
             "profile_version": profile,
             "model_version": model,
-            "context_revision": revision,
             "phase": BREACH_PHASE,
         }
 
@@ -442,6 +552,11 @@ def normalize_breach_identity(
         "identity": copy.deepcopy(identity_value),
         "errors": errors,
         "warnings": [],
+        # #327 persistence bookkeeping is deliberately exposed separately.
+        # It is not part of BREACH semantic identity or any BREACH hash.
+        "context_revision": revision,
+        "observe_only": True,
+        "affected_eligibility": False,
     }
     if identity_value is not None:
         result.update(copy.deepcopy(identity_value))
@@ -502,6 +617,14 @@ def _expected_identity(
         errors=errors,
         required=True,
     )
+    if values["signal_id"] and values["canonical_signal_id"]:
+        try:
+            derived_canonical = _canonical_signal_id(values["signal_id"], raw)
+        except _CanonicalSignalError as exc:
+            errors.append(str(exc))
+        else:
+            if values["canonical_signal_id"] != derived_canonical:
+                errors.append("canonical_signal_id_mismatch")
     values["local_order_id"] = _normalize_text_values(
         raw, ("local_order_id",), field="local_order_id", errors=errors
     )
@@ -531,7 +654,6 @@ def _expected_identity(
     values["materialization_generation"] = _normalize_optional_generation(
         raw, errors=errors
     )
-    values["context_revision"] = _normalize_optional_revision(raw, errors=errors)
     values["phase"] = (
         _normalize_text_values(raw, ("phase",), field="phase", errors=errors)
         or BREACH_PHASE
@@ -586,6 +708,103 @@ def _snapshot_id(snapshot: Mapping[str, Any], *, errors: list[str]) -> str:
     return normalized
 
 
+def _strict_safety_errors(source: Any, *, prefix: str) -> list[str]:
+    """Reject safety-flag lookalikes instead of relying on truthiness."""
+    errors: list[str] = []
+    for mapping in _source_mappings(source):
+        if "observe_only" in mapping:
+            value = mapping.get("observe_only")
+            if type(value) is not bool:
+                errors.append(f"{prefix}_observe_only_invalid_type")
+            elif value is not True:
+                errors.append(f"{prefix}_observe_only_false")
+        if "affected_eligibility" in mapping:
+            value = mapping.get("affected_eligibility")
+            if type(value) is not bool:
+                errors.append(f"{prefix}_affected_eligibility_invalid_type")
+            elif value is not False:
+                errors.append(f"{prefix}_affected_eligibility_true")
+    return _unique(errors)
+
+
+def _parent_status(snapshot: Mapping[str, Any]) -> tuple[Optional[str], list[str]]:
+    """Read row/payload status without treating a non-complete row as proof."""
+    mappings: list[Mapping[str, Any]] = []
+    pending: list[Mapping[str, Any]] = [snapshot]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop(0)
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        mappings.append(current)
+        for key in ("payload", "snapshot", "metadata", "meta"):
+            nested = current.get(key)
+            if isinstance(nested, Mapping):
+                pending.append(nested)
+
+    statuses: list[str] = []
+    warnings: list[str] = []
+    for mapping in mappings:
+        for key in ("status", "snapshot_status"):
+            if key not in mapping:
+                continue
+            value = mapping.get(key)
+            if value in (None, ""):
+                warnings.append("parent_snapshot_status_missing")
+            elif not isinstance(value, str):
+                warnings.append("parent_snapshot_status_invalid_type")
+            else:
+                statuses.append(value.strip().upper())
+    distinct = sorted(set(statuses))
+    if len(distinct) > 1:
+        warnings.append("parent_snapshot_status_conflict")
+    if not distinct:
+        return None, _unique(warnings)
+    for preferred in ("ERROR", "UNAVAILABLE", "STALE", "PARTIAL", "COMPLETE"):
+        if preferred in distinct:
+            if preferred not in _PARENT_KNOWN_STATUSES:
+                warnings.append("parent_snapshot_status_unrecognized")
+            return preferred, _unique(warnings)
+    warnings.append("parent_snapshot_status_unrecognized")
+    return distinct[0], _unique(warnings)
+
+
+def _parent_pointer(
+    snapshot: Mapping[str, Any], *, errors: list[str]
+) -> Optional[str]:
+    values: list[Any] = []
+    for mapping in _source_mappings(snapshot):
+        for key in ("parent_snapshot_id", "parent_id"):
+            if key not in mapping or mapping.get(key) in (None, ""):
+                continue
+            values.append(mapping.get(key))
+    normalized: list[str] = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            errors.append("parent_snapshot_id_invalid_type")
+            continue
+        text = str(value).strip()
+        if text:
+            normalized.append(text)
+    distinct = sorted(set(normalized))
+    if len(distinct) > 1:
+        errors.append("parent_snapshot_id_conflict")
+    return distinct[0] if distinct else None
+
+
+def _parent_link_status(snapshot: Mapping[str, Any]) -> Optional[str]:
+    values: list[str] = []
+    for mapping in _source_mappings(snapshot):
+        for key in ("parent_link_status",):
+            value = mapping.get(key)
+            if isinstance(value, str) and value.strip():
+                values.append(value.strip().upper())
+    distinct = sorted(set(values))
+    return distinct[0] if distinct else None
+
+
 def validate_breach_parent_snapshot(
     snapshot: Optional[Mapping[str, Any]],
     *,
@@ -627,52 +846,89 @@ def validate_breach_parent_snapshot(
         phase="BREACH",
     )
     errors.extend(expected_errors)
+
     if snapshot is None:
         missing_code = f"{requested_phase or 'PARENT'}_parent_missing"
         return {
             "ok": not errors,
             "accepted": False,
+            "proven": False,
             "status": "MISSING",
             "phase": requested_phase,
             "snapshot_id": None,
+            "candidate_snapshot_id": None,
+            "authoritative_parent_snapshot_id": None,
             "parent_snapshot_id": None,
             "snapshot": None,
             "missing": True,
             "mismatches": [],
             "errors": _unique(errors),
             "warnings": _unique([missing_code]),
+            "observe_only": True,
+            "affected_eligibility": False,
         }
+
     if not isinstance(snapshot, Mapping):
         errors.append("parent_snapshot_invalid_type")
         return {
             "ok": False,
             "accepted": False,
+            "proven": False,
             "status": "REJECTED",
             "phase": requested_phase,
             "snapshot_id": None,
+            "candidate_snapshot_id": None,
+            "authoritative_parent_snapshot_id": None,
             "parent_snapshot_id": None,
             "snapshot": None,
             "missing": False,
             "mismatches": _unique(errors),
             "errors": _unique(errors),
             "warnings": [],
+            "observe_only": True,
+            "affected_eligibility": False,
         }
+
+    # ``get_latest_snapshot`` returns a result wrapper, while the durable row
+    # itself is under ``snapshot``.  Accept that known #327 wrapper without
+    # performing a lookup or treating an arbitrary nested object as a parent.
+    if (
+        "id" not in snapshot
+        and isinstance(snapshot.get("snapshot"), Mapping)
+        and ("ok" in snapshot or "error" in snapshot)
+    ):
+        snapshot = snapshot["snapshot"]
+
+    candidate_errors: list[str] = []
+    candidate_snapshot_id = _snapshot_id(snapshot, errors=candidate_errors)
+    parent_pointer = _parent_pointer(snapshot, errors=errors)
+    snapshot_copy = copy.deepcopy(dict(snapshot))
+    status_name, status_warnings = _parent_status(snapshot)
+    warnings.extend(status_warnings)
+
     if expected is None:
+        errors.extend(candidate_errors)
+        errors = _unique(errors)
         return {
             "ok": False,
             "accepted": False,
+            "proven": False,
             "status": "REJECTED",
             "phase": requested_phase,
             "snapshot_id": None,
-            "parent_snapshot_id": None,
+            "candidate_snapshot_id": candidate_snapshot_id or None,
+            "authoritative_parent_snapshot_id": None,
+            "parent_snapshot_id": parent_pointer,
             "snapshot": None,
             "missing": False,
-            "mismatches": _unique(errors),
-            "errors": _unique(errors),
-            "warnings": [],
+            "mismatches": errors,
+            "errors": errors,
+            "warnings": _unique(warnings),
+            "observe_only": True,
+            "affected_eligibility": False,
         }
 
-    snapshot_id = _snapshot_id(snapshot, errors=errors)
+    snapshot_id = candidate_snapshot_id
     actual_phase = _parent_normalized_text(
         snapshot, ("phase",), field="phase", errors=errors, uppercase=True
     )
@@ -704,11 +960,13 @@ def validate_breach_parent_snapshot(
         "local_order_id": _parent_normalized_text(
             snapshot, ("local_order_id",), field="local_order_id", errors=errors
         ),
-        "context_revision": _normalize_optional_revision(snapshot, errors=errors),
     }
     actual["materialization_generation"] = _parent_generation(snapshot, errors=errors)
+    actual_context_revision = _normalize_optional_revision(snapshot, errors=errors)
 
     # Required parent identity fields must be present and exactly compatible.
+    # context_revision is deliberately absent: it is #327 bookkeeping, not
+    # BREACH semantic identity or cross-phase authority.
     for field in (
         "client_id",
         "execution_mode",
@@ -717,7 +975,6 @@ def validate_breach_parent_snapshot(
         "ticker",
         "side",
         "profile_version",
-        "context_revision",
     ):
         expected_value = expected[field]
         actual_value = actual[field]
@@ -742,52 +999,88 @@ def validate_breach_parent_snapshot(
 
     expected_generation = expected.get("materialization_generation")
     actual_generation = actual.get("materialization_generation")
+    authority_proven = True
     if expected_generation is not None:
         if actual_generation is None:
-            # The current #327 PRETRIGGER/PREOPEN payload shape does not
-            # project lifecycle generation into the snapshot row.  Absence is
-            # therefore an explicit unproven warning; a supplied stale or
-            # malformed generation remains a hard rejection below.
             warnings.append(f"{requested_phase}_materialization_generation_unavailable")
+            authority_proven = False
         elif actual_generation != expected_generation:
             errors.append(f"{requested_phase}_materialization_generation_mismatch")
     elif actual_generation is not None:
         errors.append(f"{requested_phase}_materialization_generation_unexpected")
 
-    payload_candidates = _source_mappings(snapshot)
-    for payload in payload_candidates:
-        if payload.get("observe_only") is False:
-            errors.append(f"{requested_phase}_observe_only_false")
-        if payload.get("affected_eligibility") is True:
-            errors.append(f"{requested_phase}_affected_eligibility_true")
+    errors.extend(_strict_safety_errors(snapshot, prefix=f"{requested_phase}_parent"))
 
+    if status_name != _PARENT_COMPLETE_STATUS:
+        authority_proven = False
+        if status_name is None:
+            warnings.append(f"{requested_phase}_parent_status_unproven")
+        elif status_name in _PARENT_NON_AUTHORITATIVE_STATUSES:
+            warnings.append(f"{requested_phase}_parent_status_{status_name.lower()}")
+        else:
+            warnings.append(f"{requested_phase}_parent_status_unrecognized")
+
+    errors.extend(candidate_errors)
     errors = _unique(errors)
+    warnings = _unique(warnings)
     if errors:
         return {
             "ok": False,
             "accepted": False,
+            "proven": False,
             "status": "REJECTED",
             "phase": requested_phase,
             "snapshot_id": None,
-            "parent_snapshot_id": None,
+            "candidate_snapshot_id": snapshot_id or None,
+            "authoritative_parent_snapshot_id": None,
+            "parent_snapshot_id": parent_pointer,
+            "context_revision": actual_context_revision,
             "snapshot": None,
             "missing": False,
             "mismatches": errors,
             "errors": errors,
-            "warnings": _unique(warnings),
+            "warnings": warnings,
+            "observe_only": True,
+            "affected_eligibility": False,
+        }
+    if not authority_proven:
+        return {
+            "ok": True,
+            "accepted": False,
+            "proven": False,
+            "status": "UNPROVEN",
+            "phase": requested_phase,
+            "snapshot_id": None,
+            "candidate_snapshot_id": snapshot_id or None,
+            "authoritative_parent_snapshot_id": None,
+            "parent_snapshot_id": parent_pointer,
+            "context_revision": actual_context_revision,
+            "snapshot": snapshot_copy,
+            "missing": False,
+            "mismatches": [],
+            "errors": [],
+            "warnings": warnings,
+            "observe_only": True,
+            "affected_eligibility": False,
         }
     return {
         "ok": True,
         "accepted": True,
-        "status": "ACCEPTED",
+        "proven": True,
+        "status": "PROVEN",
         "phase": requested_phase,
         "snapshot_id": snapshot_id,
-        "parent_snapshot_id": snapshot_id,
-        "snapshot": copy.deepcopy(dict(snapshot)),
+        "candidate_snapshot_id": snapshot_id,
+        "authoritative_parent_snapshot_id": snapshot_id,
+        "parent_snapshot_id": parent_pointer,
+        "context_revision": actual_context_revision,
+        "snapshot": snapshot_copy,
         "missing": False,
         "mismatches": [],
         "errors": [],
-        "warnings": _unique(warnings),
+        "warnings": warnings,
+        "observe_only": True,
+        "affected_eligibility": False,
     }
 
 
@@ -842,7 +1135,6 @@ def _identity_for_hash(identity: Any) -> dict[str, Any]:
         "materialization_generation": candidate.get("materialization_generation"),
         "profile_version": candidate.get("profile_version"),
         "model_version": candidate.get("model_version") or "",
-        "context_revision": candidate.get("context_revision") or 1,
         "phase": BREACH_PHASE,
     }
 
@@ -875,19 +1167,23 @@ def hash_breach_snapshot_input(
 ) -> str:
     """Hash canonical identity + immutable evidence + exact parent links.
 
-    ``collected_at`` and other worker lifecycle telemetry are removed at every
-    nested mapping level.  ``as_of`` and ``trigger_crossed_at`` remain part of
-    the hash.  Strict JSON conversion rejects object reprs and unordered
-    collections instead of turning them into accidental identity inputs.
+    Only the explicit canonical #614 evidence projection is hashed.  Worker
+    timestamps and arbitrary caller mappings cannot become BREACH identity.
+    ``as_of`` and ``trigger_crossed_at`` remain part of the hash.  Strict JSON
+    conversion rejects object reprs and unordered collections instead of
+    turning them into accidental identity inputs.
     """
     identity_value = _identity_for_hash(identity)
     selected_structure = structure if structure is not None else frozen_structure
+    selected_evidence = project_breach_evidence(evidence) if evidence is not None else {}
     hash_input = {
         "assembly_version": ASSEMBLY_VERSION,
         "identity": identity_value,
-        "parent_snapshot_ids": _parent_ids(parent_snapshot_ids or parent_ids),
-        "evidence": evidence if evidence is not None else {},
-        "structure": selected_structure,
+        "parent_snapshot_ids": _parent_ids(
+            parent_snapshot_ids if parent_snapshot_ids is not None else parent_ids
+        ),
+        "evidence": selected_evidence,
+        "structure": _project_structure(selected_structure),
     }
     canonical = _canonicalize(hash_input)
     encoded = json.dumps(
@@ -933,6 +1229,384 @@ def _evidence_as_of(evidence: Mapping[str, Any], *, errors: list[str]) -> Option
     return distinct[0] if distinct else None
 
 
+def _canonical_evidence_root(source: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Select the canonical #614/#615 PIT mapping, ignoring wrapper metadata."""
+    candidates = _evidence_mappings(source)
+    for candidate in candidates:
+        if "data_sources" in candidate or "underlying_observation" in candidate:
+            return candidate
+    for candidate in candidates:
+        if any(key in candidate for key in ("as_of", "data_as_of", "provenance")):
+            return candidate
+    return source
+
+
+def _projection_timestamp(value: Any, *, field: str) -> str:
+    errors: list[str] = []
+    normalized = _parse_aware_timestamp(value, field=field, errors=errors)
+    if normalized is None:
+        raise ValueError(f"{field}_invalid")
+    return normalized
+
+
+def _project_observation(value: Any) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("canonical underlying observation must be a mapping")
+    result: dict[str, Any] = {}
+    for key in sorted(value):
+        if key not in _CANONICAL_OBSERVATION_KEYS:
+            continue
+        item = value[key]
+        if key in {"as_of", "observed_at", "source_timestamp"} and item not in (None, ""):
+            result[key] = _projection_timestamp(item, field=f"underlying_observation_{key}")
+        else:
+            result[key] = copy.deepcopy(item)
+    return result
+
+
+def _project_candle_row(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError("canonical candle rows must be mappings")
+    return {
+        key: copy.deepcopy(value[key])
+        for key in sorted(value)
+        if key in _CANONICAL_CANDLE_KEYS
+    }
+
+
+def _project_candles(value: Any) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("canonical candles must be a mapping")
+    result: dict[str, Any] = {}
+    for timeframe in _CANONICAL_CANDLE_INTERVALS:
+        if timeframe not in value:
+            continue
+        rows = value[timeframe]
+        if rows is None:
+            result[timeframe] = None
+        elif isinstance(rows, list):
+            result[timeframe] = [_project_candle_row(row) for row in rows]
+        else:
+            raise TypeError(f"canonical {timeframe} candles must be a list")
+    return result
+
+
+def _project_coverage_mapping(value: Any) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("canonical coverage must be a mapping")
+
+    def _one(item: Any) -> dict[str, Any]:
+        if not isinstance(item, Mapping):
+            raise TypeError("canonical coverage entries must be mappings")
+        result: dict[str, Any] = {}
+        for key in sorted(item):
+            if key not in _CANONICAL_COVERAGE_KEYS:
+                continue
+            field_value = item[key]
+            if key in {
+                "latest_expected_close",
+                "latest_observed_close",
+                "expected_close",
+                "observed_close",
+            } and field_value not in (None, ""):
+                result[key] = _projection_timestamp(field_value, field=f"coverage_{key}")
+            else:
+                result[key] = copy.deepcopy(field_value)
+        return result
+
+    result: dict[str, Any] = {}
+    interval_keys = set(_CANONICAL_CANDLE_INTERVALS)
+    if any(key in value for key in interval_keys):
+        for key in sorted(value):
+            if key in interval_keys:
+                result[key] = _one(value[key])
+    else:
+        result = _one(value)
+    return result
+
+
+def _project_provenance(value: Any) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("canonical provenance must be a mapping")
+    return {
+        key: copy.deepcopy(value[key])
+        for key in sorted(value)
+        if key in _CANONICAL_PROVENANCE_KEYS
+    }
+
+
+def _same_numeric(left: Any, right: Any) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return False
+    try:
+        left_float = float(left)
+        right_float = float(right)
+    except (TypeError, ValueError):
+        return left == right
+    return math.isfinite(left_float) and math.isfinite(right_float) and left_float == right_float
+
+
+def project_breach_evidence(source: Optional[Mapping[str, Any]]) -> dict[str, Any]:
+    """Project only canonical, immutable #614 decision-time evidence.
+
+    Worker timestamps, arbitrary caller extras, and later quote aliases are
+    intentionally not part of this projection.  A price-like value is kept
+    when it is located in the canonical frozen observation; a data-source
+    ``current_price`` is kept only when it agrees with that observation.
+    """
+    if source is None:
+        return {}
+    if not isinstance(source, Mapping):
+        raise TypeError("BREACH evidence must be a mapping")
+    root = _canonical_evidence_root(source)
+    result: dict[str, Any] = {}
+
+    phase = root.get("phase")
+    if phase not in (None, ""):
+        result["phase"] = str(phase).strip().upper() if isinstance(phase, str) else phase
+
+    as_of = root.get("as_of")
+    if as_of in (None, ""):
+        as_of = root.get("data_as_of")
+        if isinstance(as_of, Mapping):
+            as_of = as_of.get("BREACH") or as_of.get("breach")
+    if as_of not in (None, ""):
+        result["as_of"] = _projection_timestamp(as_of, field="breach_evidence_as_of")
+
+    data_sources = root.get("data_sources")
+    if not isinstance(data_sources, Mapping):
+        data_sources = {}
+    data_sources_result: dict[str, Any] = {}
+    raw_candles = data_sources.get("candles")
+    if raw_candles is None and "candles" in root:
+        raw_candles = root.get("candles")
+    if raw_candles is not None:
+        data_sources_result["candles"] = _project_candles(raw_candles)
+
+    raw_coverage = data_sources.get("coverage")
+    if raw_coverage is None:
+        raw_coverage = root.get("coverage")
+    if raw_coverage is None:
+        raw_coverage = root.get("data_coverage")
+    if raw_coverage is not None:
+        data_sources_result["coverage"] = _project_coverage_mapping(raw_coverage)
+
+    observation = root.get("underlying_observation")
+    if observation is None:
+        observation = root.get("frozen_underlying_observation")
+    if observation is not None:
+        result["underlying_observation"] = _project_observation(observation)
+        data_sources_result["underlying_observation"] = copy.deepcopy(
+            result["underlying_observation"]
+        )
+
+    trend = data_sources.get("trend")
+    if isinstance(trend, Mapping) and isinstance(observation, Mapping):
+        current_price = trend.get("current_price")
+        observed_price = next(
+            (
+                observation.get(key)
+                for key in ("price", "current_price", "underlying_price", "breach_price", "value")
+                if observation.get(key) not in (None, "")
+            ),
+            None,
+        )
+        if current_price not in (None, "") and _same_numeric(current_price, observed_price):
+            data_sources_result["trend"] = {"current_price": copy.deepcopy(current_price)}
+    if data_sources_result:
+        result["data_sources"] = data_sources_result
+
+    provenance = root.get("provenance")
+    if provenance is None:
+        provenance = root.get("data_provenance")
+    if provenance is not None:
+        result["provenance"] = _project_provenance(provenance)
+
+    for key in (
+        "schema_version",
+        "source_authority",
+        "canonical_errors",
+        "errors",
+        "warnings",
+        "component_statuses",
+    ):
+        if key not in root:
+            continue
+        value = root.get(key)
+        if key in {"errors", "warnings", "canonical_errors"} and value is not None:
+            if not isinstance(value, list):
+                raise TypeError(f"canonical evidence {key} must be a list")
+            result[key] = [copy.deepcopy(item) for item in value]
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def _project_structure(value: Any) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("BREACH structure must be a mapping")
+    result: dict[str, Any] = {}
+    direct_keys = {
+        "schema_version",
+        "model_version",
+        "observe_only",
+        "affected_eligibility",
+        "data_as_of",
+        "side",
+        "underlying_price",
+        "underlying_price_source",
+        "trigger_price",
+        "session_policy",
+        "fvg_zones",
+        "relevant_opposing_fvg",
+        "fvg_penetration",
+        "volume_imbalance",
+        "pullback_reclaim_rebreach",
+        "regime",
+        "setup",
+        "invariants",
+    }
+    for key in sorted(direct_keys):
+        if key not in value:
+            continue
+        field_value = value[key]
+        if key == "data_as_of" and field_value not in (None, ""):
+            result[key] = _projection_timestamp(field_value, field="structure_data_as_of")
+        else:
+            result[key] = copy.deepcopy(field_value)
+    if "point_in_time" in value:
+        result["point_in_time"] = project_breach_evidence(value.get("point_in_time"))
+    if "data_coverage" in value:
+        result["data_coverage"] = _project_coverage_mapping(value.get("data_coverage"))
+    if "data_provenance" in value:
+        result["data_provenance"] = _project_provenance(value.get("data_provenance"))
+    if "underlying_observation" in value:
+        result["underlying_observation"] = _project_observation(value.get("underlying_observation"))
+    market_data = value.get("market_data")
+    if isinstance(market_data, Mapping) and "candles" in market_data:
+        result["market_data"] = {"candles": _project_candles(market_data.get("candles"))}
+    return result
+
+
+def _cross_validate_identity(
+    source: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    *,
+    prefix: str,
+    structure: bool = False,
+) -> list[str]:
+    """Reject present conflicting identity fields; absent optional fields pass."""
+    errors: list[str] = []
+    mappings = _evidence_mappings(source)
+
+    text_fields: tuple[tuple[str, tuple[str, ...], bool, bool], ...] = (
+        ("client_id", ("client_id",), False, True),
+        ("execution_mode", ("execution_mode", "mode"), True, True),
+        ("signal_id", ("signal_id",), False, True),
+        ("canonical_signal_id", ("canonical_signal_id",), False, True),
+        ("local_order_id", ("local_order_id",), False, False),
+        ("ticker", ("ticker", "symbol"), True, True),
+        ("side", ("side", "direction"), True, True),
+        ("profile_version", ("profile_version",), False, True),
+    )
+    if structure:
+        model_aliases = (
+            "identity_model_version",
+            "breach_model_version",
+            "intelligence_model_version",
+        )
+        if str(source.get("schema_version") or "").strip() != "breach_market_structure_v1":
+            model_aliases += ("model_version",)
+    else:
+        model_aliases = (
+            "identity_model_version",
+            "breach_model_version",
+            "intelligence_model_version",
+            "model_version",
+        )
+    text_fields += (("model_version", model_aliases, False, False),)
+
+    for field, aliases, uppercase, required_in_identity in text_fields:
+        expected_value = identity.get(field)
+        if expected_value in (None, "") and not required_in_identity:
+            continue
+        values: list[str] = []
+        for mapping in mappings:
+            for key in aliases:
+                if key not in mapping or mapping.get(key) in (None, ""):
+                    continue
+                value = mapping.get(key)
+                if not isinstance(value, str):
+                    errors.append(f"{prefix}_{field}_invalid_type")
+                    continue
+                text_value = value.strip()
+                if text_value:
+                    values.append(text_value.upper() if uppercase else text_value)
+        distinct = sorted(set(values))
+        if len(distinct) > 1:
+            errors.append(f"{prefix}_{field}_conflict")
+        if not distinct:
+            continue
+        if expected_value not in (None, ""):
+            normalized_expected = str(expected_value).upper() if uppercase else str(expected_value)
+            if any(value != normalized_expected for value in distinct):
+                errors.append(f"{prefix}_{field}_mismatch")
+
+    generation_values: list[int] = []
+    for mapping in mappings:
+        for key in ("materialization_generation", "lifecycle_generation", "generation"):
+            if key not in mapping or mapping.get(key) in (None, ""):
+                continue
+            value = mapping.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                errors.append(f"{prefix}_materialization_generation_invalid_type")
+            else:
+                generation_values.append(value)
+    if len(set(generation_values)) > 1:
+        errors.append(f"{prefix}_materialization_generation_conflict")
+    expected_generation = identity.get("materialization_generation")
+    if generation_values and expected_generation is not None and any(
+        value != expected_generation for value in generation_values
+    ):
+        errors.append(f"{prefix}_materialization_generation_mismatch")
+
+    expected_trigger = identity.get("trigger_crossed_at")
+    for mapping in mappings:
+        for key in (
+            "trigger_crossed_at",
+            "breach_at",
+            "trigger_at",
+            "as_of",
+            "data_as_of",
+        ):
+            if key not in mapping or mapping.get(key) in (None, ""):
+                continue
+            value = mapping.get(key)
+            if key == "data_as_of" and isinstance(value, Mapping):
+                value = value.get("BREACH") or value.get("breach")
+            if value in (None, ""):
+                continue
+            local_errors: list[str] = []
+            normalized = _parse_aware_timestamp(
+                value, field=f"{prefix}_{key}", errors=local_errors
+            )
+            if normalized is None:
+                errors.extend(local_errors)
+            elif normalized != expected_trigger:
+                errors.append(f"{prefix}_{key}_mismatch")
+    return _unique(errors)
+
+
 def _evidence_phase_errors(evidence: Mapping[str, Any]) -> list[str]:
     errors: list[str] = []
     for mapping in _evidence_mappings(evidence):
@@ -941,15 +1615,12 @@ def _evidence_phase_errors(evidence: Mapping[str, Any]) -> list[str]:
             not isinstance(phase, str) or phase.strip().upper() != BREACH_PHASE
         ):
             errors.append("breach_evidence_phase_mismatch")
-        if mapping.get("observe_only") is False:
-            errors.append("breach_evidence_observe_only_false")
-        if mapping.get("affected_eligibility") is True:
-            errors.append("breach_evidence_affected_eligibility_true")
+    errors.extend(_strict_safety_errors(evidence, prefix="breach_evidence"))
     return errors
 
 
 def _structure_phase_errors(structure: Mapping[str, Any]) -> list[str]:
-    """Validate only safety metadata on an already-frozen structure slot."""
+    """Validate phase and safety metadata on an already-frozen structure slot."""
     errors: list[str] = []
     for mapping in _evidence_mappings(structure):
         phase = mapping.get("phase")
@@ -957,10 +1628,7 @@ def _structure_phase_errors(structure: Mapping[str, Any]) -> list[str]:
             not isinstance(phase, str) or phase.strip().upper() != BREACH_PHASE
         ):
             errors.append("breach_structure_phase_mismatch")
-        if mapping.get("observe_only") is False:
-            errors.append("breach_structure_observe_only_false")
-        if mapping.get("affected_eligibility") is True:
-            errors.append("breach_structure_affected_eligibility_true")
+    errors.extend(_strict_safety_errors(structure, prefix="breach_structure"))
     return errors
 
 
@@ -968,10 +1636,81 @@ def _compact_parent_result(result: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "status": result.get("status"),
         "accepted": bool(result.get("accepted")),
+        "proven": bool(result.get("proven")),
         "snapshot_id": result.get("snapshot_id"),
+        "candidate_snapshot_id": result.get("candidate_snapshot_id"),
+        "authoritative_parent_snapshot_id": result.get(
+            "authoritative_parent_snapshot_id"
+        ),
+        "parent_snapshot_id": result.get("parent_snapshot_id"),
+        "context_revision": result.get("context_revision"),
         "mismatches": list(result.get("mismatches") or []),
         "errors": list(result.get("errors") or []),
         "warnings": list(result.get("warnings") or []),
+    }
+
+
+def _validate_parent_lineage(
+    pretrigger_result: Mapping[str, Any],
+    preopen_result: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the exact #327 PREOPEN -> PRETRIGGER pointer when supplied."""
+    pretrigger_candidate = pretrigger_result.get("candidate_snapshot_id")
+    preopen_pointer = preopen_result.get("parent_snapshot_id")
+    if preopen_result.get("status") == "MISSING":
+        return {
+            "status": "MISSING",
+            "preopen_parent_snapshot_id": None,
+            "expected_pretrigger_snapshot_id": pretrigger_candidate,
+            "errors": [],
+            "warnings": ["PREOPEN_parent_lineage_missing"],
+        }
+
+    if preopen_pointer:
+        if not pretrigger_candidate:
+            return {
+                "status": "UNPROVEN",
+                "preopen_parent_snapshot_id": preopen_pointer,
+                "expected_pretrigger_snapshot_id": None,
+                "errors": [],
+                "warnings": ["PREOPEN_parent_lineage_unproven"],
+            }
+        if str(preopen_pointer) != str(pretrigger_candidate):
+            return {
+                "status": "REJECTED",
+                "preopen_parent_snapshot_id": preopen_pointer,
+                "expected_pretrigger_snapshot_id": pretrigger_candidate,
+                "errors": ["PREOPEN_parent_snapshot_id_mismatch"],
+                "warnings": [],
+            }
+        if not pretrigger_result.get("proven") or not preopen_result.get("proven"):
+            return {
+                "status": "UNPROVEN",
+                "preopen_parent_snapshot_id": preopen_pointer,
+                "expected_pretrigger_snapshot_id": pretrigger_candidate,
+                "errors": [],
+                "warnings": ["PREOPEN_parent_lineage_unproven"],
+            }
+        return {
+            "status": "PROVEN",
+            "preopen_parent_snapshot_id": preopen_pointer,
+            "expected_pretrigger_snapshot_id": pretrigger_candidate,
+            "errors": [],
+            "warnings": [],
+        }
+
+    # A missing pointer is preserved as missing.  Even when a PRETRIGGER row
+    # is supplied later, this owner must not invent a historical relationship.
+    return {
+        "status": "UNPROVEN" if pretrigger_candidate else "MISSING",
+        "preopen_parent_snapshot_id": None,
+        "expected_pretrigger_snapshot_id": pretrigger_candidate,
+        "errors": [],
+        "warnings": [
+            "PREOPEN_parent_lineage_unproven"
+            if pretrigger_candidate
+            else "PREOPEN_parent_lineage_missing"
+        ],
     }
 
 
@@ -995,8 +1734,7 @@ def build_breach_snapshot_envelope(
     owner intentionally has no store lookup, worker clock, broker, selector,
     watcher, or order authority.
     """
-    raw_identity = _identity_mapping(identity)
-    if not isinstance(identity, Mapping) or raw_identity is None or identity.get("ok") is False:
+    if not isinstance(identity, Mapping) or identity.get("ok") is False:
         return {
             "ok": False,
             "status": "REJECTED",
@@ -1004,15 +1742,18 @@ def build_breach_snapshot_envelope(
             "identity_hash": None,
             "input_hash": None,
             "parent_snapshot_ids": {"PRETRIGGER": None, "PREOPEN": None},
+            "candidate_parent_snapshot_ids": {"PRETRIGGER": None, "PREOPEN": None},
+            "authoritative_parent_snapshot_ids": {"PRETRIGGER": None, "PREOPEN": None},
             "structure": None,
             "assembly_version": ASSEMBLY_VERSION,
+            "context_revision": None,
             "observe_only": True,
             "affected_eligibility": False,
             "errors": ["canonical_breach_identity_invalid"],
             "warnings": [],
         }
 
-    normalized_identity = normalize_breach_identity(raw_identity)
+    normalized_identity = normalize_breach_identity(identity)
     if not normalized_identity.get("ok"):
         return {
             "ok": False,
@@ -1021,8 +1762,11 @@ def build_breach_snapshot_envelope(
             "identity_hash": None,
             "input_hash": None,
             "parent_snapshot_ids": {"PRETRIGGER": None, "PREOPEN": None},
+            "candidate_parent_snapshot_ids": {"PRETRIGGER": None, "PREOPEN": None},
+            "authoritative_parent_snapshot_ids": {"PRETRIGGER": None, "PREOPEN": None},
             "structure": None,
             "assembly_version": ASSEMBLY_VERSION,
+            "context_revision": normalized_identity.get("context_revision"),
             "observe_only": True,
             "affected_eligibility": False,
             "errors": ["canonical_breach_identity_invalid"]
@@ -1030,6 +1774,7 @@ def build_breach_snapshot_envelope(
             "warnings": [],
         }
     identity_value = dict(normalized_identity["identity"])
+    context_revision = normalized_identity.get("context_revision")
 
     supplied_evidence = (
         evidence
@@ -1047,6 +1792,18 @@ def build_breach_snapshot_envelope(
     else:
         evidence_as_of = _evidence_as_of(supplied_evidence, errors=errors)
         errors.extend(_evidence_phase_errors(supplied_evidence))
+        errors.extend(
+            _cross_validate_identity(
+                supplied_evidence,
+                identity_value,
+                prefix="breach_evidence",
+            )
+        )
+        for mapping in _evidence_mappings(supplied_evidence):
+            if "errors" in mapping and mapping.get("errors") is not None and not isinstance(
+                mapping.get("errors"), list
+            ):
+                errors.append("breach_evidence_errors_invalid_type")
     trigger = identity_value["trigger_crossed_at"]
     if evidence_as_of is not None and trigger != evidence_as_of:
         errors.append("trigger_crossed_at_evidence_as_of_mismatch")
@@ -1075,13 +1832,16 @@ def build_breach_snapshot_envelope(
         errors.extend(parent_errors)
     warnings.extend(pretrigger_result.get("warnings") or [])
     warnings.extend(preopen_result.get("warnings") or [])
+    lineage = _validate_parent_lineage(pretrigger_result, preopen_result)
+    errors.extend(lineage.get("errors") or [])
+    warnings.extend(lineage.get("warnings") or [])
     parent_ids = {
-        "PRETRIGGER": pretrigger_result.get("snapshot_id")
-        if pretrigger_result.get("accepted")
-        else None,
-        "PREOPEN": preopen_result.get("snapshot_id")
-        if preopen_result.get("accepted")
-        else None,
+        "PRETRIGGER": pretrigger_result.get("authoritative_parent_snapshot_id"),
+        "PREOPEN": preopen_result.get("authoritative_parent_snapshot_id"),
+    }
+    candidate_parent_ids = {
+        "PRETRIGGER": pretrigger_result.get("candidate_snapshot_id"),
+        "PREOPEN": preopen_result.get("candidate_snapshot_id"),
     }
 
     selected_structure = structure if structure is not None else frozen_structure
@@ -1089,25 +1849,39 @@ def build_breach_snapshot_envelope(
         warnings.append("breach_structure_reserved_for_621")
     elif isinstance(selected_structure, Mapping):
         errors.extend(_structure_phase_errors(selected_structure))
+        errors.extend(
+            _cross_validate_identity(
+                selected_structure,
+                identity_value,
+                prefix="breach_structure",
+                structure=True,
+            )
+        )
+    else:
+        errors.append("breach_structure_invalid_type")
+        selected_structure = None
     evidence_copy = copy.deepcopy(dict(supplied_evidence))
     structure_copy = copy.deepcopy(selected_structure)
-    evidence_errors = supplied_evidence.get("errors") if isinstance(supplied_evidence, Mapping) else []
-    if isinstance(evidence_errors, list):
-        evidence_errors = [str(item) for item in evidence_errors]
-    else:
-        evidence_errors = []
+    evidence_errors: list[str] = []
+    if isinstance(supplied_evidence, Mapping):
+        for mapping in _evidence_mappings(supplied_evidence):
+            values = mapping.get("errors")
+            if isinstance(values, list):
+                evidence_errors.extend(str(item) for item in values)
 
     errors = _unique(errors)
     warnings = _unique(warnings)
     identity_hash: Optional[str] = None
     input_hash: Optional[str] = None
+    canonical_evidence: dict[str, Any] = {}
     if not errors:
         try:
+            canonical_evidence = project_breach_evidence(evidence_copy)
             identity_hash = hash_breach_identity(identity_value)
             input_hash = hash_breach_snapshot_input(
                 identity_value,
                 evidence_copy,
-                parent_snapshot_ids=parent_ids,
+                parent_snapshot_ids=candidate_parent_ids,
                 structure=structure_copy,
             )
         except (TypeError, ValueError) as exc:
@@ -1128,11 +1902,15 @@ def build_breach_snapshot_envelope(
         if result.get("status") == "MISSING"
     ]
     unproven_parent_authority = any(
-        any("_unavailable" in str(warning) for warning in result.get("warnings") or [])
+        result.get("status") == "UNPROVEN"
         for result in (pretrigger_result, preopen_result)
     )
     status = "REJECTED" if errors else "PARTIAL" if (
-        missing_parents or unproven_parent_authority or evidence_errors or structure_copy is None
+        missing_parents
+        or unproven_parent_authority
+        or lineage.get("status") != "PROVEN"
+        or evidence_errors
+        or structure_copy is None
     ) else "COMPLETE"
     result: dict[str, Any] = {
         "ok": not errors,
@@ -1155,13 +1933,18 @@ def build_breach_snapshot_envelope(
         "materialization_generation": identity_value["materialization_generation"],
         "profile_version": identity_value["profile_version"],
         "model_version": identity_value["model_version"],
+        "context_revision": context_revision,
         "phase": BREACH_PHASE,
         "parent_snapshot_ids": parent_ids,
+        "candidate_parent_snapshot_ids": candidate_parent_ids,
+        "authoritative_parent_snapshot_ids": copy.deepcopy(parent_ids),
         "parent_validation": parent_results,
+        "parent_lineage": lineage,
         "missing_parent_phases": missing_parents,
         "source_versions": source_versions,
         "evidence": evidence_copy,
         "breach_evidence": copy.deepcopy(evidence_copy),
+        "canonical_evidence": canonical_evidence,
         "structure": structure_copy,
         "structure_slot": {
             "status": "ATTACHED" if structure_copy is not None else "RESERVED_FOR_621",
@@ -1192,6 +1975,7 @@ __all__ = [
     "hash_breach_identity",
     "hash_breach_snapshot_input",
     "normalize_breach_identity",
+    "project_breach_evidence",
     "validate_breach_parent_snapshot",
     "validate_parent_snapshot",
 ]
