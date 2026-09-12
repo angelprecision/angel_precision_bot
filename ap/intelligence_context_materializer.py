@@ -19,6 +19,15 @@ from ap.intelligence_snapshot_store import (
     normalize_execution_mode,
 )
 
+# PR #621 (435-C): dispatch seam for frozen BREACH jobs.  Imported lazily-safe
+# (the adapter itself has no side-effects at import time and never talks to
+# broker/market-data/OSM), so importing it here cannot alter the generic
+# PRETRIGGER/PREOPEN/current BREACH path.
+from ap.intelligence_breach_snapshot_adapter import (
+    build_breach_snapshot_kwargs as _build_breach_snapshot_kwargs,
+    is_frozen_breach_job as _is_frozen_breach_job,
+)
+
 log = logging.getLogger("ap.intelligence_context_materializer")
 
 CONTEXT_REVISION = 1
@@ -210,6 +219,15 @@ def build_intelligence_context_payload(
 
 
 def build_snapshot_kwargs(job: dict[str, Any], *, broker: Any = None) -> dict[str, Any]:
+    # PR #621 (435-C) dispatch — see ap/intelligence_breach_snapshot_adapter.
+    # Only delegate when BOTH conditions hold:
+    #   * job phase == "BREACH"
+    #   * job payload carries the explicit FROZEN_BREACH_V1 marker
+    # Every other job (PRETRIGGER, PREOPEN, and any legacy generic BREACH job)
+    # falls through to the existing generic path unchanged, byte-for-byte.
+    if _is_frozen_breach_job(job):
+        return _build_breach_snapshot_kwargs(job)
+
     payload = job.get("payload") or {}
     signal = payload.get("signal") if isinstance(payload.get("signal"), dict) else payload
     phase = str(job.get("phase") or payload.get("phase") or "").upper()

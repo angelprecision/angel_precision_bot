@@ -2,135 +2,190 @@
 
 ## Status
 
-**DRAFT / HARD HOLD / SPEC ONLY. DO NOT MERGE OR DEPLOY.**
+**DRAFT / HARD HOLD / IMPLEMENTATION COMPLETE. DO NOT MERGE OR DEPLOY.**
 
-Depends on final merged #615.
+`#615` and `#625` are both MERGED. Rebased onto
+`main@71f25dabf739bce3360593ac44a7c7bf71ef9513`.
 
-## Existing authority to reuse
+## Existing authority reused (do not rebuild)
 
-Do not build a new snapshot system.
-
-Merged #327/#330 already own:
+Merged `#327` owns the intelligence substrate:
 - `ap_intelligence_snapshots`;
 - `ap_intelligence_jobs`;
-- durable phase-aware identity;
+- durable phase-aware identity (`identity_key`);
 - PRETRIGGER/PREOPEN parent relationships;
-- snapshot worker/store;
-- idempotent persistence;
-- BREACH snapshot assembly;
-- BREACH dispatch identity and compact pointers.
+- generic snapshot worker/store;
+- idempotent enqueue by `input_hash`;
+- phase-local `context_revision` allocation.
 
-#621 owns only the adapter/audit required to carry sharper #614/#615 evidence through that existing substrate.
+Merged `#625` owns the BREACH assembly owner:
+- canonical BREACH identity normalization;
+- parent validation (candidate vs authoritative);
+- deterministic identity_hash and input_hash;
+- assembly envelope with observe-only / affected_eligibility=false stamps.
 
-## Canonical input
+Merged `#615` owns FVG geometry / lifecycle / opposing / strong-break / VI /
+regime / setup / structure schema / model version.
 
-Input is the exact frozen result of:
-`#614 PIT collector -> #615 breach market-structure freezer`
+Merged `#614` owns exact trigger-time PIT market evidence, `as_of`, and
+5m/15m/1h/4h coverage/provenance.
 
-The adapter must not refetch or reinterpret market data.
+`#330` remains archaeology only. `#621` builds no second identity, no second
+worker, no second table, no second retry, no second revision allocator.
 
-## Required durable identity
+`#621` owns exactly one seam: the durable adapter between the merged `#625`
+envelope and the merged `#327` job/snapshot store, plus a small guarded
+dispatch inside `build_snapshot_kwargs`.
 
-A persisted BREACH structure snapshot must bind exact:
-- `client_id`;
-- normalized `execution_mode`;
-- `signal_id`;
-- `canonical_signal_id`;
-- `local_order_id`;
-- lifecycle/materialization generation when current architecture exposes it;
-- exact `trigger_crossed_at`;
-- exact #614 PIT `as_of`;
-- #615 `schema_version`;
-- #615 `model_version`;
-- deterministic structure input hash;
-- deterministic frozen-structure output hash;
-- parent PRETRIGGER/PREOPEN snapshot identity where applicable.
+## Production files
 
-Never join by ticker/time proximity.
+Exactly two, per spec §21:
+
+1. `ap/intelligence_breach_snapshot_adapter.py` (new).
+2. `ap/intelligence_context_materializer.py` (one import, one dispatch guard;
+   otherwise unchanged byte-for-byte).
+
+## Canonical caller trace
+
+```
+build_breach_snapshot_envelope(...)          # #625 (already merged)
+    -> enqueue_breach_snapshot_job(envelope) # #621 adapter (new)
+        -> enqueue_intelligence_job(...)     # #327 (already merged)
+    -> intelligence worker claims job        # #327 (already merged)
+    -> build_snapshot_kwargs(job)            # #327 materializer, GUARDED DISPATCH added by #621
+        -> build_breach_snapshot_kwargs(job) # #621 adapter (new) if is_frozen_breach_job(job)
+    -> complete_job_with_snapshot(...)       # #327 (already merged)
+```
+
+The guard is:
+
+```python
+if is_frozen_breach_job(job):
+    return _build_breach_snapshot_kwargs(job)
+```
+
+`is_frozen_breach_job(job)` is True iff `job.phase == "BREACH"` AND
+`job.payload["payload_kind"] == "FROZEN_BREACH_V1"`. Every other job (PRETRIGGER,
+PREOPEN, legacy generic BREACH) is untouched.
+
+## Immutable frozen payload
+
+Enqueue serializes the following into `job.payload` (spec §7):
+
+- `payload_kind = "FROZEN_BREACH_V1"`, `adapter_version`, `assembly_version`;
+- complete `#625` canonical identity;
+- `#625` identity_hash and input_hash;
+- exact `trigger_crossed_at` and `evidence_as_of`;
+- exact `candidate_parent_snapshot_ids` and `authoritative_parent_snapshot_ids`;
+- exact `parent_lineage`, `parent_validation`, `missing_parent_phases`;
+- exact `#614` canonical evidence projection;
+- exact frozen `#615` structure (deep-copied so caller mutation cannot rewrite);
+- deterministic `structure_hash` (sha256 of canonicalized structure);
+- structure_schema_version, structure_model_version, source_versions;
+- observe_only=true, affected_eligibility=false;
+- envelope_status (COMPLETE or PARTIAL only).
+
+No mutable latest-market aliases, no worker-now price, no fresh market context,
+no later candle, no current FVG reconstruction.
 
 ## Snapshot semantics
 
-Same exact economic opportunity + same generation + same frozen evidence must be idempotent.
+- Same `#625` input_hash -> same `#327` BREACH job/revision (idempotent).
+- Genuinely different `#625` input_hash at same store identity -> new
+  `#327` BREACH context_revision. New generation, changed evidence, or changed
+  structure all produce a different input_hash and therefore a new revision.
+- Snapshot `data_as_of` = envelope `evidence_as_of` = `#614` PIT `as_of`.
+  Never `collected_at`, worker start/completion, or `_now_iso()`.
+- Snapshot status: `#625` COMPLETE -> `COMPLETE`; `#625` PARTIAL -> `PARTIAL`;
+  `#625` REJECTED -> no authoritative snapshot job (fail-soft telemetry only).
+- Top-level `parent_snapshot_id` is authoritative PREOPEN only, else `None`.
+  Candidate PREOPEN is never promoted. Full candidate/authoritative maps are
+  preserved inside the payload.
 
-Restart/replay must not generate a semantically new interpretation merely because:
-- worker process changed;
-- collection occurred later;
-- current quote changed;
-- current market moved;
-- another client traded same ticker;
-- PAPER and LIVE both saw same setup.
+## Worker cross-check (fail closed for intelligence)
 
-A later/newer generation may create a distinct BREACH snapshot only when canonical lifecycle identity says it is genuinely new.
-
-## Data payload requirements
-
-Persist enough #615 output to support later replay/attribution without recomputation from current market state:
-- data_as_of / trigger as-of;
-- frozen underlying observation + provenance;
-- 5m/15m coverage/source authority;
-- relevant 4h/1h FVG identities and geometry;
-- relevant opposing FVG;
-- penetration measurements;
-- strong-break observations;
-- exact-or-MISSING VI;
-- pullback/reclaim/re-breach evidence available at snapshot time;
-- explicit regime/UNKNOWN;
-- setup archetype / observe-only posture;
-- reason codes;
-- model/schema version.
-
-Do not persist fabricated current/future evidence.
+`build_breach_snapshot_kwargs(job)` cross-checks the durable job row against
+its frozen payload identity: client_id, execution_mode, signal_id,
+canonical_signal_id, local_order_id, phase, profile_version, input_hash. Any
+mismatch raises `RuntimeError` so `#327` retry/terminal machinery marks the
+INTELLIGENCE job (not the trade) failed. Trading is unaffected.
 
 ## Persistence failure behavior
 
-This remains intelligence telemetry only.
+Intelligence telemetry only:
 
-Snapshot persistence failure:
-- must be observable;
-- may retry through existing snapshot/job machinery if that machinery already owns retry;
-- must not alter watcher ownership;
-- must not delay/deny selector or broker execution;
-- must not terminalize the trade;
-- must not create fallback current-market evidence.
+- observable via `#327` retry/terminal states;
+- may retry through existing snapshot/job machinery (`#327` owns retry);
+- MUST NOT alter watcher ownership;
+- MUST NOT delay or deny selector or broker execution;
+- MUST NOT terminalize the trade or the setup;
+- MUST NOT create fallback current-market evidence;
+- MUST NOT change LIVE/PAPER execution mode.
 
-## Required tests
+No global readiness gate from `#621`.
 
-At minimum:
-1. exact LIVE snapshot identity persists correctly;
-2. exact PAPER identity remains PAPER;
-3. same ticker LIVE/PAPER cannot cross-bind;
-4. wrong client cannot attach to parent snapshot;
-5. wrong canonical signal cannot attach;
-6. wrong local order cannot attach;
-7. wrong/new generation cannot overwrite prior generation;
-8. same exact evidence repeated is idempotent;
-9. restart with same durable facts resolves same snapshot identity;
-10. worker-time later current price cannot rewrite frozen breach price;
-11. structure version/hash is durable;
-12. parent PRETRIGGER/PREOPEN link remains exact;
-13. snapshot persistence error is fail-soft for trading;
-14. no broker/selector/watcher/order/position/proof/queue mutation;
-15. no new table/migration unless an independently proven existing schema cannot represent a mandatory field; if schema work appears necessary, STOP and re-audit instead of broadening silently.
+## No market data or broker calls in worker path
 
-## Expected scope
+Adapter path performs zero calls to:
+- `collect_point_in_time_context`;
+- `#615` structure/freezer functions;
+- broker quote/history;
+- current quote helpers;
+- selector;
+- watcher;
+- execution core;
+- order submission.
 
-Prefer adaptation inside existing intelligence snapshot/materializer modules plus focused tests only after tracing actual current-main caller flow.
+Verified by tests that monkeypatch these to raise on invocation.
 
-Before editing production, post the exact trace:
-`caller -> input identity -> existing BREACH assembly -> adapter -> snapshot write -> downstream reader`
+## Test evidence
 
-If more than a very small number of production files appears necessary, STOP and keep HARD HOLD.
+`tests/test_p1_435c_durable_breach_adapter.py` (37 focused tests):
 
-## Merge gate
+1. structure hash: deterministic, order-stable, evidence-sensitive;
+2. enqueue contract: rejects non-mapping, REJECTED envelope, wrong phase,
+   observe_only=false, affected_eligibility=true, missing evidence_as_of,
+   COMPLETE without structure;
+3. idempotency: same envelope dedupes same-input, new generation and new
+   semantic evidence both produce new `context_revision`;
+4. isolation: client, LIVE/PAPER, CALL/PUT;
+5. dispatch predicate; worker fails closed on identity or input_hash mismatch;
+6. candidate vs authoritative parent invariants;
+7. generic PRETRIGGER/PREOPEN/legacy BREACH path unchanged (dispatch does not
+   fire and generic builder is invoked);
+8. frozen-BREACH worker path does not call `collect_point_in_time_context` or
+   the generic context builder;
+9. immutable payload: caller mutation after enqueue does not affect persisted
+   structure; replay preserves exact `evidence_as_of`;
+10. end-to-end enqueue -> worker claim -> `complete_job_with_snapshot` ->
+    `get_latest_snapshot` against real `#327` memory backend, using the real
+    `#625` `build_breach_snapshot_envelope` to build the envelope;
+11. money-path isolation via source-string audit.
 
-After implementation on then-current main:
-- focused #621 tests;
-- existing #327/#330 intelligence snapshot suites;
-- #614/#615 integration suites;
+Adjacent intelligence suites (`#614` PIT, `#615` structure, `#625` identity,
+`#327` snapshot/job) all continue to pass without change.
+
+## Money-path audit
+
+Adapter module imports:
+- `ap.intelligence_breach_snapshot_assembly` (`#625`);
+- `ap.intelligence_snapshot_store` (`#327`);
+- Python stdlib only otherwise.
+
+Adapter module does NOT import (verified in test):
+`ap_execution_core`, `ap_entry_watcher`, `ap_exit_engine`, `ap.broker`,
+`ap.order_state_machine`, `ap.position_manager`, `ap.exit_manager`,
+`ap.selector`, `ap.trade_queue`, `ap.risk`, `ap.contract_selector`,
+`ap.intelligence_market_data`.
+
+## Merge gate (unchanged)
+
+No merge until independent audit clears the unchanged final SHA on:
+- focused `#621` tests;
+- existing `#327` intelligence snapshot suites;
+- `#614` / `#615` / `#625` integration suites;
 - restart/idempotency proof;
 - exact-head P0 + cohesion;
 - genuine merge-ref parity;
 - `git diff --check`;
 - whole-PR money-path audit.
-
-No merge until independent audit clears the unchanged final SHA.
