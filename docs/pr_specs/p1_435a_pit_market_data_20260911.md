@@ -79,11 +79,11 @@ For `now is not None`, cache and singleflight identity must include at least:
 
 For `now is None`, preserve the existing live/TTL behavior, but interval identity must still prevent 5m and 15m collisions.
 
-A cached series may satisfy an as-of request when its latest completed-bar coverage reaches the RTH close boundary that should exist at that exact as-of time. A successful exact-bucket provider response may also be reused when no current-session RTH close is expected yet, such as 09:32 ET for a 5-minute request. Once an RTH bar should exist, successful-but-stale data must not be blessed by cache authority. A transport/provider exception must never be marked as authoritative empty and must remain retryable.
+A cached series may satisfy an as-of request when its latest completed-bar coverage reaches the RTH close boundary that should exist at that exact as-of time. A successful exact-bucket provider response may also be reused when no current-session RTH close is expected yet, such as 09:32 ET for a 5-minute request. Once an RTH bar should exist, successful-but-stale data must not be blessed by cache authority. Provider attempt, provider success, and coverage completeness are separate facts: a transport/provider exception must never be marked as authoritative empty and must remain retryable, even when the market-clock status is `NOT_DUE`.
 
 Callers that join the same successful singleflight must receive the leader's exact response snapshot, including a successful but stale PIT response. This handoff does not make stale data reusable by later independent calls; those calls must continue to reject stale cache coverage and refetch.
 
-After provider normalization and completed-bar filtering, BREACH evidence must expose explicit interval coverage metadata: `coverage_complete`, `latest_expected_close`, `latest_observed_close`, `status`, and whether the response is authoritative. If the expected RTH close is missing, older returned bars are `STALE` and no returned completed bars are `MISSING`; neither state is authoritative for the latest interval condition. Older bars may remain available for 1h/4h structure, but they must not be indistinguishable from complete 5m/15m evidence. A later refetch may replace the stale result with `COMPLETE` coverage.
+After provider normalization and completed-bar filtering, BREACH evidence must expose explicit interval coverage metadata: `coverage_complete`, `latest_expected_close`, `latest_observed_close`, `status`, `provider_status`, and whether the response is authoritative. If the expected RTH close is missing, older returned bars are `STALE` and no returned completed bars are `MISSING`; neither state is authoritative for the latest interval condition. `NOT_DUE` remains the market-clock status before the first expected close; only a successful provider response may make that status authoritative. Older bars may remain available for 1h/4h structure, but they must not be indistinguishable from complete 5m/15m evidence. A later refetch may replace the stale result with `COMPLETE` coverage.
 
 ### C. Exclude incomplete/future candles
 
@@ -105,7 +105,7 @@ For `phase == "BREACH"`:
 3. Set `evidence_now = trigger_crossed_at`.
 4. Fetch daily history bounded to `evidence_now`.
 5. Fetch 15m and 5m timesales with `now=evidence_now`.
-6. Provider and contemporaneously frozen `candles_15m` / `candles_5m` are filtered and assessed independently at the same as-of boundary. A `COMPLETE` provider interval wins; when provider coverage is `STALE` or `MISSING` and the frozen interval is `COMPLETE`, select the frozen interval with `source: signal_frozen` and do not merge the two sources. If both are incomplete, retain one deterministic source according to the existing provenance preference and expose its honest `STALE`/`MISSING` coverage.
+6. Provider and contemporaneously frozen `candles_15m` / `candles_5m` are filtered and assessed independently at the same as-of boundary. A provider interval wins as `COMPLETE`/`NOT_DUE` only when the provider succeeded; when provider coverage is `STALE` or `MISSING`, or the provider failed/unavailable, and the frozen interval is `COMPLETE`, select the frozen interval with `source: signal_frozen` and do not merge the two sources. If both are incomplete, retain one deterministic source according to the existing provenance preference and expose its honest `STALE`/`MISSING`/`NOT_DUE` coverage plus provider status.
 7. Return completed `5m`, `15m`, derived `1h`, and derived `4h` candles under `data_sources.candles`.
 8. Return an explicit `as_of` field equal to the breach timestamp.
 9. Never call the current quote, market quote, or sector quote readers for BREACH.
@@ -150,6 +150,9 @@ Minimum matrix:
 15. A successful but stale in-session PIT response is not reused after the expected RTH close exists.
 16. A provider/transport failure returning no data is not cached as authoritative empty and is retried on the next request.
 17. The first successful but stale in-session response exposes `STALE`/`MISSING` coverage and recovers to `COMPLETE` on a later provider response.
+18. A provider failure before the first 5m/15m close remains `NOT_DUE` but non-authoritative and distinguishable from a successful empty response.
+19. Provider failure cannot suppress complete frozen evidence merely because the market-clock status is `NOT_DUE`.
+20. A successful empty pre-first-close response remains authoritative and reusable within its exact as-of bucket.
 
 ## Required fail-first evidence
 

@@ -502,6 +502,104 @@ def test_successful_empty_pit_snapshot_reuses_same_bucket(monkeypatch):
     assert len(broker.session.calls) == 1
 
 
+@pytest.mark.parametrize(
+    ("interval", "as_of"),
+    [
+        ("5m", datetime(2026, 9, 11, 13, 32, tzinfo=timezone.utc)),
+        ("15m", datetime(2026, 9, 11, 13, 40, tzinfo=timezone.utc)),
+    ],
+)
+def test_pre_first_close_provider_failure_is_not_authoritative(
+    interval, as_of, monkeypatch
+):
+    def responder(_params, _call_number):
+        raise RuntimeError("provider down")
+
+    broker = _Broker(responder)
+    monkeypatch.setattr(
+        fvg, "_resolve_base_url", lambda _broker: "https://api.tradier.com"
+    )
+    monkeypatch.setattr(imd, "_history", lambda *_a, **_k: [])
+
+    result = imd.collect_point_in_time_context(
+        _breach_signal(trigger_crossed_at=as_of.isoformat()),
+        broker=broker,
+        phase="BREACH",
+    )
+    coverage = result["data_sources"]["coverage"][interval]
+
+    assert coverage["status"] == "NOT_DUE"
+    assert coverage["coverage_complete"] is True
+    assert coverage["authoritative"] is False
+    assert coverage["source"] == "provider_response"
+    assert coverage["provider_status"] == "error"
+
+
+def test_provider_failure_does_not_suppress_frozen_not_due_evidence(monkeypatch):
+    as_of = datetime(2026, 9, 11, 13, 32, tzinfo=timezone.utc)
+    frozen = [_bar(datetime(2026, 9, 10, 14, 0, tzinfo=timezone.utc), price=130.50)]
+
+    def responder(_params, _call_number):
+        raise RuntimeError("provider down")
+
+    broker = _Broker(responder)
+    monkeypatch.setattr(
+        fvg, "_resolve_base_url", lambda _broker: "https://api.tradier.com"
+    )
+    monkeypatch.setattr(imd, "_history", lambda *_a, **_k: [])
+    result = imd.collect_point_in_time_context(
+        _breach_signal(
+            trigger_crossed_at=as_of.isoformat(),
+            candles_5m=frozen,
+            candles_15m=[],
+        ),
+        broker=broker,
+        phase="BREACH",
+    )
+
+    assert result["data_sources"]["candles"]["5m"] == frozen
+    coverage = result["data_sources"]["coverage"]["5m"]
+    assert coverage["status"] == "NOT_DUE"
+    assert coverage["coverage_complete"] is True
+    assert coverage["authoritative"] is True
+    assert coverage["source"] == "signal_frozen"
+    assert result["provenance"]["intraday_5m"] == "signal_frozen_5min"
+
+
+def test_successful_empty_pre_first_close_remains_authoritative_and_reusable(
+    monkeypatch,
+):
+    broker = _Broker(lambda _params, _call_number: [])
+    monkeypatch.setattr(
+        fvg, "_resolve_base_url", lambda _broker: "https://api.tradier.com"
+    )
+    as_of = datetime(2026, 9, 11, 13, 32, tzinfo=timezone.utc)
+    later_same_bucket = datetime(2026, 9, 11, 13, 34, tzinfo=timezone.utc)
+
+    first = fvg.fetch_5m_bars("SPY", broker, now=as_of)
+    second = fvg.fetch_5m_bars("SPY", broker, now=later_same_bucket)
+    coverage = imd._describe_pit_coverage(
+        first,
+        interval_minutes=5,
+        as_of=as_of,
+        source="provider_response",
+        authoritative_source=getattr(first, "provider_succeeded", False),
+        provider_status=(
+            "success" if getattr(first, "provider_succeeded", False) else "error"
+        ),
+    )
+
+    assert first == []
+    assert second == []
+    assert getattr(first, "provider_succeeded", False) is True
+    assert getattr(second, "provider_succeeded", False) is True
+    assert coverage["status"] == "NOT_DUE"
+    assert coverage["coverage_complete"] is True
+    assert coverage["authoritative"] is True
+    assert coverage["provider_status"] == "success"
+    assert len(broker.session.calls) == 1
+
+
 def test_successful_but_stale_in_session_pit_response_is_not_reused(monkeypatch):
     broker = _Broker(lambda _params, _call_number: [])
     monkeypatch.setattr(fvg, "_resolve_base_url", lambda _broker: "https://api.tradier.com")

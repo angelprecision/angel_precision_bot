@@ -82,8 +82,15 @@ _pit_snapshot_authoritative: set[_CacheKey] = set()
 # bars, producing N simultaneous timesales calls — violating the bounded-spend
 # invariant. Per-ticker singleflight: exactly one leader fetches; followers
 # wait on the leader's Event (bounded by FETCH_WAIT_SEC > request timeout),
-# then re-read the cache. A leader failure releases followers, who observe the
-# empty cache and degrade to 'no candles' — never a second herd.
+# then receive the exact result for a successful flight or re-read the cache
+# after failure. A leader failure releases followers, who observe the empty
+# cache and degrade to 'no candles' — never a second herd.
+class _FetchedBars(list[dict[str, Any]]):
+    def __init__(self, bars: list[dict[str, Any]], *, provider_succeeded: bool):
+        super().__init__(bars)
+        self.provider_succeeded: bool = provider_succeeded
+
+
 class _InFlight:
     def __init__(self) -> None:
         self.event = threading.Event()
@@ -332,7 +339,9 @@ def _fetch_intraday_bars(
             )
             with _inflight_lock:
                 flight.result = result
-                flight.succeeded = True
+                flight.succeeded = bool(
+                    getattr(result, "provider_succeeded", True)
+                )
             return result
         finally:
             # Release followers and clear the marker even on failure.
@@ -371,7 +380,7 @@ def _fetch_intraday_bars_network(
     quote_src = getattr(broker, "data_broker", None) or broker
     session = getattr(quote_src, "session", None)
     if session is None or not hasattr(session, "get"):
-        return []
+        return _FetchedBars([], provider_succeeded=False)
 
     now_et = (now or datetime.now(timezone.utc)).astimezone(ET)
     start = (now_et - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%dT09:30:00")
@@ -420,20 +429,21 @@ def _fetch_intraday_bars_network(
             bars = _filter_completed_bars(
                 bars, interval_minutes=interval_minutes, as_of=now
             )
+        fetched = _FetchedBars(bars, provider_succeeded=True)
         with _cache_lock:
             if cache_key not in _candle_cache and len(_candle_cache) >= _CACHE_MAX_TICKERS:
                 oldest = min(_candle_cache, key=lambda k: _candle_cache[k][0])
                 _candle_cache.pop(oldest, None)
                 _pit_snapshot_authoritative.discard(oldest)
-            _candle_cache[cache_key] = (time.monotonic(), bars)
+            _candle_cache[cache_key] = (time.monotonic(), fetched)
             if now is not None:
                 _pit_snapshot_authoritative.add(cache_key)
             else:
                 _pit_snapshot_authoritative.discard(cache_key)
-        return bars
+        return fetched
     except Exception as exc:
         log.warning("fvg_telemetry: timesales fetch failed for %s: %s", key, exc)
-        return []
+        return _FetchedBars([], provider_succeeded=False)
 
 
 def _fetch_15m_bars_network(

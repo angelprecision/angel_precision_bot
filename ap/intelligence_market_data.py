@@ -361,6 +361,7 @@ def _describe_pit_coverage(
     as_of: datetime,
     source: str,
     authoritative_source: bool,
+    provider_status: Optional[str] = None,
 ) -> dict[str, Any]:
     """Expose whether filtered bars reach the expected RTH close boundary."""
     from ap.fvg_telemetry import _required_rth_close
@@ -411,25 +412,34 @@ def _describe_pit_coverage(
             else None
         ),
         "source": source,
+        "provider_status": provider_status,
     }
+
+
+def _provider_result_succeeded(value: Any) -> bool:
+    status = getattr(value, "provider_succeeded", None)
+    return bool(status) if status is not None else bool(value)
 
 
 def _select_pit_interval_source(
     provider_bars: list[dict[str, Any]],
     frozen_bars: list[dict[str, Any]],
     *,
+    provider_succeeded: bool,
     provider_coverage: dict[str, Any],
     frozen_coverage: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any], bool]:
     """Choose one interval source without merging or inventing evidence."""
-    if provider_coverage.get("coverage_complete") is True:
+    if provider_succeeded and provider_coverage.get("coverage_complete") is True:
         return provider_bars, provider_coverage, False
-    if frozen_coverage.get("coverage_complete") is True:
+    if frozen_bars and frozen_coverage.get("coverage_complete") is True:
         return frozen_bars, frozen_coverage, True
-    if provider_bars:
+    if provider_succeeded and provider_bars:
         return provider_bars, provider_coverage, False
     if frozen_bars:
         return frozen_bars, frozen_coverage, True
+    if provider_bars:
+        return provider_bars, provider_coverage, False
     return provider_bars, provider_coverage, False
 
 
@@ -581,8 +591,10 @@ def _collect_breach_context(
     daily: list[dict[str, Any]] = []
     bars_5m: list[dict[str, Any]] = []
     bars_15m: list[dict[str, Any]] = []
-    fetched_5m = False
-    fetched_15m = False
+    provider_attempted_5m = False
+    provider_attempted_15m = False
+    provider_succeeded_5m = False
+    provider_succeeded_15m = False
     coverage_5m: Optional[dict[str, Any]] = None
     coverage_15m: Optional[dict[str, Any]] = None
 
@@ -596,15 +608,17 @@ def _collect_breach_context(
         try:
             from ap.fvg_telemetry import fetch_15m_bars
 
-            fetched_15m = True
+            provider_attempted_15m = True
             bars_15m = fetch_15m_bars(ticker, broker, now=evidence_now)
+            provider_succeeded_15m = _provider_result_succeeded(bars_15m)
         except Exception as exc:
             errors.append(f"intraday_history:{type(exc).__name__}")
         try:
             from ap.fvg_telemetry import fetch_5m_bars
 
-            fetched_5m = True
+            provider_attempted_5m = True
             bars_5m = fetch_5m_bars(ticker, broker, now=evidence_now)
+            provider_succeeded_5m = _provider_result_succeeded(bars_5m)
         except Exception as exc:
             errors.append(f"intraday_history_5m:{type(exc).__name__}")
 
@@ -618,8 +632,11 @@ def _collect_breach_context(
         bars_15m,
         interval_minutes=15,
         as_of=evidence_now,
-        source="provider_response" if fetched_15m else "unavailable",
-        authoritative_source=fetched_15m,
+        source="provider_response" if provider_attempted_15m else "unavailable",
+        authoritative_source=provider_succeeded_15m,
+        provider_status=(
+            "success" if provider_succeeded_15m else "error"
+        ) if provider_attempted_15m else "unavailable",
     )
     frozen_coverage_15m = _describe_pit_coverage(
         frozen_15m,
@@ -631,6 +648,7 @@ def _collect_breach_context(
     bars_15m, coverage_15m, used_frozen_15m = _select_pit_interval_source(
         bars_15m,
         frozen_15m,
+        provider_succeeded=provider_succeeded_15m,
         provider_coverage=provider_coverage_15m,
         frozen_coverage=frozen_coverage_15m,
     )
@@ -645,8 +663,11 @@ def _collect_breach_context(
         bars_5m,
         interval_minutes=5,
         as_of=evidence_now,
-        source="provider_response" if fetched_5m else "unavailable",
-        authoritative_source=fetched_5m,
+        source="provider_response" if provider_attempted_5m else "unavailable",
+        authoritative_source=provider_succeeded_5m,
+        provider_status=(
+            "success" if provider_succeeded_5m else "error"
+        ) if provider_attempted_5m else "unavailable",
     )
     frozen_coverage_5m = _describe_pit_coverage(
         frozen_5m,
@@ -658,6 +679,7 @@ def _collect_breach_context(
     bars_5m, coverage_5m, used_frozen_5m = _select_pit_interval_source(
         bars_5m,
         frozen_5m,
+        provider_succeeded=provider_succeeded_5m,
         provider_coverage=provider_coverage_5m,
         frozen_coverage=frozen_coverage_5m,
     )
@@ -700,12 +722,16 @@ def _collect_breach_context(
             "intraday": (
                 "signal_frozen_15min"
                 if used_frozen_15m
-                else "tradier_timesales_15min" if fetched_15m and bars_15m else None
+                else "tradier_timesales_15min"
+                if provider_attempted_15m and bars_15m
+                else None
             ),
             "intraday_5m": (
                 "signal_frozen_5min"
                 if used_frozen_5m
-                else "tradier_timesales_5min" if fetched_5m and bars_5m else None
+                else "tradier_timesales_5min"
+                if provider_attempted_5m and bars_5m
+                else None
             ),
             "market": None,
             "sector": None,
