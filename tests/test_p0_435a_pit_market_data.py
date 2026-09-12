@@ -500,6 +500,18 @@ def test_successful_empty_pit_snapshot_reuses_same_bucket(monkeypatch):
     assert len(broker.session.calls) == 1
 
 
+def test_successful_but_stale_in_session_pit_response_is_not_reused(monkeypatch):
+    broker = _Broker(lambda _params, _call_number: [])
+    monkeypatch.setattr(fvg, "_resolve_base_url", lambda _broker: "https://api.tradier.com")
+
+    first_as_of = datetime(2026, 9, 11, 13, 37, tzinfo=timezone.utc)
+    second_as_of = datetime(2026, 9, 11, 13, 39, tzinfo=timezone.utc)
+
+    assert fvg.fetch_5m_bars("SPY", broker, now=first_as_of) == []
+    assert fvg.fetch_5m_bars("SPY", broker, now=second_as_of) == []
+    assert len(broker.session.calls) == 2
+
+
 def test_failed_pit_request_is_not_cached_as_authoritative_empty(monkeypatch):
     def responder(_params, _call_number):
         raise RuntimeError("provider down")
