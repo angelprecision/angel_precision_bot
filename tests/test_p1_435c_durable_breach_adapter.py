@@ -29,7 +29,9 @@ from __future__ import annotations
 import copy
 import json
 import os
+from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -47,7 +49,14 @@ from ap.intelligence_breach_snapshot_assembly import (  # noqa: E402
     ASSEMBLY_VERSION,
     BREACH_PHASE,
     build_breach_snapshot_envelope,
+    hash_breach_snapshot_input,
     normalize_breach_identity,
+)
+from ap.intelligence_breach_market_structure import (  # noqa: E402
+    freeze_breach_market_structure_from_pit,
+)
+from ap.intelligence_market_data import (  # noqa: E402
+    collect_point_in_time_context,
 )
 from ap.intelligence_context_materializer import (  # noqa: E402
     build_snapshot_kwargs,
@@ -81,6 +90,49 @@ LOCAL_ORDER = "local-435c-1"
 TICKER = "SPY"
 SIDE = "CALL"
 TRIGGER_AT = "2026-09-12T13:45:00+00:00"
+PIT_AS_OF = "2026-09-11T17:30:00+00:00"
+_ET = ZoneInfo("America/New_York")
+
+
+def _pit_bar(ts: str, open_price: float, high: float, low: float, close: float) -> dict[str, Any]:
+    return {
+        "time": ts,
+        "open": open_price,
+        "high": high,
+        "low": low,
+        "close": close,
+        "volume": 1_000,
+    }
+
+
+def _pit_15m_session(day: str, base: float) -> list[dict[str, Any]]:
+    start = datetime.fromisoformat(f"{day}T09:30:00").replace(tzinfo=_ET)
+    rows: list[dict[str, Any]] = []
+    for index in range(26):
+        timestamp = start + timedelta(minutes=15 * index)
+        open_price, high, low, close = base, base + 0.5, base - 0.5, base
+        rows.append(_pit_bar(timestamp.isoformat(), open_price, high, low, close))
+    return rows
+
+
+def _canonical_614_signal() -> dict[str, Any]:
+    return {
+        "ticker": "NOW",
+        "side": "PUT",
+        "trigger_price": 100.50,
+        "trigger_crossed_at": PIT_AS_OF,
+        "breach_price": 100.50,
+        "breach_lineage": "INITIAL_BREACH",
+        "candles_5m": [
+            _pit_bar("2026-09-11T17:25:00+00:00", 110.5, 111.0, 100.3, 110.0)
+        ],
+        "candles_15m": (
+            _pit_15m_session("2026-09-08", 100.0)
+            + _pit_15m_session("2026-09-09", 108.0)
+            + _pit_15m_session("2026-09-10", 116.0)
+            + _pit_15m_session("2026-09-11", 110.0)
+        ),
+    }
 
 
 def _identity(
@@ -262,10 +314,9 @@ def _build_complete_envelope(**overrides: Any) -> dict[str, Any]:
     if "structure" in overrides:
         structure = overrides.pop("structure")
 
-    # For these tests we do not exercise parent lineage authority; identity
-    # parents remain empty and the envelope resolves to PARTIAL unless a
-    # caller supplies parents.  The COMPLETE path is checked with an
-    # authoritative-parent injection helper below.
+    # Build the initial envelope without parents so PARTIAL behavior remains
+    # covered.  COMPLETE tests pass it through the real #625 parent validator
+    # in _inject_authoritative_parents below.
     envelope = build_breach_snapshot_envelope(
         identity, evidence, structure=structure
     )
@@ -274,25 +325,78 @@ def _build_complete_envelope(**overrides: Any) -> dict[str, Any]:
 
 
 def _inject_authoritative_parents(envelope: dict[str, Any]) -> dict[str, Any]:
-    """Promote an envelope to COMPLETE by attaching authoritative parents.
+    """Reassemble with production-shaped parents through the real #625 owner."""
+    source = copy.deepcopy(envelope)
+    identity = dict(source["identity"])
+    trigger_at = identity["trigger_crossed_at"]
 
-    The real #625 owner does its own parent validation from supplied snapshot
-    mappings; those code paths are covered in #625's own test suite.  For
-    #621's purposes we only need a COMPLETE envelope shape — so we synthesize
-    it here after the real envelope has been built with the real assembler.
-    """
-    envelope = copy.deepcopy(envelope)
-    envelope["status"] = "COMPLETE"
-    envelope["authoritative_parent_snapshot_ids"] = {
-        "PRETRIGGER": "parent-pretrigger-xyz",
-        "PREOPEN": "parent-preopen-abc",
-    }
-    envelope["candidate_parent_snapshot_ids"] = {
-        "PRETRIGGER": "parent-pretrigger-xyz",
-        "PREOPEN": "parent-preopen-abc",
-    }
-    envelope["missing_parent_phases"] = []
-    return envelope
+    def _parent(phase: str, snapshot_id: str, parent_snapshot_id: str | None = None) -> dict[str, Any]:
+        local_order_id = identity["local_order_id"] if phase == "PREOPEN" else ""
+        signal = {
+            "client_id": identity["client_id"],
+            "execution_mode": identity["execution_mode"],
+            "signal_id": identity["signal_id"],
+            "canonical_signal_id": identity["canonical_signal_id"],
+            "local_order_id": local_order_id,
+            "ticker": identity["ticker"],
+            "side": identity["side"],
+            "trigger_crossed_at": trigger_at,
+            "materialization_generation": identity["materialization_generation"],
+            "profile_version": identity["profile_version"],
+            "model_version": identity["model_version"],
+            "phase": phase,
+        }
+        payload = {
+            "phase": phase,
+            "signal": signal,
+            "client_id": identity["client_id"],
+            "execution_mode": identity["execution_mode"],
+            "signal_id": identity["signal_id"],
+            "canonical_signal_id": identity["canonical_signal_id"],
+            "local_order_id": local_order_id,
+            "ticker": identity["ticker"],
+            "side": identity["side"],
+            "trigger_crossed_at": trigger_at,
+            "materialization_generation": identity["materialization_generation"],
+            "profile_version": identity["profile_version"],
+            "model_version": identity["model_version"],
+            "status": "COMPLETE",
+            "parent_snapshot_id": parent_snapshot_id,
+            "parent_link_status": "LINKED" if parent_snapshot_id else "PRETRIGGER_NOT_AVAILABLE",
+            "observe_only": True,
+            "affected_eligibility": False,
+        }
+        return {
+            "id": snapshot_id,
+            "client_id": identity["client_id"],
+            "execution_mode": identity["execution_mode"],
+            "signal_id": identity["signal_id"],
+            "canonical_signal_id": identity["canonical_signal_id"],
+            "local_order_id": local_order_id,
+            "ticker": identity["ticker"],
+            "side": identity["side"],
+            "phase": phase,
+            "trigger_crossed_at": trigger_at,
+            "materialization_generation": identity["materialization_generation"],
+            "profile_version": identity["profile_version"],
+            "model_version": identity["model_version"],
+            "context_revision": 1,
+            "status": "COMPLETE",
+            "parent_snapshot_id": parent_snapshot_id,
+            "observe_only": True,
+            "affected_eligibility": False,
+            "payload": payload,
+        }
+
+    return build_breach_snapshot_envelope(
+        identity,
+        source["evidence"],
+        structure=source["structure"],
+        pretrigger_snapshot=_parent("PRETRIGGER", "parent-pretrigger-xyz"),
+        preopen_snapshot=_parent(
+            "PREOPEN", "parent-preopen-abc", "parent-pretrigger-xyz"
+        ),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -311,6 +415,9 @@ class TestFrozenStructureHash:
     def test_missing_structure_has_stable_tag(self):
         assert hash_frozen_breach_structure(None).startswith("sha256:")
 
+    def test_null_is_hashed_as_json_null(self):
+        assert hash_frozen_breach_structure(None) == hash_frozen_breach_structure(None)
+
     def test_key_order_does_not_change_hash(self):
         a = hash_frozen_breach_structure({"a": 1, "b": {"x": 1, "y": 2}})
         b = hash_frozen_breach_structure({"b": {"y": 2, "x": 1}, "a": 1})
@@ -327,21 +434,45 @@ class TestFrozenStructureHash:
         mutated["strong_break"]["observed"] = True
         assert hash_frozen_breach_structure(base) != hash_frozen_breach_structure(mutated)
 
-    def test_no_repr_leak_for_exotic_type(self):
+    @pytest.mark.parametrize(
+        "mutator",
+        [
+            lambda value: value["fvg_4h"][0].update(high=450.0),
+            lambda value: value["strong_break"].update(observed=True),
+            lambda value: value["vi"].update(status="AVAILABLE"),
+            lambda value: value.update(
+                pullback_reclaim_rebreach={"status": "RECLAIMING"}
+            ),
+        ],
+    )
+    def test_semantic_structure_mutation_changes_hash(self, mutator):
+        base = _structure()
+        mutated = copy.deepcopy(base)
+        mutator(mutated)
+        assert hash_frozen_breach_structure(base) != hash_frozen_breach_structure(mutated)
+
+    def test_custom_object_is_rejected(self):
         class _Weird:
             def __repr__(self) -> str:
                 return "<Weird 0x{:x}>".format(id(self))
 
-        h1 = hash_frozen_breach_structure({"w": _Weird()})
-        h2 = hash_frozen_breach_structure({"w": _Weird()})
-        # Two independent instances with unstable repr must not both surface
-        # raw repr into the hash; the wrapper produces the SAME textual form
-        # for both because we go through str() inside the wrapper, and the
-        # wrapper key is stable.
-        # We do not require them to be equal (Weird instances differ), but we
-        # require the algorithm to run without exception.
-        assert h1.startswith("sha256:")
-        assert h2.startswith("sha256:")
+        with pytest.raises(TypeError):
+            hash_frozen_breach_structure({"w": _Weird()})
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            {"values": {1, 2}},
+            {"values": b"bytes"},
+            {1: "non-string-key"},
+            {"value": float("nan")},
+            {"value": float("inf")},
+            {"value": float("-inf")},
+        ],
+    )
+    def test_unsupported_json_shapes_are_rejected(self, value):
+        with pytest.raises((TypeError, ValueError)):
+            hash_frozen_breach_structure(value)
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +539,46 @@ class TestEnqueueContract:
         assert result["ok"] is False
         assert "envelope_evidence_as_of_missing" in result["errors"]
 
+    def test_exact_trigger_and_evidence_as_of_pass(self):
+        env = _inject_authoritative_parents(_build_complete_envelope())
+        result = enqueue_breach_snapshot_job(env)
+        assert result["ok"] is True
+
+    def test_later_evidence_as_of_rejects(self):
+        env = _inject_authoritative_parents(_build_complete_envelope())
+        env["evidence_as_of"] = "2026-09-12T13:50:00+00:00"
+        env["as_of"] = env["evidence_as_of"]
+        result = enqueue_breach_snapshot_job(env)
+        assert result["ok"] is False
+        assert result["error_code"] == "BREACH_ENVELOPE_INVALID"
+        assert _MEMORY_JOBS == {}
+
+    def test_equivalent_aware_offsets_normalize_to_the_same_breach_time(self):
+        env = _inject_authoritative_parents(_build_complete_envelope())
+        equivalent = "2026-09-12T06:45:00-07:00"
+        env["trigger_crossed_at"] = equivalent
+        env["identity"]["trigger_crossed_at"] = equivalent
+        env["evidence_as_of"] = equivalent
+        env["as_of"] = equivalent
+        result = enqueue_breach_snapshot_job(env)
+        assert result["ok"] is True
+        job = next(iter(_MEMORY_JOBS.values()))
+        assert job["payload"]["trigger_crossed_at"] == TRIGGER_AT
+        assert job["payload"]["evidence_as_of"] == TRIGGER_AT
+
+    @pytest.mark.parametrize(
+        "bad_as_of",
+        ["2026-09-12T13:45:00", "not-a-timestamp"],
+    )
+    def test_naive_or_malformed_evidence_as_of_rejects(self, bad_as_of):
+        env = _inject_authoritative_parents(_build_complete_envelope())
+        env["evidence_as_of"] = bad_as_of
+        env["as_of"] = bad_as_of
+        result = enqueue_breach_snapshot_job(env)
+        assert result["ok"] is False
+        assert result["error_code"] == "BREACH_ENVELOPE_INVALID"
+        assert _MEMORY_JOBS == {}
+
     def test_rejects_complete_without_structure(self):
         env = _inject_authoritative_parents(_build_complete_envelope())
         env["structure"] = None
@@ -415,6 +586,55 @@ class TestEnqueueContract:
         result = enqueue_breach_snapshot_job(env)
         assert result["ok"] is False
         assert "envelope_structure_required_for_complete" in result["errors"]
+
+    def test_rejects_unsupported_structure_without_store_mutation(self):
+        env = _inject_authoritative_parents(_build_complete_envelope())
+        env["structure"]["unsupported"] = object()
+        result = enqueue_breach_snapshot_job(env)
+        assert result["ok"] is False
+        assert result["error_code"] == "BREACH_ENVELOPE_HASH_INVALID"
+        assert _MEMORY_JOBS == {}
+
+
+class TestEnqueueHashAuthority:
+    @pytest.mark.parametrize(
+        "mutator",
+        [
+            lambda env: env["evidence"]["point_in_time"]["underlying_observation"].update(price=999.0),
+            lambda env: env["structure"]["fvg_4h"][0].update(high=999.0),
+            lambda env: env["candidate_parent_snapshot_ids"].update(PREOPEN="different-parent"),
+            lambda env: env["identity"].update(ticker="QQQ"),
+        ],
+    )
+    def test_mutated_625_input_with_old_hashes_is_rejected(self, mutator):
+        env = _inject_authoritative_parents(_build_complete_envelope())
+        old_input_hash = env["input_hash"]
+        old_identity_hash = env["identity_hash"]
+        mutator(env)
+        result = enqueue_breach_snapshot_job(env)
+        assert result["ok"] is False
+        assert result["error_code"] == "BREACH_ENVELOPE_HASH_MISMATCH"
+        assert "envelope_hash_mismatch" in result["errors"]
+        assert env["input_hash"] == old_input_hash
+        assert env["identity_hash"] == old_identity_hash
+        assert _MEMORY_JOBS == {}
+
+    def test_mutated_canonical_evidence_with_old_hash_is_rejected(self):
+        env = _inject_authoritative_parents(_build_complete_envelope())
+        env["canonical_evidence"]["underlying_observation"]["price"] = 999.0
+        result = enqueue_breach_snapshot_job(env)
+        assert result["ok"] is False
+        assert result["error_code"] == "BREACH_ENVELOPE_HASH_MISMATCH"
+        assert _MEMORY_JOBS == {}
+
+    def test_mutated_evidence_as_of_with_old_hash_is_rejected(self):
+        env = _inject_authoritative_parents(_build_complete_envelope())
+        env["evidence"]["as_of"] = "2026-09-12T13:50:00+00:00"
+        env["breach_evidence"]["as_of"] = env["evidence"]["as_of"]
+        result = enqueue_breach_snapshot_job(env)
+        assert result["ok"] is False
+        assert result["error_code"] == "BREACH_ENVELOPE_INVALID"
+        assert _MEMORY_JOBS == {}
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +794,14 @@ class TestDispatchAndWorkerValidation:
         with pytest.raises(RuntimeError, match="BREACH_JOB_IDENTITY_MISMATCH"):
             build_breach_snapshot_kwargs(job)
 
+    def test_worker_fails_closed_on_frozen_structure_tamper(self):
+        env = _inject_authoritative_parents(_build_complete_envelope())
+        enqueue_breach_snapshot_job(env)
+        job = copy.deepcopy(next(iter(_MEMORY_JOBS.values())))
+        job["payload"]["structure"]["strong_break"]["observed"] = True
+        with pytest.raises(RuntimeError, match="BREACH_JOB_IDENTITY_MISMATCH"):
+            build_breach_snapshot_kwargs(job)
+
 
 # ---------------------------------------------------------------------------
 # §11  Candidate vs authoritative parent invariant
@@ -590,7 +818,16 @@ class TestParentInvariants:
             "PRETRIGGER": "pt-candidate",
             "PREOPEN": "po-candidate",
         }
-        enqueue_breach_snapshot_job(env)
+        # Recompute the #625 input hash for this deliberately non-authoritative
+        # candidate map.  The adapter must still refuse to promote it.
+        env["input_hash"] = hash_breach_snapshot_input(
+            env["identity"],
+            env["evidence"],
+            parent_snapshot_ids=env["candidate_parent_snapshot_ids"],
+            structure=env["structure"],
+        )
+        result = enqueue_breach_snapshot_job(env)
+        assert result["ok"] is True
         job = next(iter(_MEMORY_JOBS.values()))
         kwargs = build_breach_snapshot_kwargs(job)
         assert kwargs["parent_snapshot_id"] is None
@@ -830,6 +1067,96 @@ class TestEndToEndWorker:
         row = snap["snapshot"]
         assert row["input_hash"] == env_2["input_hash"]
         assert row["context_revision"] == enq_2["context_revision"]
+
+
+# ---------------------------------------------------------------------------
+# §18, §19  Real #614 PIT -> #615 freezer -> #625 assembly -> #621 -> #327
+# ---------------------------------------------------------------------------
+
+
+def test_real_614_to_615_to_625_to_621_to_327_round_trip(monkeypatch):
+    signal = _canonical_614_signal()
+    pit = collect_point_in_time_context(signal, broker=None, phase=BREACH_PHASE)
+    assert pit["phase"] == BREACH_PHASE
+    assert pit["as_of"] == PIT_AS_OF
+
+    frozen_structure = freeze_breach_market_structure_from_pit(signal, pit)
+    assert frozen_structure["schema_version"] == "breach_market_structure_v1"
+    assert frozen_structure["model_version"] == "canonical_fvg_435b_v1"
+    assert frozen_structure["fvg_zones"]
+
+    identity_result = normalize_breach_identity(
+        {
+            "client_id": CLIENT,
+            "execution_mode": MODE,
+            "signal_id": "real-614-435c",
+            "canonical_signal_id": "real-614-435c",
+            "local_order_id": "real-local-435c",
+            "ticker": signal["ticker"],
+            "side": signal["side"],
+            "trigger_crossed_at": PIT_AS_OF,
+            "materialization_generation": 1,
+            "profile_version": PROFILE_VERSION,
+            "model_version": frozen_structure["model_version"],
+            "phase": BREACH_PHASE,
+        }
+    )
+    assert identity_result["ok"] is True, identity_result
+    assembled = build_breach_snapshot_envelope(
+        identity_result,
+        pit,
+        structure=frozen_structure,
+    )
+    assert assembled["ok"] is True, assembled
+    assembled = _inject_authoritative_parents(assembled)
+    assert assembled["status"] == "COMPLETE"
+
+    # The claimed worker must consume only the already-frozen job payload.
+    def _no_refetch(*_args: Any, **_kwargs: Any):
+        raise AssertionError("BREACH worker must not refetch PIT data")
+
+    monkeypatch.setattr(
+        "ap.intelligence_context_materializer.collect_point_in_time_context",
+        _no_refetch,
+    )
+    enqueued = enqueue_breach_snapshot_job(assembled)
+    assert enqueued["ok"] is True, enqueued
+    processed = process_due_intelligence_jobs_once(
+        claim_owner="real-435c-worker",
+        client_id=CLIENT,
+        execution_mode=MODE,
+        limit=5,
+    )
+    assert processed["ok"] is True, processed
+    assert processed["completed"] == 1, processed
+
+    result = get_latest_snapshot(
+        client_id=CLIENT,
+        execution_mode=MODE,
+        canonical_signal_id="real-614-435c",
+        phase=BREACH_PHASE,
+    )
+    assert result["ok"] is True, result
+    row = result["snapshot"]
+    payload = row["payload"]
+    structure = payload["structure"]
+    assert row["status"] == "COMPLETE"
+    assert row["data_as_of"] == PIT_AS_OF
+    assert payload["trigger_crossed_at"] == PIT_AS_OF
+    assert payload["evidence_as_of"] == PIT_AS_OF
+    assert structure["data_as_of"] == PIT_AS_OF
+    assert structure["schema_version"] == "breach_market_structure_v1"
+    assert structure["model_version"] == "canonical_fvg_435b_v1"
+    assert structure["fvg_zones"]
+    assert structure["data_coverage"] == pit["data_sources"]["coverage"]
+    assert structure["data_provenance"] == pit["provenance"]
+    assert payload["structure_hash"] == hash_frozen_breach_structure(frozen_structure)
+    assert payload["identity_hash"] == assembled["identity_hash"]
+    assert payload["input_hash"] == assembled["input_hash"]
+    assert row["input_hash"] == assembled["input_hash"]
+    assert payload["candidate_parent_snapshot_ids"] == assembled["candidate_parent_snapshot_ids"]
+    assert payload["authoritative_parent_snapshot_ids"] == assembled["authoritative_parent_snapshot_ids"]
+    assert row["parent_snapshot_id"] == assembled["authoritative_parent_snapshot_ids"]["PREOPEN"]
 
 
 # ---------------------------------------------------------------------------

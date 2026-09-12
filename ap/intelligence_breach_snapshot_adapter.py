@@ -43,11 +43,15 @@ import copy
 import hashlib
 import json
 import logging
+import math
+from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 
 from ap.intelligence_breach_snapshot_assembly import (
     ASSEMBLY_VERSION as _BREACH_ASSEMBLY_VERSION,
     BREACH_PHASE,
+    hash_breach_identity,
+    hash_breach_snapshot_input,
 )
 from ap.intelligence_snapshot_store import (
     DEFAULT_PROFILE_VERSION,
@@ -107,26 +111,34 @@ def _telemetry(ok: bool, **fields: Any) -> dict[str, Any]:
 
 
 def _canonicalize_for_hash(value: Any) -> Any:
-    """Deterministically canonicalize a value for JSON hashing.
+    """Return only strict JSON-shaped data suitable for deterministic hashing.
 
-    - Mappings become dicts with keys sorted lexicographically.  Dict insertion
-      order therefore cannot influence the hash.
-    - Lists/tuples are hashed in their given order (order is meaningful for
-      candle rows and lifecycle histories).
-    - Scalars are returned as-is; unknown types are represented by their str()
-      form only after being wrapped in a stable ``{"__repr__": str(value)}``
-      envelope, so no accidental raw ``repr()`` embedding sneaks in.
+    This is deliberately narrower than the durable store's compatibility JSON
+    encoder.  A structure checksum must never turn an object identity, a
+    process-specific representation, an unordered collection, or a non-finite
+    number into apparently valid frozen evidence.
     """
-    if isinstance(value, Mapping):
-        return {
-            str(key): _canonicalize_for_hash(value[key])
-            for key in sorted(value.keys(), key=lambda item: str(item))
-        }
-    if isinstance(value, (list, tuple)):
-        return [_canonicalize_for_hash(item) for item in value]
-    if value is None or isinstance(value, (str, int, float, bool)):
+    if value is None or isinstance(value, (bool, int, str)):
         return value
-    return {"__repr__": str(value)}
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("non-finite frozen BREACH structure value")
+        # JSON has one numeric zero; normalize negative zero as well.
+        return 0.0 if value == 0 else value
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key in value:
+            if not isinstance(key, str):
+                raise TypeError("frozen BREACH structure mapping keys must be strings")
+        for key in sorted(value):
+            result[key] = _canonicalize_for_hash(value[key])
+        return result
+    if isinstance(value, list):
+        return [_canonicalize_for_hash(item) for item in value]
+    raise TypeError(
+        "unsupported frozen BREACH structure type: "
+        f"{type(value).__name__}"
+    )
 
 
 def hash_frozen_breach_structure(structure: Any) -> str:
@@ -147,13 +159,15 @@ def hash_frozen_breach_structure(structure: Any) -> str:
     - changing actual frozen FVG / strong-break / VI / reclaim evidence must
       change the hash.
 
-    ``None`` returns the empty-structure hash tag so replay bookkeeping stays
-    stable even when a PARTIAL envelope has no attached structure.
+    ``None`` is a valid JSON ``null`` structure value and is hashed as such.
     """
     canonical = _canonicalize_for_hash(structure)
-    if canonical is None:
-        canonical = {"__frozen_breach_structure__": "MISSING"}
-    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=None)
+    payload = json.dumps(
+        canonical,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return f"sha256:{digest}"
 
@@ -195,6 +209,208 @@ def _envelope_evidence_as_of(envelope: Mapping[str, Any]) -> Optional[str]:
     """
     value = _get_first(envelope, ("evidence_as_of", "as_of"))
     return str(value) if isinstance(value, str) and value else None
+
+
+def _normalize_aware_timestamp(
+    value: Any, *, field: str, errors: list[str]
+) -> Optional[str]:
+    """Normalize one timestamp to UTC without accepting ambiguous time."""
+    if value is None or value == "":
+        errors.append(f"{field}_missing")
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            errors.append(f"{field}_missing")
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except (TypeError, ValueError, OverflowError):
+            errors.append(f"{field}_malformed")
+            return None
+    else:
+        errors.append(f"{field}_invalid_type")
+        return None
+    try:
+        offset = parsed.utcoffset()
+    except (TypeError, ValueError, OverflowError):
+        offset = None
+    if parsed.tzinfo is None or offset is None:
+        errors.append(f"{field}_timezone_aware_required")
+        return None
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _normalized_breach_boundary(
+    envelope: Mapping[str, Any], identity: Optional[Mapping[str, Any]]
+) -> tuple[Optional[str], Optional[str], Optional[str], list[str]]:
+    """Return normalized envelope/identity/evidence trigger times and errors."""
+    errors: list[str] = []
+    trigger = _normalize_aware_timestamp(
+        envelope.get("trigger_crossed_at"),
+        field="envelope_trigger_crossed_at",
+        errors=errors,
+    )
+    identity_trigger = _normalize_aware_timestamp(
+        identity.get("trigger_crossed_at") if identity is not None else None,
+        field="envelope_identity_trigger_crossed_at",
+        errors=errors,
+    )
+
+    evidence_values: list[str] = []
+    evidence_fields = (
+        ("evidence_as_of", "envelope_evidence_as_of"),
+        ("as_of", "envelope_as_of"),
+    )
+    for key, field in evidence_fields:
+        if key not in envelope:
+            continue
+        normalized = _normalize_aware_timestamp(
+            envelope.get(key), field=field, errors=errors
+        )
+        if normalized is not None:
+            evidence_values.append(normalized)
+    if "evidence_as_of" not in envelope:
+        errors.append("envelope_evidence_as_of_missing")
+    distinct_evidence = sorted(set(evidence_values))
+    if len(distinct_evidence) > 1:
+        errors.append("envelope_evidence_as_of_conflict")
+    evidence_as_of = distinct_evidence[0] if distinct_evidence else None
+
+    source_evidence_values: list[str] = []
+    for source in _envelope_evidence_sources(envelope):
+        raw_values, _ = _evidence_boundary_values(source)
+        for raw_value in raw_values:
+            local_errors: list[str] = []
+            normalized = _normalize_aware_timestamp(
+                raw_value,
+                field="envelope_evidence_source_as_of",
+                errors=local_errors,
+            )
+            if normalized is None:
+                errors.extend(local_errors)
+            else:
+                source_evidence_values.append(normalized)
+    if source_evidence_values and len(set(source_evidence_values)) > 1:
+        errors.append("envelope_evidence_source_as_of_conflict")
+    if evidence_as_of is not None and any(
+        value != evidence_as_of for value in source_evidence_values
+    ):
+        errors.append("envelope_evidence_source_as_of_mismatch")
+
+    boundary_values = [
+        value
+        for value in (trigger, identity_trigger, evidence_as_of)
+        if value is not None
+    ]
+    if len(set(boundary_values)) > 1 or len(boundary_values) != 3:
+        errors.append("envelope_breach_time_mismatch")
+    return trigger, identity_trigger, evidence_as_of, errors
+
+
+def _envelope_evidence_sources(envelope: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Return every canonical evidence representation that must agree."""
+    sources: list[Mapping[str, Any]] = []
+    for key in ("evidence", "breach_evidence", "canonical_evidence"):
+        value = envelope.get(key)
+        if isinstance(value, Mapping):
+            sources.append(value)
+    return sources
+
+
+def _evidence_boundary_values(source: Mapping[str, Any]) -> tuple[list[Any], list[str]]:
+    """Read known #614 wrapper timestamps without traversing candle payloads."""
+    values: list[Any] = []
+    errors: list[str] = []
+    pending: list[Mapping[str, Any]] = [source]
+    seen: set[int] = set()
+    nested_keys = (
+        "point_in_time",
+        "evidence",
+        "breach_evidence",
+        "frozen_evidence",
+        "structure",
+        "market_structure",
+        "identity",
+        "payload",
+        "metadata",
+        "meta",
+        "signal",
+        "underlying_observation",
+        "frozen_underlying_observation",
+    )
+    while pending:
+        current = pending.pop(0)
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        for key in ("as_of", "data_as_of", "trigger_crossed_at", "breach_at"):
+            if key not in current or current.get(key) in (None, ""):
+                continue
+            value = current.get(key)
+            if key == "data_as_of" and isinstance(value, Mapping):
+                value = value.get("BREACH") or value.get("breach")
+            if value not in (None, ""):
+                values.append(value)
+        for key in nested_keys:
+            nested = current.get(key)
+            if isinstance(nested, Mapping):
+                pending.append(nested)
+    return values, errors
+
+
+def _verify_envelope_hashes(
+    envelope: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    structure: Any,
+) -> tuple[bool, list[str]]:
+    """Recompute the merged #625 hashes before any #327 mutation."""
+    errors: list[str] = []
+    supplied_identity_hash = envelope.get("identity_hash")
+    supplied_input_hash = envelope.get("input_hash")
+    if not isinstance(supplied_identity_hash, str) or not supplied_identity_hash:
+        return False, ["envelope_identity_hash_missing"]
+    if not isinstance(supplied_input_hash, str) or not supplied_input_hash:
+        return False, ["envelope_input_hash_missing"]
+
+    try:
+        # This adapter deliberately delegates semantic identity to #625.
+        expected_identity_hash = hash_breach_identity(identity)
+        hash_frozen_breach_structure(structure)
+        structure_slot = envelope.get("structure_slot")
+        if isinstance(structure_slot, Mapping) and "value" in structure_slot:
+            if hash_frozen_breach_structure(structure) != hash_frozen_breach_structure(
+                structure_slot.get("value")
+            ):
+                errors.append("structure_mismatch")
+        evidence_sources = _envelope_evidence_sources(envelope)
+        if not evidence_sources:
+            raise ValueError("canonical BREACH evidence is required")
+        candidate_parent_ids = _candidate_parent_ids(envelope)
+        expected_input_hashes = [
+            hash_breach_snapshot_input(
+                identity,
+                evidence,
+                parent_snapshot_ids=candidate_parent_ids,
+                structure=structure,
+            )
+            for evidence in evidence_sources
+        ]
+    except (TypeError, ValueError, OverflowError) as exc:
+        return False, [f"envelope_hash_recompute_invalid:{type(exc).__name__}"]
+
+    if supplied_identity_hash != expected_identity_hash:
+        errors.append("identity_hash_mismatch")
+    if (
+        not expected_input_hashes
+        or len(set(expected_input_hashes)) != 1
+        or supplied_input_hash != expected_input_hashes[0]
+    ):
+        errors.append("input_hash_mismatch")
+    return not errors, errors
 
 
 def _envelope_structure(envelope: Mapping[str, Any]) -> Any:
@@ -259,13 +475,15 @@ def _validate_envelope_for_enqueue(envelope: Any) -> tuple[bool, Optional[str], 
     - valid #625 identity;
     - non-empty identity_hash;
     - non-empty input_hash;
-    - exact canonical ``trigger_crossed_at``;
-    - exact evidence_as_of;
+    - normalized aware ``trigger_crossed_at`` on envelope and identity;
+    - normalized aware ``evidence_as_of`` equal to that trigger;
+    - supplied #625 identity/input hashes recompute exactly;
     - attached structure for COMPLETE snapshots;
     - structure is a mapping when present;
     - REJECTED envelopes never enqueue.
     """
     errors: list[str] = []
+    hash_error_code: Optional[str] = None
     if not isinstance(envelope, Mapping):
         return False, "BREACH_ENVELOPE_NOT_MAPPING", ["envelope_not_mapping"]
 
@@ -294,18 +512,11 @@ def _validate_envelope_for_enqueue(envelope: Any) -> tuple[bool, Optional[str], 
     if not isinstance(input_hash, str) or not input_hash:
         errors.append("envelope_input_hash_missing")
 
-    trigger = envelope.get("trigger_crossed_at")
-    if identity is not None:
-        identity_trigger = identity.get("trigger_crossed_at")
-        if trigger != identity_trigger or not isinstance(trigger, str) or not trigger:
-            errors.append("envelope_trigger_crossed_at_missing_or_inconsistent")
-    else:
-        if not isinstance(trigger, str) or not trigger:
-            errors.append("envelope_trigger_crossed_at_missing")
+    _, _, _, boundary_errors = _normalized_breach_boundary(envelope, identity)
+    errors.extend(boundary_errors)
 
-    evidence_as_of = _envelope_evidence_as_of(envelope)
-    if evidence_as_of is None:
-        errors.append("envelope_evidence_as_of_missing")
+    if envelope.get("assembly_version") != _BREACH_ASSEMBLY_VERSION:
+        errors.append("envelope_assembly_version_mismatch")
 
     structure = _envelope_structure(envelope)
     if structure is None:
@@ -314,8 +525,21 @@ def _validate_envelope_for_enqueue(envelope: Any) -> tuple[bool, Optional[str], 
     elif not isinstance(structure, Mapping):
         errors.append("envelope_structure_invalid_type")
 
+    if identity is not None and isinstance(identity_hash, str) and identity_hash and isinstance(
+        input_hash, str
+    ) and input_hash:
+        hashes_ok, hash_errors = _verify_envelope_hashes(envelope, identity, structure)
+        if not hashes_ok:
+            if any(error.startswith("envelope_hash_recompute_invalid") for error in hash_errors):
+                hash_error_code = "BREACH_ENVELOPE_HASH_INVALID"
+                errors.append("envelope_hash_recompute_invalid")
+            else:
+                hash_error_code = "BREACH_ENVELOPE_HASH_MISMATCH"
+                errors.append("envelope_hash_mismatch")
+            errors.extend(hash_errors)
+
     if errors:
-        return False, "BREACH_ENVELOPE_INVALID", errors
+        return False, hash_error_code or "BREACH_ENVELOPE_INVALID", errors
 
     return True, None, []
 
@@ -368,9 +592,23 @@ def _build_frozen_payload(envelope: Mapping[str, Any]) -> dict[str, Any]:
     what #327 persists.
     """
     identity = _envelope_identity(envelope) or {}
+    trigger, identity_trigger, evidence_as_of, boundary_errors = (
+        _normalized_breach_boundary(envelope, identity)
+    )
+    if boundary_errors:
+        raise ValueError("invalid BREACH boundary: " + ",".join(boundary_errors))
+    identity_copy = copy.deepcopy(dict(identity))
+    if identity_trigger is not None:
+        identity_copy["trigger_crossed_at"] = identity_trigger
     structure = _envelope_structure(envelope)
     structure_copy = copy.deepcopy(structure) if structure is not None else None
-    evidence = envelope.get("canonical_evidence") or envelope.get("evidence") or {}
+    evidence = (
+        envelope.get("canonical_evidence")
+        if isinstance(envelope.get("canonical_evidence"), Mapping)
+        else envelope.get("evidence")
+        or envelope.get("breach_evidence")
+        or {}
+    )
     evidence_copy = copy.deepcopy(evidence) if isinstance(evidence, Mapping) else {}
 
     parent_lineage = envelope.get("parent_lineage")
@@ -399,12 +637,12 @@ def _build_frozen_payload(envelope: Mapping[str, Any]) -> dict[str, Any]:
         "adapter_version": ADAPTER_VERSION,
         "assembly_version": envelope.get("assembly_version") or _BREACH_ASSEMBLY_VERSION,
         # Complete #625 canonical identity (immutable).
-        "identity": copy.deepcopy(dict(identity)),
+        "identity": identity_copy,
         "identity_hash": envelope.get("identity_hash"),
         "input_hash": envelope.get("input_hash"),
         # Timing authority.
-        "trigger_crossed_at": envelope.get("trigger_crossed_at"),
-        "evidence_as_of": _envelope_evidence_as_of(envelope),
+        "trigger_crossed_at": trigger,
+        "evidence_as_of": evidence_as_of,
         # Parents — candidate and authoritative both persisted per spec §11.
         "candidate_parent_snapshot_ids": _candidate_parent_ids(envelope),
         "authoritative_parent_snapshot_ids": _authoritative_parent_ids(envelope),
@@ -619,6 +857,36 @@ def _job_vs_envelope_identity_ok(
     return (not errors), errors
 
 
+def _frozen_payload_integrity_errors(payload: Mapping[str, Any]) -> list[str]:
+    """Reject a poisoned frozen payload before intelligence persistence."""
+    errors: list[str] = []
+    identity = payload.get("identity")
+    if not isinstance(identity, Mapping):
+        return ["job_payload_identity_missing"]
+    if payload.get("assembly_version") != _BREACH_ASSEMBLY_VERSION:
+        errors.append("job_payload_assembly_version_mismatch")
+
+    _, _, _, boundary_errors = _normalized_breach_boundary(payload, identity)
+    errors.extend(f"job_payload_{error}" for error in boundary_errors)
+
+    hashes_ok, hash_errors = _verify_envelope_hashes(
+        payload, identity, payload.get("structure")
+    )
+    if not hashes_ok:
+        errors.extend(f"job_payload_{error}" for error in hash_errors)
+
+    try:
+        expected_structure_hash = hash_frozen_breach_structure(
+            payload.get("structure")
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        errors.append(f"job_payload_structure_hash_invalid:{type(exc).__name__}")
+    else:
+        if payload.get("structure_hash") != expected_structure_hash:
+            errors.append("job_payload_structure_hash_mismatch")
+    return errors
+
+
 def build_breach_snapshot_kwargs(job: Mapping[str, Any]) -> dict[str, Any]:
     """Return ``write_snapshot(**kwargs)`` for a frozen-BREACH job.
 
@@ -642,6 +910,8 @@ def build_breach_snapshot_kwargs(job: Mapping[str, Any]) -> dict[str, Any]:
     assert isinstance(payload, Mapping)
 
     ok, errors = _job_vs_envelope_identity_ok(job, payload)
+    errors.extend(_frozen_payload_integrity_errors(payload))
+    ok = not errors
     if not ok:
         # Fail closed for intelligence persistence only.  The worker will
         # translate this via mark_job_retry / mark_job_terminal — no trading

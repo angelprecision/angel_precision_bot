@@ -2,7 +2,7 @@
 
 ## Status
 
-**DRAFT / HARD HOLD / IMPLEMENTATION COMPLETE. DO NOT MERGE OR DEPLOY.**
+**DRAFT / HARD HOLD / AMENDED FOR INDEPENDENT FINAL AUDIT. DO NOT MERGE OR DEPLOY.**
 
 `#615` and `#625` are both MERGED. Rebased onto
 `main@71f25dabf739bce3360593ac44a7c7bf71ef9513`.
@@ -96,6 +96,14 @@ no later candle, no current FVG reconstruction.
   structure all produce a different input_hash and therefore a new revision.
 - Snapshot `data_as_of` = envelope `evidence_as_of` = `#614` PIT `as_of`.
   Never `collected_at`, worker start/completion, or `_now_iso()`.
+- Enqueue requires normalized aware equality across envelope trigger, canonical
+  `#625` identity trigger, and explicit `evidence_as_of`; missing, malformed,
+  naive, later, or conflicting values are rejected before `#327` mutation.
+- Enqueue recomputes `#625` `hash_breach_identity` and
+  `hash_breach_snapshot_input` over the exact canonical inputs and rejects
+  stale hashes fail-soft.
+- `hash_frozen_breach_structure` is strict JSON-only: custom objects, sets,
+  bytes, non-string keys, and non-finite numbers are rejected.
 - Snapshot status: `#625` COMPLETE -> `COMPLETE`; `#625` PARTIAL -> `PARTIAL`;
   `#625` REJECTED -> no authoritative snapshot job (fail-soft telemetry only).
 - Top-level `parent_snapshot_id` is authoritative PREOPEN only, else `None`.
@@ -157,10 +165,13 @@ Verified by tests that monkeypatch these to raise on invocation.
    the generic context builder;
 9. immutable payload: caller mutation after enqueue does not affect persisted
    structure; replay preserves exact `evidence_as_of`;
-10. end-to-end enqueue -> worker claim -> `complete_job_with_snapshot` ->
-    `get_latest_snapshot` against real `#327` memory backend, using the real
-    `#625` `build_breach_snapshot_envelope` to build the envelope;
-11. money-path isolation via source-string audit.
+10. canonical `#614` PIT -> real `#615` freezer -> real `#625`
+    `build_breach_snapshot_envelope` -> #621 enqueue -> worker claim ->
+    `complete_job_with_snapshot` -> `get_latest_snapshot` against the real
+    `#327` memory backend, with exact versions, FVG/coverage/provenance,
+    parent/hash retention, and no-refetch assertions;
+11. exact-time, hash-mutation, and strict-JSON fail-first coverage;
+12. money-path isolation via source-string audit.
 
 Adjacent intelligence suites (`#614` PIT, `#615` structure, `#625` identity,
 `#327` snapshot/job) all continue to pass without change.

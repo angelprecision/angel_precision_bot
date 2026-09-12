@@ -1,7 +1,7 @@
 # P1 435-C — Durable BREACH Snapshot Adapter
 
 ## Status
-DRAFT / HARD HOLD / IMPLEMENTATION COMPLETE. Do not merge or deploy.
+DRAFT / HARD HOLD / AMENDED FOR INDEPENDENT FINAL AUDIT. Do not merge or deploy.
 Kept open for independent whole-PR audit.
 
 ## Merged reality at implementation
@@ -96,6 +96,13 @@ existing generic path unchanged, byte-for-byte.
   exception).
 - Snapshot `data_as_of` == exact `#625` `evidence_as_of` == exact `#614` PIT
   `as_of`. Never `collected_at`, never worker time, never `_now_iso()`.
+- Enqueue normalizes aware trigger timestamps to UTC and rejects any missing,
+  malformed, naive, or conflicting BREACH boundary.
+- Enqueue recomputes the merged `#625` `identity_hash` and `input_hash` from
+  the exact canonical identity, evidence, candidate parent map, and frozen
+  structure before touching `#327`; mismatch is fail-soft with no job mutation.
+- `structure_hash` accepts only strict JSON-shaped values and rejects custom
+  objects, unordered collections, non-string keys, and non-finite numbers.
 - Top-level `parent_snapshot_id` is authoritative PREOPEN only (or `None`);
   candidate parents never promoted. Full candidate/authoritative maps preserved
   inside the payload.
@@ -109,8 +116,13 @@ watcher, or setup. No global readiness gate from `#621`.
 ## Test evidence
 Focused suite `tests/test_p1_435c_durable_breach_adapter.py`:
 
-- deterministic structure hash (key-order stable, list-order sensitive,
-  evidence changes change hash);
+- strict deterministic structure hash (key-order stable, list-order sensitive,
+  semantic FVG/strong-break/VI/reclaim changes change hash, unsupported values
+  reject);
+- exact trigger/evidence-as-of equality, equivalent-offset normalization, and
+  malformed/naive/later-time rejection;
+- #625 hash-authority verification with post-assembly evidence, structure,
+  candidate-parent, identity, and as-of mutation rejection;
 - enqueue contract (rejects non-mapping, REJECTED envelope, wrong phase,
   observe_only=false, affected_eligibility=true, missing evidence_as_of,
   COMPLETE without structure);
@@ -127,9 +139,11 @@ Focused suite `tests/test_p1_435c_durable_breach_adapter.py`:
   `build_intelligence_context_payload`, broker, selector, or watcher;
 - immutable frozen payload (caller mutation after enqueue cannot alter
   persisted structure; replay preserves exact evidence_as_of);
-- end-to-end enqueue -> claim -> complete_job_with_snapshot -> `get_latest_snapshot`
-  round-trips through the real `#327` memory backend with the real `#625`
-  `build_breach_snapshot_envelope` producing the envelope;
+- end-to-end canonical `#614` PIT -> real `#615` freezer -> real `#625`
+  identity/assembly -> enqueue -> claim -> complete_job_with_snapshot ->
+  `get_latest_snapshot` round-trip through the real `#327` memory backend,
+  including version, FVG, coverage, provenance, parent, hash, and no-refetch
+  assertions;
 - money-path isolation (adapter module imports nothing under `ap_execution_core`,
   entry watcher, exit engine, broker, order state machine, position manager,
   exit manager, selector, trade queue, risk, contract selector, or intelligence
