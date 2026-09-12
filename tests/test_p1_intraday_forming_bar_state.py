@@ -52,6 +52,7 @@ def _obs(
     price: float = 100.0,
     *,
     source_id: str | None = None,
+    source_sequence: int | None = None,
     timeframe: str | None = None,
     volume: float | None = None,
     **extra,
@@ -59,6 +60,8 @@ def _obs(
     row = {"ticker": "NVDA", "timestamp": timestamp, "price": price}
     if source_id is not None:
         row["source_observation_id"] = source_id
+    if source_sequence is not None:
+        row["source_sequence"] = source_sequence
     if timeframe is not None:
         row["timeframe"] = timeframe
     if volume is not None:
@@ -88,13 +91,17 @@ def test_5m_basic_incremental_ohlc_and_exact_finalization():
     assert (forming.bucket_end.hour, forming.bucket_end.minute) == (9, 35)
     assert (forming.open, forming.high, forming.low, forming.close) == (100.0, 103.0, 98.0, 98.0)
 
-    result = state.ingest(_obs(_ts(9, 35), 101.0, source_id="boundary"),)
+    result = state.ingest(
+        _obs(_ts(9, 35), 101.0, source_id="boundary", source_sequence=4),
+    )
     assert result.status == bar_state.ACCEPTED
     completed = state.completed_bars("NVDA", "5m")
     assert len(completed) == 1
     assert completed[0].status == bar_state.COMPLETED
     assert completed[0].bar_id == "NVDA|5m|2026-09-11|09:30:00"
-    assert state.ingest(_obs(_ts(9, 35), 102.0, source_id="boundary-2"),).status == bar_state.ACCEPTED
+    assert state.ingest(
+        _obs(_ts(9, 35), 102.0, source_id="boundary-2", source_sequence=5),
+    ).status == bar_state.ACCEPTED
     assert len(state.completed_bars("NVDA", "5m")) == 1
     assert state.forming_bar("NVDA", "5m").bar_id == "NVDA|5m|2026-09-11|09:35:00"
 
@@ -386,6 +393,7 @@ def test_default_nyse_adapter_uses_existing_full_day_authority_and_early_close_s
     fake_ap = types.ModuleType("ap")
     fake_ap.__path__ = []
     fake_flatline = types.ModuleType("ap.flatline_alarm")
+    fake_flatline.NYSE_HOLIDAYS = {2026: frozenset()}
     fake_flatline.is_trading_day = lambda value: value != date(2026, 9, 14)
     monkeypatch.setitem(sys.modules, "ap", fake_ap)
     monkeypatch.setitem(sys.modules, "ap.flatline_alarm", fake_flatline)
@@ -397,3 +405,244 @@ def test_default_nyse_adapter_uses_existing_full_day_authority_and_early_close_s
     session = calendar.session_for(DAY)
     assert session is not None
     assert session.close.time() == time(13, 0)
+
+
+def test_equal_timestamp_authoritative_sequence_is_delivery_order_independent_and_survives_restart():
+    first = _obs(
+        _ts(9, 30),
+        100.0,
+        source_id="equal-a",
+        source_sequence=1,
+        timeframe="5m",
+        volume=3.0,
+    )
+    second = _obs(
+        _ts(9, 30),
+        102.0,
+        source_id="equal-b",
+        source_sequence=2,
+        timeframe="5m",
+        volume=4.0,
+    )
+
+    forward = _state()
+    reverse = _state()
+    assert forward.ingest(first).status == bar_state.ACCEPTED
+    assert forward.ingest(second).status == bar_state.ACCEPTED
+    assert reverse.ingest(second).status == bar_state.ACCEPTED
+    assert reverse.ingest(first).status == bar_state.ACCEPTED
+
+    forward_bar = forward.forming_bar("NVDA", "5m")
+    reverse_bar = reverse.forming_bar("NVDA", "5m")
+    assert forward_bar is not None and reverse_bar is not None
+    assert forward_bar.to_dict() == reverse_bar.to_dict()
+    assert (forward_bar.open, forward_bar.high, forward_bar.low, forward_bar.close) == (
+        100.0,
+        102.0,
+        100.0,
+        102.0,
+    )
+    assert (forward_bar.first_source_sequence, forward_bar.last_source_sequence) == (1, 2)
+    assert forward_bar.volume == 7.0
+
+    restarted = bar_state.IntradayBarState.from_snapshot(
+        forward.snapshot(), calendar=StaticCalendar()
+    )
+    assert restarted.snapshot() == forward.snapshot()
+    assert restarted.ingest(copy.deepcopy(first)).status == bar_state.DUPLICATE
+    assert restarted.ingest(copy.deepcopy(second)).status == bar_state.DUPLICATE
+    third = _obs(
+        _ts(9, 30),
+        101.0,
+        source_id="equal-c",
+        source_sequence=3,
+        timeframe="5m",
+    )
+    assert forward.ingest(third).status == bar_state.ACCEPTED
+    assert restarted.ingest(copy.deepcopy(third)).status == bar_state.ACCEPTED
+    assert restarted.snapshot() == forward.snapshot()
+
+
+def test_equal_timestamp_without_authoritative_sequence_fails_closed_without_mutation():
+    state = _state()
+    first = _obs(_ts(9, 30), 100.0, source_id="ambiguous-a", timeframe="5m")
+    second = _obs(_ts(9, 30), 102.0, source_id="ambiguous-b", timeframe="5m")
+    assert state.ingest(first).status == bar_state.ACCEPTED
+    before = state.snapshot()
+
+    result = state.ingest(second)
+    assert result.status == bar_state.AMBIGUOUS_EQUAL_TIMESTAMP
+    assert result.reason == "equal_source_timestamp_requires_authoritative_order"
+    assert result.timeframes[0].status == bar_state.AMBIGUOUS_EQUAL_TIMESTAMP
+    assert state.snapshot() == before
+
+
+@pytest.mark.parametrize("bad_sequence", [True, 1.0, -1, "1.5", {"n": 1}])
+def test_source_sequence_is_strictly_typed_ordering_evidence(bad_sequence):
+    state = _state()
+    row = _obs(_ts(9, 30), source_id="bad-sequence", timeframe="5m")
+    row["source_sequence"] = bad_sequence
+    before = state.snapshot()
+    result = state.ingest(row)
+    assert result.status == bar_state.REJECTED
+    assert result.reason == "source_sequence_malformed"
+    assert state.snapshot() == before
+
+
+def test_one_source_event_can_be_consumed_by_5m_then_15m_without_global_replay_loss():
+    state = _state()
+    event = _obs(
+        _ts(9, 30),
+        100.0,
+        source_id="route-once",
+        timeframe="5m",
+        volume=7.0,
+    )
+    assert state.ingest(event).status == bar_state.ACCEPTED
+    routed = {**event, "timeframe": "15m"}
+    assert state.ingest(routed).status == bar_state.ACCEPTED
+    assert state.forming_bar("NVDA", "5m").volume == 7.0
+    assert state.forming_bar("NVDA", "15m").volume == 7.0
+
+
+def test_all_timeframes_then_5m_replay_is_per_timeframe_duplicate_without_double_volume():
+    state = _state()
+    event = _obs(_ts(9, 30), source_id="route-all", volume=4.0)
+    assert state.ingest(event).status == bar_state.ACCEPTED
+    replay = {**event, "timeframe": "5m"}
+    result = state.ingest(replay)
+    assert result.status == bar_state.DUPLICATE
+    assert result.timeframes[0].status == bar_state.DUPLICATE
+    for timeframe in bar_state.SUPPORTED_TIMEFRAMES:
+        assert state.forming_bar("NVDA", timeframe).volume == 4.0
+
+
+def test_fallback_event_identity_excludes_timeframe_routing_and_volume_is_not_doubled():
+    state = _state()
+    event = _obs(_ts(9, 30), source_id=None, volume=6.0)
+    assert state.ingest(event).status == bar_state.ACCEPTED
+    replay = {**event, "timeframe": "5m"}
+    result = state.ingest(replay)
+    assert result.status == bar_state.DUPLICATE
+    assert state.forming_bar("NVDA", "5m").volume == 6.0
+
+
+def test_same_source_id_with_conflicting_payload_is_rejected_before_new_routing():
+    state = _state()
+    first = _obs(_ts(9, 30), 100.0, source_id="reused", timeframe="5m")
+    conflicting = _obs(_ts(9, 31), 101.0, source_id="reused", timeframe="15m")
+    assert state.ingest(first).status == bar_state.ACCEPTED
+    before = state.snapshot()
+    result = state.ingest(conflicting)
+    assert result.status == bar_state.CONFLICTING_DUPLICATE
+    assert result.reason == "source_observation_id_reused_with_different_payload"
+    assert state.snapshot() == before
+
+
+def test_provider_namespace_and_version_are_part_of_source_event_identity():
+    state = _state()
+    first = _obs(
+        _ts(9, 30),
+        100.0,
+        source_id="shared-id",
+        source_identity="provider-a",
+        source_version="v1",
+        timeframe="5m",
+    )
+    second = _obs(
+        _ts(9, 31),
+        102.0,
+        source_id="shared-id",
+        source_identity="provider-b",
+        source_version="v1",
+        timeframe="5m",
+    )
+    assert state.ingest(first).status == bar_state.ACCEPTED
+    assert state.ingest(second).status == bar_state.ACCEPTED
+    bar = state.forming_bar("NVDA", "5m")
+    assert bar is not None
+    assert (bar.open, bar.high, bar.low, bar.close) == (100.0, 102.0, 100.0, 102.0)
+    assert bar.source_identity == "MIXED"
+
+
+def test_seed_rows_are_canonically_sorted_and_permutations_reconstruct_identically():
+    rows = [
+        _obs(_ts(9, 33), 103.0, source_id="seed-3", timeframe="5m"),
+        _obs(_ts(9, 30), 100.0, source_id="seed-0", timeframe="5m"),
+        _obs(_ts(9, 32), 102.0, source_id="seed-2", timeframe="5m"),
+        _obs(_ts(9, 31), 101.0, source_id="seed-1", timeframe="5m"),
+    ]
+    snapshots = []
+    for ordered in (rows, list(reversed(rows)), [rows[2], rows[0], rows[3], rows[1]]):
+        state = _state()
+        result = state.seed_once(ordered)
+        assert result.status == bar_state.ACCEPTED
+        snapshots.append(state.snapshot())
+    assert snapshots[0] == snapshots[1] == snapshots[2]
+
+
+def test_seed_equal_timestamp_sequence_permutations_reconstruct_identically():
+    rows = [
+        _obs(_ts(9, 30), 100.0, source_id="seed-equal-a", source_sequence=1, timeframe="5m"),
+        _obs(_ts(9, 30), 102.0, source_id="seed-equal-b", source_sequence=2, timeframe="5m"),
+    ]
+    forward = _state()
+    reverse = _state()
+    assert forward.seed_once(rows).status == bar_state.ACCEPTED
+    assert reverse.seed_once(list(reversed(rows))).status == bar_state.ACCEPTED
+    assert forward.snapshot() == reverse.snapshot()
+
+
+def test_seed_equal_timestamp_without_sequence_is_rejected_before_any_mutation():
+    state = _state()
+    rows = [
+        _obs(_ts(9, 30), 100.0, source_id="seed-ambiguous-a", timeframe="5m"),
+        _obs(_ts(9, 30), 102.0, source_id="seed-ambiguous-b", timeframe="5m"),
+    ]
+    result = state.seed_once(rows)
+    assert result.status == bar_state.REJECTED
+    assert result.reason.startswith("seed_equal_source_timestamp_requires_source_sequence:")
+    assert state.forming_bar("NVDA", "5m") is None
+
+
+def test_completed_bar_seed_rows_are_canonically_sorted():
+    source = _state()
+    for index, minute in enumerate((30, 35, 40, 45)):
+        assert source.ingest(
+            _obs(
+                _ts(9, minute),
+                100.0 + index,
+                source_id=f"completed-seed-{index}",
+                timeframe="5m",
+            )
+        ).accepted
+    rows = [bar.to_dict() for bar in source.completed_bars("NVDA", "5m")]
+    forward = _state()
+    reverse = _state()
+    assert forward.seed_once(rows).status == bar_state.ACCEPTED
+    assert reverse.seed_once(list(reversed(rows))).status == bar_state.ACCEPTED
+    assert forward.snapshot() == reverse.snapshot()
+
+
+def test_default_calendar_rejects_unknown_year_as_calendar_unavailable(monkeypatch):
+    import types
+
+    fake_ap = types.ModuleType("ap")
+    fake_ap.__path__ = []
+    fake_flatline = types.ModuleType("ap.flatline_alarm")
+    fake_flatline.NYSE_HOLIDAYS = {2026: frozenset()}
+    fake_flatline.is_trading_day = lambda value: True
+    monkeypatch.setitem(sys.modules, "ap", fake_ap)
+    monkeypatch.setitem(sys.modules, "ap.flatline_alarm", fake_flatline)
+
+    calendar = bar_state.NYSESessionCalendar()
+    unknown_day = date(2028, 1, 3)
+    assert calendar.is_supported(unknown_day) is False
+    assert calendar.session_for(unknown_day) is None
+
+    state = bar_state.IntradayBarState()
+    unknown_timestamp = datetime(2028, 1, 3, 10, 0, tzinfo=ET)
+    result = state.ingest(_obs(unknown_timestamp, source_id="unknown-year"))
+    assert result.status == bar_state.REJECTED
+    assert result.reason == "calendar_unavailable"
+    assert state.snapshot()["forming"] == []

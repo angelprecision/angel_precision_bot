@@ -15,10 +15,14 @@ The live observation contract is intentionally small:
 * ``volume``, when present, is a non-negative *incremental* contribution and
   must declare ``volume_kind="incremental"``.  Cumulative volume is not
   accepted because the state engine cannot infer its reset/interval scope.
+* ``source_sequence`` (or its ``source_order`` alias) is optional for
+  distinct source timestamps, but is required to merge distinct observations
+  that share a source timestamp.  It is a strict non-negative integer.
 
 The default calendar delegates full-session/holiday truth to the existing
 ``ap.flatline_alarm.is_trading_day`` authority.  Early closes are supplied as
-an explicit schedule and the calendar can be replaced with an injected
+an explicit schedule.  Years absent from that authority fail closed as
+``calendar_unavailable``; the calendar can be replaced with an injected
 authority when the deployment has a richer exchange-calendar source.
 """
 
@@ -26,6 +30,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -39,7 +44,7 @@ ET = ZoneInfo("America/New_York")
 BOUNDED_UNIVERSE = frozenset({"SPY", "QQQ", "IWM", "AAPL", "GOOGL", "NVDA", "MSFT"})
 SUPPORTED_TIMEFRAMES = ("5m", "15m", "30m", "60m")
 TIMEFRAME_MINUTES = {"5m": 5, "15m": 15, "30m": 30, "60m": 60}
-STATE_SCHEMA_VERSION = "intraday_bar_state_v1"
+STATE_SCHEMA_VERSION = "intraday_bar_state_v2"
 DEFAULT_SOURCE_IDENTITY = "supplied_observation"
 DEFAULT_SOURCE_VERSION = "1"
 
@@ -51,6 +56,7 @@ DUPLICATE = "DUPLICATE"
 CONFLICTING_DUPLICATE = "CONFLICTING_DUPLICATE"
 LATE_COMPLETED_BUCKET = "LATE_COMPLETED_BUCKET"
 OUT_OF_ORDER_FORMING = "OUT_OF_ORDER_FORMING"
+AMBIGUOUS_EQUAL_TIMESTAMP = "AMBIGUOUS_EQUAL_TIMESTAMP"
 REJECTED = "REJECTED"
 NOOP = "NOOP"
 
@@ -104,6 +110,41 @@ def _metadata_string(value: Any, default: str) -> Optional[str]:
     return text or None
 
 
+def _source_sequence_value(value: Any) -> tuple[Optional[int], Optional[str]]:
+    """Normalize an authoritative, non-negative source order value.
+
+    Floats, booleans, and coercive numeric strings are rejected.  A source
+    sequence is ordering evidence, so silently changing its type or value is
+    unsafe even when ``int(value)`` would appear to work.
+    """
+    if value is None:
+        return None, None
+    if isinstance(value, bool):
+        return None, "source_sequence_malformed"
+    if isinstance(value, int):
+        return (value, None) if value >= 0 else (None, "source_sequence_malformed")
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        return int(value.strip()), None
+    return None, "source_sequence_malformed"
+
+
+def _source_sequence_from_mapping(data: Mapping[str, Any]) -> tuple[Optional[int], Optional[str]]:
+    """Read the canonical ``source_sequence``/``source_order`` alias pair."""
+    present = [key for key in ("source_sequence", "source_order") if key in data]
+    if not present:
+        return None, None
+    values: list[int] = []
+    for key in present:
+        parsed, error = _source_sequence_value(data.get(key))
+        if error is not None:
+            return None, error
+        if parsed is not None:
+            values.append(parsed)
+    if len(values) == 2 and values[0] != values[1]:
+        return None, "source_sequence_conflict"
+    return (values[0] if values else None), None
+
+
 def _canonical_json(value: Mapping[str, Any]) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
@@ -152,16 +193,37 @@ NYSE_EARLY_CLOSES_ET: dict[date, time] = {
 
 
 class NYSESessionCalendar:
-    """Compact default adapter over the repository's NYSE day authority."""
+    """Compact default adapter over the repository's NYSE day authority.
+
+    The underlying helper currently has a weekday fallback for years without
+    a holiday table.  This adapter requires an explicitly known year first so
+    that fallback cannot fabricate a tradable session.
+    """
 
     def __init__(self, *, early_closes: Optional[Mapping[date, time]] = None) -> None:
         self._early_closes = dict(early_closes or NYSE_EARLY_CLOSES_ET)
+
+    @staticmethod
+    def is_supported(session_date: date) -> bool:
+        """Return whether the repository has an authoritative calendar year."""
+        try:
+            from ap.flatline_alarm import NYSE_HOLIDAYS
+        except Exception:
+            return False
+        try:
+            return session_date.year in NYSE_HOLIDAYS
+        except Exception:
+            return False
 
     def session_for(self, session_date: date) -> Optional[TradingSession]:
         try:
             from ap.flatline_alarm import is_trading_day
         except Exception:
             # Unknown calendar truth is not permission to fabricate a session.
+            return None
+        if not self.is_supported(session_date):
+            # The repository helper intentionally falls back to weekdays for
+            # unknown years.  That fallback is not an exchange-session proof.
             return None
         try:
             if not bool(is_trading_day(session_date)):
@@ -195,6 +257,8 @@ class MarketObservation:
     source_identity: str = DEFAULT_SOURCE_IDENTITY
     source_version: str = DEFAULT_SOURCE_VERSION
     timeframe: Optional[str] = None
+    source_sequence: Optional[int] = None
+    source_order: Optional[int] = None
 
     def to_mapping(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -205,6 +269,10 @@ class MarketObservation:
         }
         if self.timeframe is not None:
             result["timeframe"] = self.timeframe
+        if self.source_sequence is not None:
+            result["source_sequence"] = self.source_sequence
+        if self.source_order is not None:
+            result["source_order"] = self.source_order
         if self.price is not None:
             result["price"] = self.price
         if self.open is not None:
@@ -242,6 +310,8 @@ class Bar:
     source_identity: str
     source_version: str
     state_schema_version: str = STATE_SCHEMA_VERSION
+    first_source_sequence: Optional[int] = None
+    last_source_sequence: Optional[int] = None
 
     @property
     def bar_id(self) -> str:
@@ -267,6 +337,8 @@ class Bar:
             "volume": self.volume,
             "first_source_timestamp": _iso_timestamp(self.first_source_timestamp),
             "last_source_timestamp": _iso_timestamp(self.last_source_timestamp),
+            "first_source_sequence": self.first_source_sequence,
+            "last_source_sequence": self.last_source_sequence,
             "source_identity": self.source_identity,
             "source_version": self.source_version,
             "state_schema_version": self.state_schema_version,
@@ -336,6 +408,7 @@ class SeedResult:
 class _NormalizedObservation:
     ticker: str
     timestamp: datetime
+    source_sequence: Optional[int]
     targets: tuple[str, ...]
     open: float
     high: float
@@ -376,6 +449,10 @@ class _MutableBar:
     volume: Optional[float]
     first_source_timestamp: datetime
     last_source_timestamp: datetime
+    first_source_sequence: Optional[int]
+    last_source_sequence: Optional[int]
+    current_timestamp_first_sequence: Optional[int]
+    current_timestamp_last_sequence: Optional[int]
     source_identities: set[str] = field(default_factory=set)
     source_versions: set[str] = field(default_factory=set)
     accepted_observation_count: int = 1
@@ -391,21 +468,43 @@ class _MutableBar:
             volume=observation.volume,
             first_source_timestamp=observation.timestamp,
             last_source_timestamp=observation.timestamp,
+            first_source_sequence=observation.source_sequence,
+            last_source_sequence=observation.source_sequence,
+            current_timestamp_first_sequence=observation.source_sequence,
+            current_timestamp_last_sequence=observation.source_sequence,
             source_identities={observation.source_identity},
             source_versions={observation.source_version},
         )
 
-    def apply(self, observation: _NormalizedObservation) -> None:
+    def apply(self, observation: _NormalizedObservation, *, same_timestamp: bool = False) -> None:
         self.high = max(self.high, observation.high)
         self.low = min(self.low, observation.low)
-        self.close = observation.close
+        if same_timestamp:
+            assert observation.source_sequence is not None
+            assert self.current_timestamp_first_sequence is not None
+            assert self.current_timestamp_last_sequence is not None
+            if observation.source_sequence < self.current_timestamp_first_sequence:
+                self.current_timestamp_first_sequence = observation.source_sequence
+                if self.first_source_timestamp == observation.timestamp:
+                    self.first_source_sequence = observation.source_sequence
+                self.open = observation.open
+            if observation.source_sequence > self.current_timestamp_last_sequence:
+                self.current_timestamp_last_sequence = observation.source_sequence
+                if self.last_source_timestamp == observation.timestamp:
+                    self.last_source_sequence = observation.source_sequence
+                self.close = observation.close
+        else:
+            self.close = observation.close
+            self.last_source_timestamp = observation.timestamp
+            self.last_source_sequence = observation.source_sequence
+            self.current_timestamp_first_sequence = observation.source_sequence
+            self.current_timestamp_last_sequence = observation.source_sequence
         if observation.volume is not None:
             self.volume = (
                 observation.volume
                 if self.volume is None
                 else self.volume + observation.volume
             )
-        self.last_source_timestamp = observation.timestamp
         self.source_identities.add(observation.source_identity)
         self.source_versions.add(observation.source_version)
         self.accepted_observation_count += 1
@@ -428,6 +527,8 @@ class _MutableBar:
             volume=self.volume,
             first_source_timestamp=self.first_source_timestamp,
             last_source_timestamp=self.last_source_timestamp,
+            first_source_sequence=self.first_source_sequence,
+            last_source_sequence=self.last_source_sequence,
             source_identity=self._provenance(self.source_identities),
             source_version=self._provenance(self.source_versions),
         )
@@ -439,6 +540,8 @@ class _MutableBar:
                 "_source_identities": sorted(self.source_identities),
                 "_source_versions": sorted(self.source_versions),
                 "_accepted_observation_count": self.accepted_observation_count,
+                "_current_timestamp_first_sequence": self.current_timestamp_first_sequence,
+                "_current_timestamp_last_sequence": self.current_timestamp_last_sequence,
             }
         )
         return result
@@ -471,6 +574,17 @@ def _session_from_calendar(calendar: Any, session_date: date) -> Optional[Tradin
         )
     except (TypeError, ValueError):
         return None
+
+
+def _calendar_year_supported(calendar: Any, session_date: date) -> Optional[bool]:
+    """Read optional explicit support metadata without weakening injected calendars."""
+    provider = getattr(calendar, "is_supported", None)
+    if not callable(provider):
+        return None
+    try:
+        return bool(provider(session_date))
+    except Exception:
+        return False
 
 
 class IntradayBarState:
@@ -529,6 +643,10 @@ class IntradayBarState:
         )
         if timestamp is None:
             return None, "timezone_aware_source_timestamp_required"
+
+        source_sequence, sequence_error = _source_sequence_from_mapping(data)
+        if sequence_error is not None:
+            return None, sequence_error
 
         if as_of is not None:
             cutoff = _parse_timestamp(as_of)
@@ -622,10 +740,12 @@ class IntradayBarState:
             if not source_id:
                 return None, "source_observation_id_malformed"
 
+        # Routing is consumption policy, not source-event identity.  Keeping
+        # targets out of this payload lets one source event be consumed by a
+        # new timeframe after another timeframe has already seen it.
         fingerprint_payload = {
             "ticker": ticker,
             "timestamp": _iso_timestamp(timestamp),
-            "targets": list(target_tuple),
             "open": opened,
             "high": high,
             "low": low,
@@ -634,10 +754,11 @@ class IntradayBarState:
             "source_identity": source_identity,
             "source_version": source_version,
             "source_observation_id": source_id,
+            "source_sequence": source_sequence,
         }
         fingerprint = _canonical_json(fingerprint_payload)
         identity_key = (
-            f"source_id|{ticker}|{source_id}"
+            f"source_id|{ticker}|{source_identity}|{source_version}|{source_id}"
             if source_id is not None
             else f"canonical|{fingerprint}"
         )
@@ -645,6 +766,7 @@ class IntradayBarState:
             _NormalizedObservation(
                 ticker=ticker,
                 timestamp=timestamp,
+                source_sequence=source_sequence,
                 targets=target_tuple,
                 open=opened,
                 high=high,
@@ -664,7 +786,8 @@ class IntradayBarState:
         local = timestamp.astimezone(ET)
         session = _session_from_calendar(self.calendar, local.date())
         if session is None:
-            return None, "non_trading_session"
+            supported = _calendar_year_supported(self.calendar, local.date())
+            return None, "calendar_unavailable" if supported is False else "non_trading_session"
         if local < session.open or local >= session.close:
             return None, "outside_rth"
         elapsed_seconds = (local - session.open).total_seconds()
@@ -707,14 +830,7 @@ class IntradayBarState:
                 return UpdateResult(status=REJECTED, reason=error)
 
             previous_fingerprint = self._seen_observations.get(normalized.identity_key)
-            if previous_fingerprint is not None:
-                if previous_fingerprint == normalized.fingerprint:
-                    return UpdateResult(
-                        status=DUPLICATE,
-                        ticker=normalized.ticker,
-                        source_timestamp=normalized.timestamp,
-                        reason="exact_observation_replay",
-                    )
+            if previous_fingerprint is not None and previous_fingerprint != normalized.fingerprint:
                 return UpdateResult(
                     status=CONFLICTING_DUPLICATE,
                     ticker=normalized.ticker,
@@ -751,10 +867,28 @@ class IntradayBarState:
             updates: list[TimeframeUpdate] = []
             accepted_any = False
             rejected_any = False
+            duplicate_any = False
             for timeframe in normalized.targets:
                 bucket = buckets[timeframe]
                 state_key = (normalized.ticker, timeframe)
                 active = self._forming.get(state_key)
+
+                # A source event is globally identified once, but each
+                # timeframe owns its own consumption ledger.  This permits a
+                # replay routed to 15m after 5m already consumed the event,
+                # while still preventing duplicate volume in 5m.
+                if normalized.identity_key in self._seen_by_state.get(state_key, set()):
+                    duplicate_any = True
+                    updates.append(
+                        TimeframeUpdate(
+                            timeframe,
+                            DUPLICATE,
+                            bar_id=active.bucket.bar_id if active is not None else None,
+                            reason="exact_observation_replay_for_timeframe",
+                        )
+                    )
+                    continue
+
                 completed_bar = self._completed.get((normalized.ticker, timeframe, bucket.bar_id))
                 if completed_bar is not None:
                     rejected_any = True
@@ -811,7 +945,40 @@ class IntradayBarState:
                             )
                         )
                         continue
-                    active.apply(normalized)
+                    if normalized.timestamp == active.last_source_timestamp:
+                        if (
+                            normalized.source_sequence is None
+                            or active.last_source_sequence is None
+                        ):
+                            rejected_any = True
+                            updates.append(
+                                TimeframeUpdate(
+                                    timeframe,
+                                    AMBIGUOUS_EQUAL_TIMESTAMP,
+                                    bar_id=active.bucket.bar_id,
+                                    reason="equal_source_timestamp_requires_source_sequence",
+                                )
+                            )
+                            continue
+                        if normalized.source_sequence == active.last_source_sequence:
+                            rejected_any = True
+                            updates.append(
+                                TimeframeUpdate(
+                                    timeframe,
+                                    AMBIGUOUS_EQUAL_TIMESTAMP,
+                                    bar_id=active.bucket.bar_id,
+                                    reason="equal_source_timestamp_sequence_collision",
+                                )
+                            )
+                            continue
+                        # Equal source timestamps are safe to merge in either
+                        # delivery order when both events carry authoritative
+                        # sequence values.  _MutableBar canonicalizes open and
+                        # close by sequence while high/low/volume are
+                        # commutative.
+                        active.apply(normalized, same_timestamp=True)
+                    else:
+                        active.apply(normalized)
                     accepted_any = True
                     updates.append(TimeframeUpdate(timeframe, ACCEPTED, bar_id=active.bucket.bar_id))
                     continue
@@ -840,22 +1007,39 @@ class IntradayBarState:
                             normalized.identity_key
                         )
 
-            if accepted_any and rejected_any:
+            statuses = {item.status for item in updates}
+            if accepted_any and (rejected_any or duplicate_any):
                 result_status = "PARTIAL"
             elif accepted_any:
                 result_status = ACCEPTED
-            elif updates and all(item.status == LATE_COMPLETED_BUCKET for item in updates):
+            elif duplicate_any and statuses == {DUPLICATE}:
+                result_status = DUPLICATE
+            elif statuses == {LATE_COMPLETED_BUCKET}:
                 result_status = LATE_COMPLETED_BUCKET
-            elif updates and all(item.status == OUT_OF_ORDER_FORMING for item in updates):
+            elif statuses == {OUT_OF_ORDER_FORMING}:
                 result_status = OUT_OF_ORDER_FORMING
+            elif statuses == {AMBIGUOUS_EQUAL_TIMESTAMP}:
+                result_status = AMBIGUOUS_EQUAL_TIMESTAMP
             else:
                 result_status = REJECTED
+            result_reason: Optional[str] = None
+            if accepted_any and (rejected_any or duplicate_any):
+                result_reason = "one_or_more_timeframes_rejected"
+            elif result_status == DUPLICATE:
+                result_reason = "exact_observation_replay"
+            elif result_status == AMBIGUOUS_EQUAL_TIMESTAMP:
+                result_reason = "equal_source_timestamp_requires_authoritative_order"
+            elif result_status in {LATE_COMPLETED_BUCKET, OUT_OF_ORDER_FORMING, REJECTED}:
+                result_reason = next(
+                    (item.reason for item in updates if item.reason is not None),
+                    None,
+                )
             return UpdateResult(
                 status=result_status,
                 ticker=normalized.ticker,
                 source_timestamp=normalized.timestamp,
                 accepted=accepted_any,
-                reason=("one_or_more_timeframes_rejected" if accepted_any and rejected_any else None),
+                reason=result_reason,
                 timeframes=tuple(updates),
             )
 
@@ -923,9 +1107,122 @@ class IntradayBarState:
     # ------------------------------------------------------------------
     # One-shot seed and explicit completed-bar loading
     # ------------------------------------------------------------------
+    def _prepare_seed_rows(
+        self,
+        rows: list[Any],
+    ) -> tuple[list[Any], list[Mapping[str, Any]], Optional[str]]:
+        """Validate and canonically order a seed before mutating state."""
+        observations: list[tuple[_NormalizedObservation, Any]] = []
+        completed: list[tuple[Bar, Mapping[str, Any]]] = []
+        for index, row in enumerate(rows):
+            if self._looks_like_completed_bar(row):
+                bar, error = self._bar_from_mapping(row, expected_status=COMPLETED)
+                if bar is None:
+                    return [], [], f"seed_row_{index}:{error or 'completed_bar_invalid'}"
+                completed.append((bar, row))
+                continue
+            normalized, error = self._normalize_observation(row)
+            if normalized is None:
+                return [], [], f"seed_row_{index}:{error or 'observation_invalid'}"
+            for timeframe in normalized.targets:
+                _, bucket_error = self._bucket_for(
+                    normalized.ticker,
+                    timeframe,
+                    normalized.timestamp,
+                )
+                if bucket_error is not None:
+                    return [], [], f"seed_row_{index}:{bucket_error}"
+            observations.append((normalized, row))
+
+        if observations and completed:
+            return [], [], "seed_mixes_observation_and_completed_bar_rows"
+
+        if completed:
+            by_identity: dict[tuple[str, str, str], Bar] = {}
+            by_row: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+            for bar, row in completed:
+                key = (bar.ticker, bar.timeframe, bar.bar_id)
+                prior = by_identity.get(key)
+                if prior is not None:
+                    if prior.to_dict() != bar.to_dict():
+                        return [], [], "seed_completed_bar_identity_conflict"
+                    continue
+                by_identity[key] = bar
+                by_row[key] = row
+            ordered_keys = sorted(
+                by_identity,
+                key=lambda key: (
+                    key[0],
+                    key[1],
+                    by_identity[key].bucket_start,
+                    key[2],
+                ),
+            )
+            return [], [by_row[key] for key in ordered_keys], None
+
+        # First reject source-id reuse with a changed payload.  This is done
+        # before sorting so a malformed permutation cannot partially mutate
+        # the state or make the conflict result order-dependent.
+        fingerprints: dict[str, str] = {}
+        for normalized, _ in observations:
+            prior = fingerprints.get(normalized.identity_key)
+            if prior is not None and prior != normalized.fingerprint:
+                return [], [], "seed_source_identity_conflict"
+            fingerprints[normalized.identity_key] = normalized.fingerprint
+
+        # Exact duplicate rows with the same routing are redundant seed input;
+        # collapse them before the canonical ordering proof.  The same event
+        # with different routing remains present so another timeframe can
+        # consume it.
+        unique: list[tuple[_NormalizedObservation, Any]] = []
+        seen_routes: set[tuple[str, str, tuple[str, ...]]] = set()
+        for normalized, row in observations:
+            route_key = (
+                normalized.identity_key,
+                normalized.fingerprint,
+                normalized.targets,
+            )
+            if route_key in seen_routes:
+                continue
+            seen_routes.add(route_key)
+            unique.append((normalized, row))
+
+        by_timestamp: dict[datetime, dict[str, _NormalizedObservation]] = {}
+        for normalized, _ in unique:
+            by_timestamp.setdefault(normalized.timestamp, {})[
+                normalized.identity_key
+            ] = normalized
+        for timestamp, events in by_timestamp.items():
+            if len(events) < 2:
+                continue
+            if any(item.source_sequence is None for item in events.values()):
+                return [], [], (
+                    "seed_equal_source_timestamp_requires_source_sequence"
+                    f":{_iso_timestamp(timestamp)}"
+                )
+            sequences = [item.source_sequence for item in events.values()]
+            if len(set(sequences)) != len(sequences):
+                return [], [], (
+                    "seed_equal_source_timestamp_sequence_collision"
+                    f":{_iso_timestamp(timestamp)}"
+                )
+
+        unique.sort(
+            key=lambda item: (
+                item[0].timestamp,
+                item[0].source_sequence is None,
+                item[0].source_sequence if item[0].source_sequence is not None else -1,
+                item[0].identity_key,
+                item[0].fingerprint,
+                item[0].targets,
+            )
+        )
+        return [row for _, row in unique], [], None
+
     def seed_once(
         self,
-        seed_source: Iterable[Mapping[str, Any]] | Callable[[], Iterable[Mapping[str, Any]]],
+        seed_source: Iterable[Mapping[str, Any] | MarketObservation]
+        | Callable[[], Iterable[Mapping[str, Any] | MarketObservation]],
         *,
         finalize_through: Optional[Any] = None,
     ) -> SeedResult:
@@ -956,18 +1253,26 @@ class IntradayBarState:
             except Exception as exc:
                 return SeedResult(REJECTED, reason=f"seed_source_error:{type(exc).__name__}")
 
+            observation_rows, completed_rows, preparation_error = self._prepare_seed_rows(rows_list)
+            if preparation_error is not None:
+                return SeedResult(
+                    REJECTED,
+                    rows_seen=len(rows_list),
+                    rejected_rows=len(rows_list),
+                    reason=preparation_error,
+                )
+
             results: list[UpdateResult] = []
             accepted_rows = 0
             rejected_rows = 0
-            for row in rows_list:
-                if self._looks_like_completed_bar(row):
-                    loaded = self._load_completed_bar(row)
-                    results.append(loaded)
-                    if loaded.status == ACCEPTED:
-                        accepted_rows += 1
-                    else:
-                        rejected_rows += 1
-                    continue
+            for row in completed_rows:
+                loaded = self._load_completed_bar(row)
+                results.append(loaded)
+                if loaded.status == ACCEPTED:
+                    accepted_rows += 1
+                else:
+                    rejected_rows += 1
+            for row in observation_rows:
                 result = self.ingest(row)
                 results.append(result)
                 if result.accepted:
@@ -1015,6 +1320,24 @@ class IntradayBarState:
         last_ts = _parse_timestamp(row.get("last_source_timestamp"))
         if bucket_start is None or bucket_end is None or first_ts is None or last_ts is None:
             return None, "bar_timestamps_malformed_or_naive"
+        first_sequence, sequence_error = _source_sequence_value(
+            row.get("first_source_sequence")
+            if "first_source_sequence" in row
+            else None
+        )
+        if sequence_error is not None:
+            return None, sequence_error
+        last_sequence, sequence_error = _source_sequence_value(
+            row.get("last_source_sequence")
+            if "last_source_sequence" in row
+            else None
+        )
+        if sequence_error is not None:
+            return None, sequence_error
+        if first_ts == last_ts and (
+            (first_sequence is None) != (last_sequence is None)
+        ):
+            return None, "bar_source_sequence_malformed"
         values = tuple(
             _finite_number(row.get(key), positive=True)
             for key in ("open", "high", "low", "close")
@@ -1060,6 +1383,8 @@ class IntradayBarState:
                 volume=volume,
                 first_source_timestamp=first_ts,
                 last_source_timestamp=last_ts,
+                first_source_sequence=first_sequence,
+                last_source_sequence=last_sequence,
                 source_identity=source_identity,
                 source_version=source_version,
             ),
@@ -1247,6 +1572,28 @@ class IntradayBarState:
                     raise ValueError("snapshot_forming_count_malformed")
                 if accepted_count < 1:
                     raise ValueError("snapshot_forming_count_malformed")
+                current_first_sequence, sequence_error = _source_sequence_value(
+                    row.get("_current_timestamp_first_sequence")
+                    if "_current_timestamp_first_sequence" in row
+                    else (
+                        bar.first_source_sequence
+                        if bar.first_source_timestamp == bar.last_source_timestamp
+                        else bar.last_source_sequence
+                    )
+                )
+                if sequence_error is not None:
+                    raise ValueError(sequence_error)
+                current_last_sequence, sequence_error = _source_sequence_value(
+                    row.get("_current_timestamp_last_sequence")
+                    if "_current_timestamp_last_sequence" in row
+                    else bar.last_source_sequence
+                )
+                if sequence_error is not None:
+                    raise ValueError(sequence_error)
+                if (
+                    current_first_sequence is None
+                ) != (current_last_sequence is None):
+                    raise ValueError("snapshot_forming_sequence_malformed")
                 state._forming[key] = _MutableBar(
                     bucket=_Bucket(
                         ticker=bar.ticker,
@@ -1262,6 +1609,10 @@ class IntradayBarState:
                     volume=bar.volume,
                     first_source_timestamp=bar.first_source_timestamp,
                     last_source_timestamp=bar.last_source_timestamp,
+                    first_source_sequence=bar.first_source_sequence,
+                    last_source_sequence=bar.last_source_sequence,
+                    current_timestamp_first_sequence=current_first_sequence,
+                    current_timestamp_last_sequence=current_last_sequence,
                     source_identities=ids,
                     source_versions=versions,
                     accepted_observation_count=accepted_count,
@@ -1271,6 +1622,7 @@ class IntradayBarState:
 
 __all__ = [
     "ACCEPTED",
+    "AMBIGUOUS_EQUAL_TIMESTAMP",
     "AdvanceResult",
     "Bar",
     "BOUNDED_UNIVERSE",

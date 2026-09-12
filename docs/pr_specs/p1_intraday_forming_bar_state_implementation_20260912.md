@@ -38,15 +38,33 @@ Actual runtime subscription/wiring remains a separate PR.
 - aware `timestamp`, `source_timestamp`, or `time`;
 - either a positive finite `price`/`last` value or a complete valid OHLC;
 - optional `timeframe`/`timeframes` target restriction;
-- optional `source_observation_id`, `source_identity`, and `source_version`;
+- optional `source_observation_id`, `source_identity`, `source_version`, and
+  strict non-negative `source_sequence`/`source_order`;
 - optional non-negative `volume` only when `volume_kind="incremental"`.
 
 Volume is therefore an incremental contribution associated with one unique
 source observation. It is summed once after duplicate identity checks. Missing
 volume remains `None`; cumulative volume is rejected rather than guessed.
 
-For a supplied OHLC observation, the exact merge is: first `open`, maximum
-`high`, minimum `low`, newest accepted `close`, and sum of unique incremental
+Source event identity is independent of timeframe routing. An explicit event
+identity is `(ticker, source namespace, source version, source observation
+ID)`; the canonical fallback contains the normalized event payload but never
+the requested timeframe set. `_seen_by_state` records per-timeframe
+consumption, so a replay can fill a previously untouched timeframe without
+double-counting a timeframe that already consumed the event. Reusing an event
+identity with a changed payload is a conflicting duplicate, and the source
+namespace/version prevents provider-local IDs from colliding.
+
+Distinct observations with the same source timestamp require an authoritative
+non-negative source sequence. With that evidence, equal-timestamp OHLC and
+incremental volume merge commutatively and open/close are selected by source
+sequence. Without it, the update is `AMBIGUOUS_EQUAL_TIMESTAMP` and the bar is
+not mutated. Source sequence bounds and the current equal-timestamp tie state
+are included in snapshots.
+
+For a supplied OHLC observation, the exact merge is: chronologically first
+`open`, maximum `high`, minimum `low`, chronologically latest `close` (with
+source sequence resolving equal timestamps), and sum of unique incremental
 volume contributions.
 
 ## Lifecycle and safety contract
@@ -62,23 +80,35 @@ volume contributions.
 - Exact source identity replays return `DUPLICATE`; a reused source ID with a
   different payload returns `CONFLICTING_DUPLICATE`.
 - Without a source ID, the canonical identity includes ticker, source time,
-  OHLC/price, volume, provenance, and target timeframes. Equal prices at
-  different source times are distinct observations.
+  OHLC/price, volume, and provenance, but not target timeframes. Equal prices
+  at different source times are distinct observations.
+- The default calendar rejects years absent from the repository's explicit
+  NYSE year table as `calendar_unavailable`; injected calendars remain the
+  extension point for richer authoritative schedules.
 - A backward source timestamp in the same forming bucket returns
   `OUT_OF_ORDER_FORMING` and does not mutate state.
 - An explicit `as_of` rejects a source timestamp later than that cutoff as a
   future observation. No implicit current-time decision is made.
 - `seed_once()` invokes a supplied iterable/callback at most once. Incremental
   ingestion never asks the seed source for history.
+- `seed_once()` validates all rows and sorts source observations by timestamp,
+  authoritative sequence, and canonical identity before the first mutation;
+  equal-timestamp rows without a sequence are rejected. Completed-bar seed
+  rows are sorted by ticker, timeframe, and bucket start as well.
 - `snapshot()`/`from_snapshot()` provide bounded reconstruction without a new
   database table. The snapshot includes completed bars, the current forming
-  bars, and duplicate identities needed for idempotent restart replay.
+  bars, source-sequence tie state, and duplicate identities needed for
+  idempotent restart replay.
 
 ## Verification
 
 `tests/test_p1_intraday_forming_bar_state.py` exercises the required basic,
 boundary, early-close, malformed-input, duplicate, late/out-of-order,
 restart, multi-ticker, seed-call-count, input-immutability, no-classifier, and
-no-money-path cases. The test imports the production module directly so the
-focused suite does not initialize the repository's unrelated database-backed
-package guards.
+no-money-path cases, plus equal-timestamp order/replay, routing-independent
+identity, namespace isolation, canonical seed permutations, sequence
+snapshotting, and unknown-year calendar fail-closed behavior. The file is in
+the shared `P0_TEST_INVENTORY` used by both exact-head and genuine
+`pull_request` merge-ref jobs. The test imports the production module directly
+so the focused suite does not initialize the repository's unrelated
+database-backed package guards.
