@@ -1,0 +1,108 @@
+name: P1 435-B Breach Market Structure
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "ap/intelligence_breach_market_structure.py"
+      - "tests/test_p0_435b_breach_market_structure.py"
+      - "docs/pr_specs/p1_435b_breach_market_structure_20260911.md"
+      - ".github/workflows/p1_435b_breach_market_structure.yml"
+
+jobs:
+  exact-head:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: intelligence_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d intelligence_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Assert exact PR head
+        run: |
+          expected="${{ github.event.pull_request.head.sha }}"
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$expected"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install focused dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas
+
+      - name: Run 435-B plus canonical PIT/FVG tests
+        env:
+          PGSSLMODE: "disable"
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
+        run: |
+          python -m pytest \
+            tests/test_p0_435b_breach_market_structure.py \
+            tests/test_p0_435a_pit_market_data.py \
+            tests/test_p1_fvg_telemetry.py \
+            tests/test_position_score_profile.py \
+            -v --tb=short
+
+  merge-ref:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: intelligence_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d intelligence_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+
+      - name: Assert synthetic merge ref
+        run: |
+          expected="${{ github.sha }}"
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$expected"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install focused dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas
+
+      - name: Run identical 435-B plus canonical PIT/FVG tests
+        env:
+          PGSSLMODE: "disable"
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
+        run: |
+          python -m pytest \
+            tests/test_p0_435b_breach_market_structure.py \
+            tests/test_p0_435a_pit_market_data.py \
+            tests/test_p1_fvg_telemetry.py \
+            tests/test_position_score_profile.py \
+            -v --tb=short
