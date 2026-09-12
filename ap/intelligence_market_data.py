@@ -192,22 +192,80 @@ def _aggregate_calendar(
 def _completed_intraday(
     rows: list[dict[str, Any]], *, bucket_minutes: int, now: datetime
 ) -> list[dict[str, Any]]:
+    """Aggregate only clock-complete HTF buckets with every 15m constituent."""
     from ap.fvg_telemetry import aggregate_bars
-    aggregated = aggregate_bars(rows, bucket_minutes=bucket_minutes)
-    completed = []
+
+    if (
+        now.tzinfo is None
+        or now.utcoffset() is None
+        or bucket_minutes <= 0
+        or bucket_minutes % 15 != 0
+    ):
+        return []
+
     now_et = now.astimezone(ET)
-    for row in aggregated:
+    groups: dict[tuple[Any, int], dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_time = str(row.get("time") or row.get("timestamp") or "")
         try:
-            start = datetime.fromisoformat(str(row.get("time") or "").replace("Z", "+00:00"))
-            if start.tzinfo is None:
-                start = start.replace(tzinfo=ET)
-            start_et = start.astimezone(ET)
-            session_close = start_et.replace(hour=16, minute=0, second=0, microsecond=0)
-            bucket_end = min(start_et + timedelta(minutes=bucket_minutes), session_close)
-            if now_et >= bucket_end:
-                completed.append(row)
+            opened = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
         except ValueError:
             continue
+        if opened.tzinfo is None or opened.utcoffset() is None:
+            continue
+
+        local = opened.astimezone(ET)
+        session_open = local.replace(hour=9, minute=30, second=0, microsecond=0)
+        session_close = local.replace(hour=16, minute=0, second=0, microsecond=0)
+        if local < session_open or local >= session_close:
+            continue
+        offset_minutes = int((local - session_open).total_seconds() // 60)
+        if offset_minutes % 15 != 0:
+            continue
+
+        bucket_index = offset_minutes // bucket_minutes
+        bucket_start = session_open + timedelta(minutes=bucket_index * bucket_minutes)
+        bucket_end = min(
+            bucket_start + timedelta(minutes=bucket_minutes), session_close
+        )
+        if now_et < bucket_end:
+            continue
+
+        key = (local.date(), bucket_index)
+        group = groups.setdefault(
+            key,
+            {
+                "start": bucket_start,
+                "end": bucket_end,
+                "rows": {},
+                "duplicate": False,
+            },
+        )
+        row_map = group["rows"]
+        if local in row_map:
+            group["duplicate"] = True
+        row_map[local] = row
+
+    completed: list[dict[str, Any]] = []
+    for group in sorted(groups.values(), key=lambda item: item["start"]):
+        if group["duplicate"]:
+            continue
+        bucket_start = group["start"]
+        bucket_end = group["end"]
+        expected_count = int((bucket_end - bucket_start).total_seconds() // (15 * 60))
+        expected_times = [
+            bucket_start + timedelta(minutes=15 * idx)
+            for idx in range(expected_count)
+        ]
+        row_map = group["rows"]
+        if set(row_map) != set(expected_times):
+            continue
+        bucket_rows = [row_map[stamp] for stamp in expected_times]
+        aggregated = aggregate_bars(bucket_rows, bucket_minutes=bucket_minutes)
+        if len(aggregated) == 1:
+            completed.append(aggregated[0])
     return completed
 
 
