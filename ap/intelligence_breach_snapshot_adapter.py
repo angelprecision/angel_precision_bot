@@ -906,11 +906,10 @@ def _frozen_payload_integrity_errors(payload: Mapping[str, Any]) -> list[str]:
     if not isinstance(identity, Mapping):
         return ["job_payload_identity_missing"]
 
-    # Recreate the #625 proof input using the frozen status field.  The worker
-    # must never infer a new status or parent authority from mutable aliases.
-    proof_source = dict(payload)
-    proof_source["status"] = payload.get("envelope_status")
-    proof_ok, proof_errors = _verify_envelope_assembly_proof(proof_source)
+    # Verify the frozen payload directly.  The shared #625 helper accepts the
+    # persisted ``envelope_status`` spelling and never infers parent authority
+    # from mutable aliases.
+    proof_ok, proof_errors = _verify_envelope_assembly_proof(payload)
     if not proof_ok:
         errors.extend(f"job_payload_{error}" for error in proof_errors)
 

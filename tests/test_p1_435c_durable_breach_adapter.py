@@ -868,6 +868,8 @@ class TestDispatchAndWorkerValidation:
         assert payload["payload_kind"] == FROZEN_BREACH_PAYLOAD_KIND
         assert payload["adapter_version"] == ADAPTER_VERSION
         assert payload["assembly_version"] == ASSEMBLY_VERSION
+        assert "status" not in payload
+        assert hash_breach_assembly_proof(payload) == payload["assembly_proof_hash"]
 
     def test_worker_fails_closed_on_identity_mismatch(self):
         env = _inject_authoritative_parents(_build_complete_envelope())

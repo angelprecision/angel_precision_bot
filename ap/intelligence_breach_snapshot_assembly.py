@@ -1403,15 +1403,21 @@ def hash_breach_assembly_proof(envelope: Mapping[str, Any]) -> str:
     lineage, missing phases, safety flags, and the already-computed #625
     identity/input hashes.  It deliberately excludes evidence bodies and all
     worker/collection/current timestamps; those are covered by the existing
-    input hash or are not assembly authority.
+    input hash or are not assembly authority.  The final assembly envelope
+    carries status as ``status``; a frozen persisted payload carries the same
+    value as ``envelope_status``.  Supporting both shapes keeps direct replay
+    verification equivalent to the worker's verification path.
     """
     if not isinstance(envelope, Mapping):
         raise TypeError("BREACH assembly proof input must be a mapping")
+    status = envelope.get("status") if "status" in envelope else envelope.get(
+        "envelope_status"
+    )
     proof_input = {
         "assembly_version": ASSEMBLY_VERSION,
         "identity_hash": envelope.get("identity_hash"),
         "input_hash": envelope.get("input_hash"),
-        "status": envelope.get("status"),
+        "status": status,
         "candidate_parent_snapshot_ids": envelope.get(
             "candidate_parent_snapshot_ids"
         ),
