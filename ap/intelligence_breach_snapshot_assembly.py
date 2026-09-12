@@ -1396,6 +1396,39 @@ def hash_breach_identity(identity: Mapping[str, Any]) -> str:
     return hash_breach_snapshot_input(identity, {}, parent_snapshot_ids={})
 
 
+def _assembly_status_value(envelope: Mapping[str, Any]) -> str:
+    """Return one unambiguous status value for either persisted shape."""
+    has_status = "status" in envelope
+    has_envelope_status = "envelope_status" in envelope
+    if not has_status and not has_envelope_status:
+        raise ValueError("breach_assembly_status_missing")
+
+    def _normalize(value: Any) -> str:
+        if type(value) is not str:
+            raise ValueError("breach_assembly_status_alias_invalid_type")
+        normalized = value.strip().upper()
+        if not normalized:
+            raise ValueError("breach_assembly_status_missing")
+        return normalized
+
+    status = _normalize(envelope.get("status")) if has_status else None
+    envelope_status = (
+        _normalize(envelope.get("envelope_status"))
+        if has_envelope_status
+        else None
+    )
+    if (
+        status is not None
+        and envelope_status is not None
+        and status != envelope_status
+    ):
+        raise ValueError("breach_assembly_status_alias_conflict")
+    if status is not None:
+        return status
+    assert envelope_status is not None
+    return envelope_status
+
+
 def hash_breach_assembly_proof(envelope: Mapping[str, Any]) -> str:
     """Hash the final #625 assembly authority fields.
 
@@ -1406,13 +1439,12 @@ def hash_breach_assembly_proof(envelope: Mapping[str, Any]) -> str:
     input hash or are not assembly authority.  The final assembly envelope
     carries status as ``status``; a frozen persisted payload carries the same
     value as ``envelope_status``.  Supporting both shapes keeps direct replay
-    verification equivalent to the worker's verification path.
+    verification equivalent to the worker's verification path.  If both
+    aliases are present, they must normalize to the same exact string.
     """
     if not isinstance(envelope, Mapping):
         raise TypeError("BREACH assembly proof input must be a mapping")
-    status = envelope.get("status") if "status" in envelope else envelope.get(
-        "envelope_status"
-    )
+    status = _assembly_status_value(envelope)
     proof_input = {
         "assembly_version": ASSEMBLY_VERSION,
         "identity_hash": envelope.get("identity_hash"),

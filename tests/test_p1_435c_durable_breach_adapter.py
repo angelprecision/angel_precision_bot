@@ -637,6 +637,61 @@ class TestEnqueueHashAuthority:
 
 
 class TestAssemblyProofAuthority:
+    def test_canonical_envelope_status_alias_replays(self):
+        env = _inject_authoritative_parents(_build_complete_envelope())
+        assert "status" in env
+        assert "envelope_status" not in env
+        assert hash_breach_assembly_proof(env) == env["assembly_proof_hash"]
+
+    def test_frozen_payload_status_alias_replays(self):
+        env = _inject_authoritative_parents(_build_complete_envelope())
+        enqueue_breach_snapshot_job(env)
+        payload = build_breach_snapshot_kwargs(next(iter(_MEMORY_JOBS.values())))[
+            "payload"
+        ]
+        assert "status" not in payload
+        assert payload["envelope_status"] == "COMPLETE"
+        assert hash_breach_assembly_proof(payload) == payload["assembly_proof_hash"]
+
+    @pytest.mark.parametrize("status", ["PARTIAL", "COMPLETE"])
+    def test_equal_status_aliases_replay(self, status):
+        env = _inject_authoritative_parents(_build_complete_envelope())
+        if status == "PARTIAL":
+            env = _build_complete_envelope()
+        env["envelope_status"] = status
+        env["status"] = status
+        # Recompute the proof for the intentionally equivalent dual-alias
+        # shape; the helper must not select one alias by preference.
+        env["assembly_proof_hash"] = hash_breach_assembly_proof(env)
+        assert hash_breach_assembly_proof(env) == env["assembly_proof_hash"]
+
+    @pytest.mark.parametrize(
+        ("status", "envelope_status"),
+        [("PARTIAL", "COMPLETE"), ("COMPLETE", "PARTIAL")],
+    )
+    def test_conflicting_status_aliases_fail_closed(
+        self, status, envelope_status
+    ):
+        env = _build_complete_envelope()
+        env["status"] = status
+        env["envelope_status"] = envelope_status
+        with pytest.raises(
+            ValueError, match="breach_assembly_status_alias_conflict"
+        ):
+            hash_breach_assembly_proof(env)
+
+        result = enqueue_breach_snapshot_job(env)
+        assert result["ok"] is False
+        assert result["error_code"] == "BREACH_ENVELOPE_ASSEMBLY_PROOF_MISMATCH"
+        assert _MEMORY_JOBS == {}
+        assert _MEMORY_SNAPSHOTS == {}
+
+    def test_missing_status_alias_fails_closed(self):
+        env = _build_complete_envelope()
+        env.pop("status")
+        with pytest.raises(ValueError, match="breach_assembly_status_missing"):
+            hash_breach_assembly_proof(env)
+
     def test_proof_is_replay_stable_and_excludes_collection_time(self):
         env = _inject_authoritative_parents(_build_complete_envelope())
         proof = env["assembly_proof_hash"]
@@ -914,6 +969,26 @@ class TestDispatchAndWorkerValidation:
         mutator(job["payload"])
         with pytest.raises(RuntimeError, match="BREACH_JOB_IDENTITY_MISMATCH"):
             build_breach_snapshot_kwargs(job)
+
+    def test_worker_rejects_conflicting_partial_status_aliases(self):
+        env = _build_complete_envelope()
+        assert env["status"] == "PARTIAL"
+        enqueue_breach_snapshot_job(env)
+        job = copy.deepcopy(next(iter(_MEMORY_JOBS.values())))
+        job["payload"]["status"] = "PARTIAL"
+        job["payload"]["envelope_status"] = "COMPLETE"
+        with pytest.raises(RuntimeError, match="BREACH_JOB_IDENTITY_MISMATCH"):
+            build_breach_snapshot_kwargs(job)
+        assert _MEMORY_SNAPSHOTS == {}
+
+    def test_worker_accepts_equivalent_complete_status_aliases(self):
+        env = _inject_authoritative_parents(_build_complete_envelope())
+        enqueue_breach_snapshot_job(env)
+        job = copy.deepcopy(next(iter(_MEMORY_JOBS.values())))
+        job["payload"]["status"] = "COMPLETE"
+        job["payload"]["envelope_status"] = "COMPLETE"
+        kwargs = build_breach_snapshot_kwargs(job)
+        assert kwargs["status"] == "COMPLETE"
 
 
 # ---------------------------------------------------------------------------
