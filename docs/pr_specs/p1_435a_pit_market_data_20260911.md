@@ -81,6 +81,8 @@ For `now is None`, preserve the existing live/TTL behavior, but interval identit
 
 A cached series may satisfy an as-of request when its latest completed-bar coverage reaches the RTH close boundary that should exist at that exact as-of time. A successful exact-bucket provider response may also be reused when no current-session RTH close is expected yet, such as 09:32 ET for a 5-minute request. Once an RTH bar should exist, successful-but-stale data must not be blessed by cache authority. A transport/provider exception must never be marked as authoritative empty and must remain retryable.
 
+After provider normalization and completed-bar filtering, BREACH evidence must expose explicit interval coverage metadata: `coverage_complete`, `latest_expected_close`, `latest_observed_close`, `status`, and whether the response is authoritative. If the expected RTH close is missing, older returned bars are `STALE` and no returned completed bars are `MISSING`; neither state is authoritative for the latest interval condition. Older bars may remain available for 1h/4h structure, but they must not be indistinguishable from complete 5m/15m evidence. A later refetch may replace the stale result with `COMPLETE` coverage.
+
 ### C. Exclude incomplete/future candles
 
 When an as-of timestamp is supplied:
@@ -145,6 +147,7 @@ Minimum matrix:
 14. Two reads of the same exact PIT bucket reuse a successful response when no current-session RTH close is expected yet.
 15. A successful but stale in-session PIT response is not reused after the expected RTH close exists.
 16. A provider/transport failure returning no data is not cached as authoritative empty and is retried on the next request.
+17. The first successful but stale in-session response exposes `STALE`/`MISSING` coverage and recovers to `COMPLETE` on a later provider response.
 
 ## Required fail-first evidence
 

@@ -512,6 +512,54 @@ def test_successful_but_stale_in_session_pit_response_is_not_reused(monkeypatch)
     assert len(broker.session.calls) == 2
 
 
+def test_breach_exposes_stale_first_pit_response_and_recovers(monkeypatch):
+    # 10:07 ET: 10:00-10:05 is the latest completed 5m candle that should
+    # exist.  The first provider response stops at 10:00 ET.
+    trigger = datetime(2026, 9, 11, 14, 7, tzinfo=timezone.utc)
+    stale_5m = [_bar(datetime(2026, 9, 11, 13, 55, tzinfo=timezone.utc))]
+    complete_5m = stale_5m + [
+        _bar(datetime(2026, 9, 11, 14, 0, tzinfo=timezone.utc))
+    ]
+    complete_15m = [_bar(datetime(2026, 9, 11, 13, 45, tzinfo=timezone.utc))]
+    calls_by_interval: dict[str, int] = {}
+
+    def responder(params, _call_number):
+        interval = params["interval"]
+        calls_by_interval[interval] = calls_by_interval.get(interval, 0) + 1
+        if interval == "5min":
+            return stale_5m if calls_by_interval[interval] == 1 else complete_5m
+        if interval == "15min":
+            return complete_15m
+        raise AssertionError(interval)
+
+    broker = _Broker(responder)
+    monkeypatch.setattr(
+        fvg, "_resolve_base_url", lambda _broker: "https://api.tradier.com"
+    )
+    monkeypatch.setattr(imd, "_history", lambda *_a, **_k: [])
+
+    signal = _breach_signal(trigger_crossed_at=trigger.isoformat())
+    first = imd.collect_point_in_time_context(signal, broker=broker, phase="BREACH")
+    first_coverage = first["data_sources"]["coverage"]["5m"]
+
+    assert first["as_of"] == trigger.isoformat()
+    assert first_coverage["status"] == "STALE"
+    assert first_coverage["coverage_complete"] is False
+    assert first_coverage["authoritative"] is False
+    assert first_coverage["latest_expected_close"] == "2026-09-11T10:05:00-04:00"
+    assert first_coverage["latest_observed_close"] == "2026-09-11T10:00:00-04:00"
+    assert len(first["data_sources"]["candles"]["5m"]) == 1
+
+    second = imd.collect_point_in_time_context(signal, broker=broker, phase="BREACH")
+    second_coverage = second["data_sources"]["coverage"]["5m"]
+
+    assert second_coverage["status"] == "COMPLETE"
+    assert second_coverage["coverage_complete"] is True
+    assert second_coverage["authoritative"] is True
+    assert len(second["data_sources"]["candles"]["5m"]) == 2
+    assert calls_by_interval == {"15min": 1, "5min": 2}
+
+
 def test_failed_pit_request_is_not_cached_as_authoritative_empty(monkeypatch):
     def responder(_params, _call_number):
         raise RuntimeError("provider down")

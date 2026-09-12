@@ -354,6 +354,66 @@ def _filter_completed_bars(
     return completed
 
 
+def _describe_pit_coverage(
+    rows: list[dict[str, Any]],
+    *,
+    interval_minutes: int,
+    as_of: datetime,
+    source: str,
+    authoritative_source: bool,
+) -> dict[str, Any]:
+    """Expose whether filtered bars reach the expected RTH close boundary."""
+    from ap.fvg_telemetry import _required_rth_close
+
+    expected_close = _required_rth_close(as_of, interval_minutes=interval_minutes)
+    interval = timedelta(minutes=interval_minutes)
+    latest_close: Optional[datetime] = None
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        raw_time = str(row.get("time") or row.get("timestamp") or "")
+        try:
+            opened = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if opened.tzinfo is None or opened.utcoffset() is None:
+            continue
+        close = opened + interval
+        if close > as_of:
+            continue
+        if latest_close is None or close > latest_close:
+            latest_close = close
+
+    if expected_close is None:
+        status = "NOT_DUE"
+        coverage_complete = True
+    else:
+        coverage_complete = (
+            latest_close is not None and latest_close >= expected_close
+        )
+        status = (
+            "COMPLETE"
+            if coverage_complete
+            else "STALE" if latest_close is not None else "MISSING"
+        )
+    return {
+        "status": status,
+        "coverage_complete": coverage_complete,
+        "authoritative": bool(authoritative_source and coverage_complete),
+        "latest_expected_close": (
+            expected_close.astimezone(ET).isoformat()
+            if expected_close is not None
+            else None
+        ),
+        "latest_observed_close": (
+            latest_close.astimezone(ET).isoformat()
+            if latest_close is not None
+            else None
+        ),
+        "source": source,
+    }
+
+
 def _strict_breach_numeric(value: Any) -> Optional[float]:
     if value is None or isinstance(value, bool):
         return None
@@ -455,6 +515,8 @@ def _breach_data_sources(
     candles_4h: list[dict[str, Any]],
     now: datetime,
     observed_price: Optional[float],
+    coverage_5m: dict[str, Any],
+    coverage_15m: dict[str, Any],
 ) -> dict[str, Any]:
     today_et = now.astimezone(ET).date().isoformat()
     completed_daily = [
@@ -473,6 +535,7 @@ def _breach_data_sources(
             "1h": candles_1h,
             "4h": candles_4h,
         },
+        "coverage": {"5m": coverage_5m, "15m": coverage_15m},
         "trend": {"vwap": metrics.get("vwap"), "current_price": observed_price},
         "volume": {"relative_volume": metrics.get("relative_volume")},
         "market": {
@@ -501,6 +564,8 @@ def _collect_breach_context(
     bars_15m: list[dict[str, Any]] = []
     fetched_5m = False
     fetched_15m = False
+    coverage_5m: Optional[dict[str, Any]] = None
+    coverage_15m: Optional[dict[str, Any]] = None
 
     # BREACH deliberately has no current quote path. Only bounded historical
     # reads and already-frozen signal evidence are allowed here.
@@ -533,6 +598,16 @@ def _collect_breach_context(
     used_frozen_15m = not bars_15m and bool(frozen_15m)
     if used_frozen_15m:
         bars_15m = frozen_15m
+        coverage_15m_source = "signal_frozen"
+    else:
+        coverage_15m_source = "provider_response" if fetched_15m else "unavailable"
+    coverage_15m = _describe_pit_coverage(
+        bars_15m,
+        interval_minutes=15,
+        as_of=evidence_now,
+        source=coverage_15m_source,
+        authoritative_source=bool(bars_15m) and coverage_15m_source != "unavailable",
+    )
 
     bars_5m = _filter_completed_bars(
         bars_5m, interval_minutes=5, as_of=evidence_now
@@ -543,6 +618,16 @@ def _collect_breach_context(
     used_frozen_5m = not bars_5m and bool(frozen_5m)
     if used_frozen_5m:
         bars_5m = frozen_5m
+        coverage_5m_source = "signal_frozen"
+    else:
+        coverage_5m_source = "provider_response" if fetched_5m else "unavailable"
+    coverage_5m = _describe_pit_coverage(
+        bars_5m,
+        interval_minutes=5,
+        as_of=evidence_now,
+        source=coverage_5m_source,
+        authoritative_source=bool(bars_5m) and coverage_5m_source != "unavailable",
+    )
 
     try:
         candles_1h = _completed_intraday(
@@ -566,6 +651,8 @@ def _collect_breach_context(
         candles_4h=candles_4h,
         now=evidence_now,
         observed_price=observation.get("price"),
+        coverage_5m=coverage_5m,
+        coverage_15m=coverage_15m,
     )
     return {
         "phase": "BREACH",
