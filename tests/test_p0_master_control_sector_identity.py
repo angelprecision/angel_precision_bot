@@ -1,21 +1,27 @@
-"""Behavioral proof for the surgical #548 sector-identity repair.
+"""Behavioral proof for degraded sector-identity admission.
 
 These tests execute the Master Control helpers and both sector-cap call paths.
 They deliberately use canonical-known tickers, unrelated unknown tickers, and
 tight independent caps so a hidden "other" fallback cannot pass by accident.
 
 Canonical executable-underlying coverage is supplied by dependency #589 on
-main. These tests consume that one map authority and prove Master Control
-cannot silently disable sector protection for known names.
+main. These tests consume that one map authority and prove incomplete sector
+metadata cannot become a portfolio-wide tradeflow kill switch or silently
+disable sector protection for known names.
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 import ap_master_control as mc_mod
+
+
+@pytest.fixture(autouse=True)
+def _disable_decision_event_db_writes(monkeypatch):
+    monkeypatch.setattr(mc_mod, "emit_decision_event", None)
 
 
 def _bare_control():
@@ -73,7 +79,8 @@ def _control(**overrides):
         "require_snapshot_freshness_live": False,
     }
     kwargs.update(overrides)
-    control = mc_mod.APMasterControl(**kwargs)
+    with patch.object(mc_mod.APMasterControl, "_seed_dedup_from_db", return_value=None):
+        control = mc_mod.APMasterControl(**kwargs)
     control._kill_switch_fn = lambda: False
     control._equity_snapshot = MagicMock(
         return_value=(kwargs["account_equity"], kwargs["max_daily_loss"])
@@ -86,6 +93,7 @@ def _control(**overrides):
             "pending_total_capital_reserved": 0.0,
         }
     )
+    control._log_capital_utilization = MagicMock()
     return control
 
 
@@ -118,6 +126,40 @@ def _plan(
         mode="PAPER",
         paper_sim=True,
     )
+
+
+def _signal(ticker: str, signal_id: str = "signal-548-evaluate") -> dict:
+    return {
+        "signal_id": signal_id,
+        "ticker": ticker,
+        "side": "CALL",
+        "direction": "CALL",
+        "score": 80.0,
+        "underlying_price": 100.0,
+        "timeframe": "1d",
+        "pattern": "BREAKOUT",
+        "score_breakdown": {"real_time_ctx": 10.0},
+        "trigger": {"entry": 100.0, "stop": 99.0, "pt1": 105.0},
+    }
+
+
+def _prepare_evaluate(control, snapshot, *, duplicate=None):
+    control._get_snapshot = MagicMock(return_value=snapshot)
+    control._has_durable_duplicate_signal = MagicMock(
+        return_value=duplicate if duplicate is not None else (False, "", "")
+    )
+    control._persist_dedup = MagicMock()
+    control._run_intelligence = MagicMock(
+        return_value={
+            "approved": True,
+            "score": 0.0,
+            "contracts": 1,
+            "reasoning": "test",
+            "_available": False,
+        }
+    )
+    control._run_final_quality_gates = MagicMock(return_value=None)
+    control._emit_trade_dossier = MagicMock()
 
 
 @pytest.mark.parametrize(
@@ -205,6 +247,7 @@ def test_required_cross_sector_pairs_do_not_aggregate(existing, candidate):
         candidate_sector,
     ) == 0.0
 
+
 @pytest.mark.parametrize(
     ("existing", "candidate", "sector"),
     [
@@ -268,52 +311,69 @@ def test_required_cross_sector_pairs_do_not_trigger_sector_cap(existing, candida
 
 
 @pytest.mark.parametrize("mode", ["paper", "live"])
-def test_unknown_revalidation_has_same_fail_closed_result_in_each_mode(mode):
+def test_unknown_candidate_revalidation_skips_only_sector_cap_in_each_mode(mode):
     control = _control(
         mode=mode,
         max_position_pct=0.90,
         max_total_capital_pct=0.90,
         max_ticker_pct=0.90,
-        max_sector_pct=0.90,
+        max_sector_pct=0.01,
     )
 
-    decision = control.revalidate_exposure(_plan("ZZUNKNOWN1", 100.0))
+    control._get_snapshot = MagicMock(return_value=_snapshot())
+    plan = _plan("ZZUNKNOWN1", 100.0)
 
-    assert (decision.ok, decision.reason, decision.reason_code) == (
-        False,
-        "SECTOR_IDENTITY_UNPROVEN",
-        "SECTOR_IDENTITY_UNPROVEN",
-    )
+    decision = control.revalidate_exposure(plan)
+
+    assert decision.ok is True, decision.reason
+    assert decision.reason_code == ""
+    assert plan.metadata["candidate_sector_resolved"] is False
+    assert plan.metadata["sector_identity_complete"] is False
+    assert plan.metadata["sector_cap_applied"] is False
+    assert plan.metadata["sector_cap_partial"] is False
+    assert plan.metadata["sector_cap_skip_reason"] == "candidate_sector_unresolved"
+    assert plan.metadata["unresolved_sector_positions"] == []
+
 
 @pytest.mark.parametrize("mode", ["paper", "live"])
-def test_unknown_evaluate_has_same_fail_closed_result_in_each_mode(mode):
-    control = _control(mode=mode)
-    control._get_snapshot = MagicMock(
-        side_effect=AssertionError("identity must fail before snapshot")
+def test_unknown_candidate_evaluate_reaches_downstream_admission_in_each_mode(
+    mode,
+    monkeypatch,
+):
+    control = _control(
+        mode=mode,
+        max_position_pct=0.90,
+        max_total_capital_pct=0.90,
+        max_ticker_pct=0.90,
+        max_sector_pct=0.01,
+    )
+    snapshot = _snapshot()
+    _prepare_evaluate(control, snapshot)
+    events = []
+    monkeypatch.setattr(
+        mc_mod,
+        "emit_decision_event",
+        lambda **kwargs: events.append(kwargs),
     )
 
     decision = control.evaluate(
-        {
-            "signal_id": f"signal-548-mode-{mode}",
-            "ticker": "ZZUNKNOWN1",
-            "side": "CALL",
-            "direction": "CALL",
-            "score": 80.0,
-            "underlying_price": 100.0,
-            "timeframe": "1d",
-            "pattern": "BREAKOUT",
-            "score_breakdown": {"real_time_ctx": 10.0},
-            "trigger": {"entry": 100.0, "stop": 99.0, "pt1": 105.0},
-        },
+        _signal("ZZUNKNOWN1", f"signal-548-mode-{mode}"),
         client_id="client@example.com",
     )
 
-    assert (decision.ok, decision.reason, decision.reason_code) == (
-        False,
-        "SECTOR_IDENTITY_UNPROVEN",
-        "SECTOR_IDENTITY_UNPROVEN",
-    )
-    control._get_snapshot.assert_not_called()
+    assert decision.ok is True, decision.reason
+    assert decision.plan is not None
+    assert control._run_final_quality_gates.called
+    metadata = decision.plan.metadata
+    assert metadata["candidate_sector_resolved"] is False
+    assert metadata["sector_identity_complete"] is False
+    assert metadata["sector_cap_applied"] is False
+    assert metadata["sector_cap_skip_reason"] == "candidate_sector_unresolved"
+    assert metadata["unresolved_sector_positions"] == []
+    approval = [event for event in events if event.get("decision") == "APPROVE"][-1]
+    assert approval["context"]["candidate_sector_resolved"] is False
+    assert approval["context"]["sector_cap_applied"] is False
+    assert approval["context"]["sector_cap_skip_reason"] == "candidate_sector_unresolved"
 
 
 def test_reporting_keeps_unresolved_names_separate_without_shared_sector():
@@ -329,7 +389,7 @@ def test_reporting_keeps_unresolved_names_separate_without_shared_sector():
     assert exposure["tech"] == 200.0
 
 
-def test_unknown_revalidation_fails_closed_before_cap_math():
+def test_unknown_candidate_revalidation_still_runs_other_cap_math():
     control = _control(
         max_position_pct=0.90,
         max_total_capital_pct=0.90,
@@ -340,21 +400,22 @@ def test_unknown_revalidation_fails_closed_before_cap_math():
         return_value=_snapshot([_position("ZZUNKNOWN2", price=6.0)])
     )
     plan = _plan("ZZUNKNOWN1", 100.0)
-    before_plan = (plan.contracts, plan.max_position_usd)
 
     decision = control.revalidate_exposure(plan)
 
-    assert decision.ok is False
-    assert decision.reason == "SECTOR_IDENTITY_UNPROVEN"
-    assert decision.reason_code == "SECTOR_IDENTITY_UNPROVEN"
-    assert plan.contracts == before_plan[0]
-    assert plan.max_position_usd == before_plan[1]
-    control._get_snapshot.assert_not_called()
+    assert decision.ok is True, decision.reason
+    assert plan.metadata["candidate_sector_resolved"] is False
+    assert plan.metadata["sector_cap_applied"] is False
+    assert plan.metadata["sector_cap_skip_reason"] == "candidate_sector_unresolved"
+    assert [row["symbol"] for row in plan.metadata["unresolved_sector_positions"]] == [
+        "ZZUNKNOWN2"
+    ]
+    control._get_snapshot.assert_called_once()
 
 
-def test_unknown_identity_precedes_ticker_total_and_broker_cap_gates():
-    """Independent capacity headroom cannot substitute for risk identity."""
+def test_unknown_candidate_does_not_bypass_total_capital_gate():
     control = _control(
+        account_equity=1000.0,
         max_capital_pct=0.90,
         max_position_pct=0.90,
         max_total_capital_pct=0.90,
@@ -362,15 +423,18 @@ def test_unknown_identity_precedes_ticker_total_and_broker_cap_gates():
         max_sector_pct=0.90,
     )
     control._get_snapshot = MagicMock(
-        side_effect=AssertionError("identity must fail before capital reads")
+        return_value=_snapshot([_position("ZZUNKNOWN2", price=6.0)], capital_deployed=900.0)
     )
+    plan = _plan("ZZUNKNOWN1", 200.0)
 
-    decision = control.revalidate_exposure(_plan("ZZUNKNOWN1", 100.0))
+    decision = control.revalidate_exposure(plan)
 
     assert decision.ok is False
-    assert decision.reason == "SECTOR_IDENTITY_UNPROVEN"
-    assert decision.reason_code == "SECTOR_IDENTITY_UNPROVEN"
-    control._get_snapshot.assert_not_called()
+    assert decision.reason_code in {
+        "CAPITAL_LIMIT_TOTAL_EXPOSURE_CAP_REACHED",
+        "ACTUAL_CONTRACT_COST_EXCEEDS_REMAINING_TOTAL_CAPACITY",
+    }
+    assert "SECTOR_IDENTITY_UNPROVEN" not in decision.reason
 
 
 def test_known_canonical_sector_still_enforces_sector_cap():
@@ -468,58 +532,67 @@ def test_sep4_known_names_keep_real_sector_cap(candidate, existing, sector):
 def test_sector_telemetry_distinguishes_unknown_from_known():
     control = _bare_control()
 
-    assert control._sector_telemetry(None) == {
-        "sector_resolution": "unknown",
-        "sector_cap_applied": False,
-        "sector_cap_skip_reason": "unknown_sector_identity",
-    }
-    assert control._sector_telemetry("tech") == {
-        "sector_resolution": "known",
-        "sector_cap_applied": True,
-        "sector_cap_skip_reason": None,
-    }
+    unknown = control._sector_telemetry(None)
+    assert unknown["candidate_sector_resolved"] is False
+    assert unknown["sector_identity_complete"] is False
+    assert unknown["sector_cap_applied"] is False
+    assert unknown["sector_cap_partial"] is False
+    assert unknown["sector_cap_skip_reason"] == "candidate_sector_unresolved"
+    assert unknown["unresolved_sector_positions"] == []
+
+    known = control._sector_telemetry("tech")
+    assert known["candidate_sector_resolved"] is True
+    assert known["sector_identity_complete"] is True
+    assert known["sector_cap_applied"] is True
+    assert known["sector_cap_partial"] is False
+    assert known["sector_cap_skip_reason"] is None
+
+    partial = control._sector_telemetry(
+        "tech",
+        unresolved_positions=[{"symbol": "ZZUNKNOWN1"}],
+    )
+    assert partial["candidate_sector_resolved"] is True
+    assert partial["sector_identity_complete"] is False
+    assert partial["active_sector_identity_complete"] is False
+    assert partial["sector_cap_applied"] is True
+    assert partial["sector_cap_partial"] is True
+    assert partial["sector_cap_skip_reason"] == "unresolved_active_position_identity"
 
 
-def test_evaluate_unknown_sector_fails_closed_before_other_cap_gates(monkeypatch):
-    monkeypatch.setenv("ENABLE_TRADE_DOSSIER", "false")
+def test_unresolved_active_position_does_not_bypass_total_capital_gate(monkeypatch):
     control = _control(
+        account_equity=1000.0,
         max_position_pct=0.90,
         max_total_capital_pct=0.90,
         max_ticker_pct=0.90,
-        max_sector_pct=0.01,
+        max_sector_pct=0.90,
         max_daily_loss=-500.0,
     )
-    control._get_snapshot = MagicMock(side_effect=AssertionError("unknown sector must fail before snapshot"))
-    control._has_durable_duplicate_signal = MagicMock(
-        side_effect=AssertionError("unknown sector must fail before dedup")
+    snapshot = _snapshot(
+        [_position("ZZUNKNOWN1", price=3.0)],
+        capital_deployed=800.0,
     )
-    control._persist_dedup = MagicMock()
-    control._emit_trade_dossier = MagicMock()
-    monkeypatch.setattr(mc_mod, "emit_decision_event", None)
+    _prepare_evaluate(control, snapshot)
+    events = []
+    monkeypatch.setattr(
+        mc_mod,
+        "emit_decision_event",
+        lambda **kwargs: events.append(kwargs),
+    )
 
     decision = control.evaluate(
-        {
-            "signal_id": "signal-548-evaluate",
-            "ticker": "ZZUNKNOWN1",
-            "side": "CALL",
-            "direction": "CALL",
-            "score": 80.0,
-            "underlying_price": 100.0,
-            "timeframe": "1d",
-            "pattern": "BREAKOUT",
-            "score_breakdown": {"real_time_ctx": 10.0},
-            "trigger": {"entry": 100.0, "stop": 99.0, "pt1": 105.0},
-        },
+        _signal("BMY", "signal-548-capital-with-unresolved"),
         client_id="client@example.com",
     )
 
     assert decision.ok is False
     assert decision.plan is None
-    assert decision.reason == "SECTOR_IDENTITY_UNPROVEN"
-    assert decision.reason_code == "SECTOR_IDENTITY_UNPROVEN"
-    control._get_snapshot.assert_not_called()
-    control._has_durable_duplicate_signal.assert_not_called()
-    control._persist_dedup.assert_not_called()
+    assert decision.reason_code == "CAPITAL_UTIL_BLOCK"
+    assert "SECTOR_IDENTITY_UNPROVEN" not in decision.reason
+    rejection = [event for event in events if event.get("decision") == "REJECT"][-1]
+    assert rejection["context"]["sector_identity_complete"] is False
+    assert rejection["context"]["sector_cap_partial"] is True
+    assert rejection["context"]["unresolved_sector_positions"][0]["symbol"] == "ZZUNKNOWN1"
 
 
 def test_sector_exposure_authority_reports_completeness_and_diagnostics():
@@ -554,13 +627,22 @@ def test_sector_exposure_authority_reports_completeness_and_diagnostics():
         for row in incomplete["unresolved"]
     )
 
+    partial = control._sector_exposure_authority(
+        [_position("AAPL"), _position("ZZUNKNOWN1", price=9.0)],
+        "tech",
+    )
+    assert partial["capital"] == 200.0
+    assert partial["identity_complete"] is False
+    assert [row["symbol"] for row in partial["unresolved"]] == ["ZZUNKNOWN1"]
+
 
 @pytest.mark.parametrize("position_bucket", ["open_positions", "closing_positions"])
-def test_revalidate_blocks_known_candidate_when_active_position_identity_is_unproven(
+def test_unresolved_active_position_is_partial_diagnostic_only_in_both_paths(
     position_bucket,
+    monkeypatch,
 ):
     control = _control(
-        mode="live",
+        mode="paper",
         max_position_pct=0.90,
         max_total_capital_pct=0.90,
         max_ticker_pct=0.90,
@@ -570,34 +652,48 @@ def test_revalidate_blocks_known_candidate_when_active_position_identity_is_unpr
         **{position_bucket: [_position("ZZUNKNOWN1", price=3.0)]},
         capital_deployed=300.0,
     )
-    control._get_snapshot = MagicMock(return_value=snapshot)
-    control._sector_capital_deployed = MagicMock(
-        side_effect=AssertionError("incomplete sector authority must not calculate cap")
+    _prepare_evaluate(control, snapshot)
+    events = []
+    monkeypatch.setattr(
+        mc_mod,
+        "emit_decision_event",
+        lambda **kwargs: events.append(kwargs),
     )
-    control._pending_capital_from_snapshot_or_db = MagicMock(
-        side_effect=AssertionError("incomplete sector authority must block before pending capital")
-    )
-    control._get_pending_capital_breakdown = MagicMock(
-        side_effect=AssertionError("incomplete sector authority must block before diagnostics")
-    )
-    control._log_capital_utilization = MagicMock()
 
-    plan = _plan("BMY", 150.0)
-    plan.metadata["sizing_context"] = {"bootstrap_mode": True}
-    plan.contracts = 3
-    before_plan = (plan.contracts, plan.max_position_usd)
-    decision = control.revalidate_exposure(plan)
-
-    assert (decision.ok, decision.reason, decision.reason_code) == (
-        False,
-        "SECTOR_IDENTITY_UNPROVEN",
-        "SECTOR_IDENTITY_UNPROVEN",
+    evaluation = control.evaluate(
+        _signal("BMY", f"signal-548-unresolved-{position_bucket}"),
+        client_id="client@example.com",
     )
-    assert (plan.contracts, plan.max_position_usd) == before_plan
-    control._sector_capital_deployed.assert_not_called()
-    control._pending_capital_from_snapshot_or_db.assert_not_called()
-    control._get_pending_capital_breakdown.assert_not_called()
-    control._log_capital_utilization.assert_not_called()
+
+    assert evaluation.ok is True, evaluation.reason
+    assert evaluation.plan is not None
+    assert control._run_final_quality_gates.called
+    metadata = evaluation.plan.metadata
+    assert metadata["candidate_sector_resolved"] is True
+    assert metadata["sector_identity_complete"] is False
+    assert metadata["sector_cap_applied"] is True
+    assert metadata["sector_cap_partial"] is True
+    assert metadata["sector_cap_skip_reason"] == "unresolved_active_position_identity"
+    assert metadata["unresolved_sector_positions"][0]["symbol"] == "ZZUNKNOWN1"
+
+    # Use the actual plan passed through revalidation so its fresh diagnostic
+    # snapshot is observable without treating a revalidation success as an
+    # execution mutation.
+    revalidated_plan = _plan("BMY", 150.0)
+    revalidation = control.revalidate_exposure(revalidated_plan)
+    assert revalidation.ok is True, revalidation.reason
+    assert revalidated_plan.metadata["sector_identity_complete"] is False
+    assert revalidated_plan.metadata["sector_cap_partial"] is True
+    assert revalidated_plan.metadata["sector_cap_skip_reason"] == "unresolved_active_position_identity"
+    assert revalidated_plan.metadata["unresolved_sector_positions"][0]["symbol"] == "ZZUNKNOWN1"
+    log_kwargs = control._log_capital_utilization.call_args.kwargs
+    assert log_kwargs["sector_identity_complete"] is False
+    assert log_kwargs["sector_cap_partial"] is True
+    assert log_kwargs["unresolved_sector_positions"][0]["symbol"] == "ZZUNKNOWN1"
+
+    approval = [event for event in events if event.get("decision") == "APPROVE"][-1]
+    assert approval["context"]["sector_identity_complete"] is False
+    assert approval["context"]["sector_cap_partial"] is True
 
 
 @pytest.mark.parametrize(
@@ -606,12 +702,14 @@ def test_revalidate_blocks_known_candidate_when_active_position_identity_is_unpr
         ({"avg_fill": 3.0, "quantity_remaining": 1}, "<missing>"),
         ({"underlying": "   ", "avg_fill": 3.0, "quantity_remaining": 1}, "<missing>"),
         ({"underlying": {"not": "a symbol"}, "avg_fill": 3.0, "quantity_remaining": 1}, "{'NOT': 'A SYMBOL'}"),
+        ("legacy-position-row", "<invalid_position>"),
         (_position("ZZUNKNOWN1", price=3.0), "ZZUNKNOWN1"),
     ],
 )
-def test_revalidate_blocks_missing_blank_malformed_and_unmapped_active_identity(
+def test_malformed_or_unmapped_active_identity_does_not_halt_tradeflow(
     bad_position,
     expected_symbol,
+    monkeypatch,
 ):
     control = _control(
         max_position_pct=0.90,
@@ -627,17 +725,26 @@ def test_revalidate_blocks_missing_blank_malformed_and_unmapped_active_identity(
     assert authority["identity_complete"] is False
     assert authority["unresolved"][0]["symbol"] == expected_symbol
 
-    decision = control.revalidate_exposure(_plan("BMY", 150.0))
-
-    assert (decision.ok, decision.reason, decision.reason_code) == (
-        False,
-        "SECTOR_IDENTITY_UNPROVEN",
-        "SECTOR_IDENTITY_UNPROVEN",
+    _prepare_evaluate(
+        control,
+        _snapshot([bad_position], capital_deployed=300.0),
     )
-    control._pending_capital_from_snapshot_or_db.assert_not_called()
+    monkeypatch.setattr(mc_mod, "emit_decision_event", None)
+    evaluation = control.evaluate(
+        _signal("BMY", f"signal-548-malformed-{expected_symbol}"),
+        client_id="client@example.com",
+    )
+    assert evaluation.ok is True, evaluation.reason
+    assert evaluation.plan.metadata["unresolved_sector_positions"][0]["symbol"] == expected_symbol
+
+    revalidated_plan = _plan("BMY", 150.0)
+    decision = control.revalidate_exposure(revalidated_plan)
+
+    assert decision.ok is True, decision.reason
+    assert revalidated_plan.metadata["unresolved_sector_positions"][0]["symbol"] == expected_symbol
 
 
-def test_revalidate_blocks_when_active_position_resolver_raises(monkeypatch):
+def test_revalidate_resolver_error_is_partial_sector_diagnostic(monkeypatch):
     original_resolver = mc_mod._canonical_get_sector
 
     def raising_resolver(symbol):
@@ -656,18 +763,18 @@ def test_revalidate_blocks_when_active_position_resolver_raises(monkeypatch):
         return_value=_snapshot([_position("ZZUNKNOWN1", price=3.0)], capital_deployed=300.0)
     )
 
-    decision = control.revalidate_exposure(_plan("BMY", 150.0))
+    plan = _plan("BMY", 150.0)
+    decision = control.revalidate_exposure(plan)
 
-    assert (decision.ok, decision.reason, decision.reason_code) == (
-        False,
-        "SECTOR_IDENTITY_UNPROVEN",
-        "SECTOR_IDENTITY_UNPROVEN",
-    )
-    control._pending_capital_from_snapshot_or_db.assert_not_called()
+    assert decision.ok is True, decision.reason
+    assert plan.metadata["sector_identity_complete"] is False
+    assert plan.metadata["sector_cap_partial"] is True
+    assert plan.metadata["sector_cap_skip_reason"] == "unresolved_active_position_identity"
+    assert plan.metadata["unresolved_sector_positions"][0]["symbol"] == "ZZUNKNOWN1"
 
 
 @pytest.mark.parametrize("mode", ["paper", "live"])
-def test_known_candidate_with_unresolved_active_position_blocks_in_both_modes(mode):
+def test_known_candidate_with_unresolved_active_position_degrades_identically_in_both_modes(mode):
     control = _control(
         mode=mode,
         max_position_pct=0.90,
@@ -678,63 +785,92 @@ def test_known_candidate_with_unresolved_active_position_blocks_in_both_modes(mo
     control._get_snapshot = MagicMock(
         return_value=_snapshot([_position("ZZUNKNOWN1", price=3.0)], capital_deployed=300.0)
     )
-    control._pending_capital_from_snapshot_or_db = MagicMock(
-        side_effect=AssertionError("identity failure must precede pending capital")
-    )
 
-    decision = control.revalidate_exposure(_plan("BMY", 150.0))
+    plan = _plan("BMY", 150.0)
+    decision = control.revalidate_exposure(plan)
 
-    assert (decision.ok, decision.reason, decision.reason_code) == (
-        False,
-        "SECTOR_IDENTITY_UNPROVEN",
-        "SECTOR_IDENTITY_UNPROVEN",
-    )
-    control._pending_capital_from_snapshot_or_db.assert_not_called()
+    assert decision.ok is True, decision.reason
+    assert plan.metadata["candidate_sector_resolved"] is True
+    assert plan.metadata["sector_identity_complete"] is False
+    assert plan.metadata["sector_cap_partial"] is True
+    assert plan.metadata["sector_cap_skip_reason"] == "unresolved_active_position_identity"
+    assert plan.metadata["unresolved_sector_positions"][0]["symbol"] == "ZZUNKNOWN1"
 
 
-def test_evaluate_blocks_known_candidate_with_unresolved_open_position_before_approval():
+def test_evaluate_known_candidate_with_unresolved_open_position_reaches_approval():
     control = _control(
         max_position_pct=0.90,
         max_total_capital_pct=0.90,
         max_ticker_pct=0.90,
         max_sector_pct=0.90,
     )
-    control._has_durable_duplicate_signal = MagicMock(return_value=(False, "", ""))
+    _prepare_evaluate(
+        control,
+        _snapshot([_position("ZZUNKNOWN1", price=3.0)], capital_deployed=300.0),
+    )
+    decision = control.evaluate(
+        _signal("BMY", "signal-548-existing-unknown"),
+        client_id="client@example.com",
+    )
+
+    assert decision.ok is True, decision.reason
+    assert decision.plan is not None
+    assert decision.plan.metadata["unresolved_sector_positions"][0]["symbol"] == "ZZUNKNOWN1"
+    assert decision.plan.metadata["sector_cap_partial"] is True
+    assert decision.plan.metadata["sector_cap_skip_reason"] == "unresolved_active_position_identity"
+    control._run_intelligence.assert_called_once()
+    control._run_final_quality_gates.assert_called_once()
+
+
+def test_duplicate_gate_remains_authoritative_when_sector_metadata_is_incomplete():
+    control = _control(
+        max_position_pct=0.90,
+        max_total_capital_pct=0.90,
+        max_ticker_pct=0.90,
+        max_sector_pct=0.90,
+    )
+    control._has_durable_duplicate_signal = MagicMock(
+        return_value=(True, "orders", "id=existing-entry")
+    )
     control._get_snapshot = MagicMock(
-        return_value=_snapshot([_position("ZZUNKNOWN1", price=3.0)], capital_deployed=300.0)
+        side_effect=AssertionError("duplicate protection should stop before snapshot")
     )
-    control._sector_capital_deployed = MagicMock(
-        side_effect=AssertionError("incomplete sector authority must not calculate cap")
-    )
-    control._pending_capital_from_snapshot_or_db = MagicMock(
-        side_effect=AssertionError("incomplete sector authority must block before pending capital")
-    )
-    control._run_intelligence = MagicMock(
-        side_effect=AssertionError("incomplete sector authority must not reach intelligence")
-    )
-    control._persist_dedup = MagicMock()
 
     decision = control.evaluate(
-        {
-            "signal_id": "signal-548-existing-unknown",
-            "ticker": "BMY",
-            "side": "CALL",
-            "direction": "CALL",
-            "score": 80.0,
-            "underlying_price": 100.0,
-            "timeframe": "1d",
-            "pattern": "BREAKOUT",
-            "score_breakdown": {"real_time_ctx": 10.0},
-            "trigger": {"entry": 100.0, "stop": 99.0, "pt1": 105.0},
-        },
+        _signal("BMY", "signal-548-duplicate-with-unresolved"),
         client_id="client@example.com",
     )
 
     assert decision.ok is False
-    assert decision.plan is None
-    assert decision.reason == "SECTOR_IDENTITY_UNPROVEN"
-    assert decision.reason_code == "SECTOR_IDENTITY_UNPROVEN"
-    control._sector_capital_deployed.assert_not_called()
-    control._pending_capital_from_snapshot_or_db.assert_not_called()
-    control._run_intelligence.assert_not_called()
-    control._persist_dedup.assert_not_called()
+    assert decision.reason_code == "DEDUP_BLOCK"
+    assert "SECTOR_IDENTITY_UNPROVEN" not in decision.reason
+    control._get_snapshot.assert_not_called()
+
+
+def test_partial_sector_cap_still_blocks_when_proven_sector_exceeds_cap():
+    control = _control(
+        max_position_pct=0.90,
+        max_total_capital_pct=0.90,
+        max_ticker_pct=0.90,
+        max_sector_pct=0.15,
+        account_equity=1000.0,
+    )
+    control._get_snapshot = MagicMock(
+        return_value=_snapshot(
+            [
+                _position("AAPL", price=1.0),
+                _position("ZZUNKNOWN1", price=9.0),
+            ],
+            capital_deployed=100.0,
+        )
+    )
+    plan = _plan("QCOM", 100.0)
+
+    decision = control.revalidate_exposure(plan)
+
+    assert decision.ok is False
+    assert decision.reason_code == "SECTOR_CAP_BLOCK"
+    assert "revalidate_sector_cap_tech" in decision.reason
+    assert plan.metadata["sector_cap_applied"] is True
+    assert plan.metadata["sector_cap_partial"] is True
+    assert plan.metadata["unresolved_sector_positions"][0]["symbol"] == "ZZUNKNOWN1"
