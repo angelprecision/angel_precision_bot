@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
@@ -295,31 +296,19 @@ def _filter_completed_bars(
     return completed
 
 
-def _frozen_breach_observation(signal: dict[str, Any], as_of: datetime) -> dict[str, Any]:
-    candidates = (
-        ("signal_breach_price", signal.get("breach_price")),
-        ("signal_frozen_underlying_price", signal.get("frozen_underlying_price")),
-        ("signal_underlying_at_breach", signal.get("underlying_at_breach")),
-        ("signal_underlying_at_signal", signal.get("underlying_at_signal")),
-        ("signal_underlying_price", signal.get("underlying_price")),
-        ("signal_current_price", signal.get("current_price")),
-    )
-    for source, raw_price in candidates:
-        price = to_float(raw_price)
-        if price is None:
-            continue
-        source_timestamp = (
-            signal.get("breach_price_at")
-            or signal.get("underlying_at_breach_at")
-            or as_of.isoformat()
-        )
-        return {
-            "price": price,
-            "source": source,
-            "observed_at": as_of.isoformat(),
-            "source_timestamp": str(source_timestamp),
-            "age_seconds": None,
-        }
+def _strict_breach_numeric(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _empty_breach_observation() -> dict[str, Any]:
     return {
         "price": None,
         "source": None,
@@ -327,6 +316,75 @@ def _frozen_breach_observation(signal: dict[str, Any], as_of: datetime) -> dict[
         "source_timestamp": None,
         "age_seconds": None,
     }
+
+
+def resolve_frozen_breach_observation(
+    signal: dict[str, Any], as_of: datetime
+) -> dict[str, Any]:
+    """Resolve only explicit, point-in-time breach price evidence."""
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        return _empty_breach_observation()
+
+    scalar_candidates = (
+        ("signal.breach_price", "breach_price", "breach_price_at"),
+        (
+            "signal.frozen_underlying_price",
+            "frozen_underlying_price",
+            "frozen_underlying_price_at",
+        ),
+        ("signal.underlying_at_breach", "underlying_at_breach", "underlying_at_breach_at"),
+        ("signal.price_at_breach", "price_at_breach", "price_at_breach_at"),
+    )
+    for source, field, timestamp_field in scalar_candidates:
+        if field not in signal:
+            continue
+        price = _strict_breach_numeric(signal.get(field))
+        if price is None:
+            continue
+
+        if timestamp_field in signal:
+            source_timestamp = signal.get(timestamp_field)
+            parsed_timestamp, _ = _parse_breach_as_of(source_timestamp)
+            if parsed_timestamp is None or parsed_timestamp > as_of:
+                continue
+            source_timestamp_value = str(source_timestamp)
+        else:
+            source_timestamp_value = as_of.isoformat()
+        return {
+            "price": price,
+            "source": source,
+            "observed_at": as_of.isoformat(),
+            "source_timestamp": source_timestamp_value,
+            "age_seconds": None,
+        }
+
+    evidence = signal.get("breach_evidence")
+    if isinstance(evidence, Mapping):
+        timestamp = None
+        for field in ("as_of", "data_as_of", "timestamp", "observed_at", "time"):
+            if field in evidence:
+                timestamp = evidence.get(field)
+                break
+        parsed_timestamp, _ = _parse_breach_as_of(timestamp)
+        if parsed_timestamp is None or parsed_timestamp > as_of:
+            return _empty_breach_observation()
+
+        price = None
+        for field in ("price", "underlying_price", "breach_price", "value"):
+            if field in evidence:
+                price = _strict_breach_numeric(evidence.get(field))
+                break
+        if price is None:
+            return _empty_breach_observation()
+        return {
+            "price": price,
+            "source": "signal.breach_evidence",
+            "observed_at": as_of.isoformat(),
+            "source_timestamp": str(timestamp),
+            "age_seconds": None,
+        }
+
+    return _empty_breach_observation()
 
 
 def _breach_data_sources(
@@ -440,7 +498,7 @@ def _collect_breach_context(
         candles_1h = []
         candles_4h = []
 
-    observation = _frozen_breach_observation(signal, evidence_now)
+    observation = resolve_frozen_breach_observation(signal, evidence_now)
     data_sources = _breach_data_sources(
         signal,
         daily=daily,

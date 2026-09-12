@@ -8,6 +8,7 @@ BREACH-specific assertions.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -128,6 +129,182 @@ def test_fail_first_breach_uses_exact_as_of_and_skips_current_quotes(monkeypatch
     observation = result.get("underlying_observation") or {}
     assert observation.get("price") == pytest.approx(501.25)
     assert observation.get("source") not in {None, "tradier_quote"}
+
+
+def test_generic_prices_cannot_become_breach_truth():
+    observation = imd.resolve_frozen_breach_observation(
+        _breach_signal(
+            breach_price=None,
+            frozen_underlying_price=None,
+            underlying_at_breach=None,
+            price_at_breach=None,
+            underlying_price=999,
+            current_price=998,
+        ),
+        AS_OF,
+    )
+
+    assert observation["price"] is None
+    assert observation["source"] is None
+
+
+def test_signal_time_price_cannot_become_breach_truth():
+    observation = imd.resolve_frozen_breach_observation(
+        _breach_signal(
+            breach_price=None,
+            frozen_underlying_price=None,
+            underlying_at_breach=None,
+            price_at_breach=None,
+            underlying_at_signal=130.50,
+        ),
+        AS_OF,
+    )
+
+    assert observation["price"] is None
+
+
+def test_explicit_breach_price_wins_over_contradictory_generic_prices():
+    observation = imd.resolve_frozen_breach_observation(
+        _breach_signal(breach_price=130.50, underlying_price=999, current_price=998),
+        AS_OF,
+    )
+
+    assert observation["price"] == pytest.approx(130.50)
+    assert observation["source"] == "signal.breach_price"
+
+
+@pytest.mark.parametrize("value", [True, False, math.nan, math.inf, -math.inf])
+def test_non_finite_or_boolean_breach_prices_are_rejected(value):
+    observation = imd.resolve_frozen_breach_observation(
+        _breach_signal(
+            breach_price=value,
+            frozen_underlying_price=None,
+            underlying_at_breach=None,
+            price_at_breach=None,
+            underlying_price=999,
+            current_price=998,
+        ),
+        AS_OF,
+    )
+
+    assert observation["price"] is None
+    assert observation["source"] is None
+
+
+def test_future_breach_price_companion_timestamp_is_rejected():
+    observation = imd.resolve_frozen_breach_observation(
+        _breach_signal(
+            breach_price=130.50,
+            breach_price_at=(AS_OF + timedelta(minutes=1)).isoformat(),
+            frozen_underlying_price=None,
+            underlying_at_breach=None,
+            price_at_breach=None,
+            underlying_price=999,
+            current_price=998,
+        ),
+        AS_OF,
+    )
+
+    assert observation["price"] is None
+    assert observation["source"] is None
+
+
+@pytest.mark.parametrize("timestamp", ["2026-09-11T17:30:00", "not-a-timestamp"])
+def test_naive_or_malformed_breach_price_companion_timestamp_is_rejected(timestamp):
+    observation = imd.resolve_frozen_breach_observation(
+        _breach_signal(
+            breach_price=130.50,
+            breach_price_at=timestamp,
+            frozen_underlying_price=None,
+            underlying_at_breach=None,
+            price_at_breach=None,
+            underlying_price=999,
+            current_price=998,
+        ),
+        AS_OF,
+    )
+
+    assert observation["price"] is None
+
+
+def test_valid_mapping_breach_evidence_preserves_source_timestamp():
+    timestamp = "2026-09-11T17:29:00+00:00"
+    observation = imd.resolve_frozen_breach_observation(
+        _breach_signal(
+            breach_price=None,
+            frozen_underlying_price=None,
+            underlying_at_breach=None,
+            price_at_breach=None,
+            breach_evidence={"price": 130.50, "timestamp": timestamp},
+        ),
+        AS_OF,
+    )
+
+    assert observation["price"] == pytest.approx(130.50)
+    assert observation["source"] == "signal.breach_evidence"
+    assert observation["source_timestamp"] == timestamp
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"price": 130.50},
+        {"price": 130.50, "timestamp": "2026-09-11T17:29:00"},
+        {"price": 130.50, "timestamp": "not-a-timestamp"},
+        {
+            "price": 130.50,
+            "timestamp": (AS_OF + timedelta(minutes=1)).isoformat(),
+        },
+    ],
+)
+def test_invalid_mapping_breach_evidence_timestamp_is_rejected(evidence):
+    observation = imd.resolve_frozen_breach_observation(
+        _breach_signal(
+            breach_price=None,
+            frozen_underlying_price=None,
+            underlying_at_breach=None,
+            price_at_breach=None,
+            breach_evidence=evidence,
+            underlying_price=999,
+            current_price=998,
+        ),
+        AS_OF,
+    )
+
+    assert observation["price"] is None
+    assert observation["source"] is None
+
+
+def test_production_shaped_breach_result_uses_only_frozen_breach_authority(monkeypatch):
+    quote_calls: list[str] = []
+
+    def fail_quote(symbol, _broker):
+        quote_calls.append(symbol)
+        raise AssertionError("BREACH must not read current quotes")
+
+    monkeypatch.setattr(imd, "_quote", fail_quote)
+    monkeypatch.setattr(imd, "_history", lambda *_a, **_k: [])
+    monkeypatch.setattr(fvg, "fetch_15m_bars", lambda *_a, **_k: [])
+    monkeypatch.setattr(fvg, "fetch_5m_bars", lambda *_a, **_k: [], raising=False)
+
+    result = imd.collect_point_in_time_context(
+        _breach_signal(
+            breach_price=130.50,
+            underlying_price=999,
+            current_price=998,
+        ),
+        broker=object(),
+        phase="BREACH",
+    )
+
+    assert result["as_of"] == AS_OF.isoformat()
+    candles = result["data_sources"]["candles"]
+    assert all(timeframe in candles for timeframe in ("5m", "15m", "1h", "4h"))
+    observation = result["underlying_observation"]
+    assert observation["price"] == pytest.approx(130.50)
+    assert observation["source"] == "signal.breach_price"
+    assert result["provenance"]["quote"] is None
+    assert quote_calls == []
 
 
 @pytest.mark.parametrize(

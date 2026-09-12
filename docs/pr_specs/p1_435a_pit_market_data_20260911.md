@@ -104,7 +104,7 @@ For `phase == "BREACH"`:
 7. Return completed `5m`, `15m`, derived `1h`, and derived `4h` candles under `data_sources.candles`.
 8. Return an explicit `as_of` field equal to the breach timestamp.
 9. Never call the current quote, market quote, or sector quote readers for BREACH.
-10. Underlying BREACH observation may use only already-frozen signal evidence such as `breach_price` / frozen underlying price and must identify that source; no fresh quote may substitute.
+10. Underlying BREACH observation may use only already-frozen signal evidence such as `breach_price` / frozen underlying price and must identify that source; no fresh quote may substitute. Generic current or signal-time prices cannot satisfy BREACH observation authority and cannot be used as fallback evidence.
 
 For `PRETRIGGER` and `PREOPEN`, preserve current behavior. Do not add the 5m read to those paths in this PR.
 
