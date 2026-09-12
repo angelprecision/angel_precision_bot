@@ -71,6 +71,10 @@ _CacheKey = tuple[str, str, Optional[int]]
 
 _cache_lock = threading.Lock()
 _candle_cache: dict[_CacheKey, tuple[float, list[dict[str, Any]]]] = {}
+# Exact PIT keys in this set were produced by a successful provider response.
+# That makes an empty list authoritative for that immutable bucket without
+# conflating it with a transport/provider failure, which is never marked.
+_pit_snapshot_authoritative: set[_CacheKey] = set()
 
 # ── singleflight (#283 review amendment, round 2) ────────────────────────────
 # The TTL cache alone protects read/write, not IN-FLIGHT fetches: a 50–100
@@ -220,9 +224,10 @@ def _cached_bars(
 ) -> Optional[list[dict[str, Any]]]:
     with _cache_lock:
         hit = _candle_cache.get(cache_key)
+        pit_authoritative = cache_key in _pit_snapshot_authoritative
     if not hit or (time.monotonic() - hit[0]) >= CANDLE_TTL_SEC:
         return None
-    if now is not None and not _cache_covers_as_of(
+    if now is not None and not pit_authoritative and not _cache_covers_as_of(
         hit[1], interval_minutes=interval_minutes, as_of=now
     ):
         return None
@@ -366,7 +371,12 @@ def _fetch_intraday_bars_network(
             if cache_key not in _candle_cache and len(_candle_cache) >= _CACHE_MAX_TICKERS:
                 oldest = min(_candle_cache, key=lambda k: _candle_cache[k][0])
                 _candle_cache.pop(oldest, None)
+                _pit_snapshot_authoritative.discard(oldest)
             _candle_cache[cache_key] = (time.monotonic(), bars)
+            if now is not None:
+                _pit_snapshot_authoritative.add(cache_key)
+            else:
+                _pit_snapshot_authoritative.discard(cache_key)
         return bars
     except Exception as exc:
         log.warning("fvg_telemetry: timesales fetch failed for %s: %s", key, exc)
