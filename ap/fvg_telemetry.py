@@ -84,8 +84,15 @@ _pit_snapshot_authoritative: set[_CacheKey] = set()
 # wait on the leader's Event (bounded by FETCH_WAIT_SEC > request timeout),
 # then re-read the cache. A leader failure releases followers, who observe the
 # empty cache and degrade to 'no candles' — never a second herd.
+class _InFlight:
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.result: Optional[list[dict[str, Any]]] = None
+        self.succeeded = False
+
+
 _inflight_lock = threading.Lock()
-_inflight: dict[_CacheKey, threading.Event] = {}
+_inflight: dict[_CacheKey, _InFlight] = {}
 FETCH_WAIT_SEC = 12.0  # > 10s request timeout so followers outlast the leader
 
 # Telemetry thread cap: burst threads are cheap under singleflight (they park
@@ -294,24 +301,28 @@ def _fetch_intraday_bars(
 
         # Leader election is scoped to ticker, interval, and as-of bucket.
         with _inflight_lock:
-            evt = _inflight.get(cache_key)
-            if evt is None:
-                evt = threading.Event()
-                _inflight[cache_key] = evt
+            flight = _inflight.get(cache_key)
+            if flight is None:
+                flight = _InFlight()
+                _inflight[cache_key] = flight
                 is_leader = True
             else:
                 is_leader = False
 
         if not is_leader:
-            # Follower: park until the leader finishes (or times out), then
-            # re-read the cache exactly once. Missing coverage → fail soft.
-            evt.wait(FETCH_WAIT_SEC)
+            # Follower: a successful flight hands off the leader's exact
+            # snapshot, including a deliberately stale PIT response. Only a
+            # failed/expired wait falls back to the existing cache check.
+            flight.event.wait(FETCH_WAIT_SEC)
+            with _inflight_lock:
+                if flight.succeeded:
+                    return flight.result if flight.result is not None else []
             return _cached_bars(
                 cache_key, now=now, interval_minutes=interval_minutes
             ) or []
 
         try:
-            return _fetch_intraday_bars_network(
+            result = _fetch_intraday_bars_network(
                 key,
                 broker,
                 interval=interval,
@@ -319,11 +330,15 @@ def _fetch_intraday_bars(
                 cache_key=cache_key,
                 now=now,
             )
+            with _inflight_lock:
+                flight.result = result
+                flight.succeeded = True
+            return result
         finally:
             # Release followers and clear the marker even on failure.
             with _inflight_lock:
                 _inflight.pop(cache_key, None)
-            evt.set()
+            flight.event.set()
 
 
 def fetch_15m_bars(

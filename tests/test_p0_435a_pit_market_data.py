@@ -7,8 +7,10 @@ BREACH-specific assertions.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import math
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -512,6 +514,60 @@ def test_successful_but_stale_in_session_pit_response_is_not_reused(monkeypatch)
     assert len(broker.session.calls) == 2
 
 
+def test_successful_stale_pit_singleflight_hands_off_exact_snapshot(monkeypatch):
+    trigger = datetime(2026, 9, 11, 14, 7, tzinfo=timezone.utc)
+    stale_rows = [_bar(datetime(2026, 9, 11, 13, 55, tzinfo=timezone.utc))]
+    follower_checked_cache = threading.Event()
+    original_cached_bars = fvg._cached_bars
+    cache_checks = 0
+
+    def tracked_cached_bars(*args, **kwargs):
+        nonlocal cache_checks
+        result = original_cached_bars(*args, **kwargs)
+        cache_checks += 1
+        if cache_checks >= 2:
+            follower_checked_cache.set()
+        return result
+
+    def responder(params, _call_number):
+        assert params["interval"] == "5min"
+        assert follower_checked_cache.wait(2), "follower did not join the flight"
+        return stale_rows
+
+    broker = _Broker(responder)
+    monkeypatch.setattr(fvg, "_cached_bars", tracked_cached_bars)
+    monkeypatch.setattr(
+        fvg, "_resolve_base_url", lambda _broker: "https://api.tradier.com"
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        leader = pool.submit(fvg.fetch_5m_bars, "SPY", broker, now=trigger)
+        follower = pool.submit(fvg.fetch_5m_bars, "SPY", broker, now=trigger)
+        first = leader.result(timeout=3)
+        second = follower.result(timeout=3)
+
+    assert len(broker.session.calls) == 1
+    assert first == second
+    assert first != []
+    for bars in (first, second):
+        coverage = imd._describe_pit_coverage(
+            bars,
+            interval_minutes=5,
+            as_of=trigger,
+            source="provider_response",
+            authoritative_source=True,
+        )
+        assert coverage["status"] == "STALE"
+        assert coverage["coverage_complete"] is False
+        assert coverage["authoritative"] is False
+
+    # Once the flight is over, a new caller must still reject the stale cache
+    # and issue a fresh provider request.
+    independent = fvg.fetch_5m_bars("SPY", broker, now=trigger)
+    assert independent == stale_rows
+    assert len(broker.session.calls) == 2
+
+
 def test_breach_exposes_stale_first_pit_response_and_recovers(monkeypatch):
     # 10:07 ET: 10:00-10:05 is the latest completed 5m candle that should
     # exist.  The first provider response stops at 10:00 ET.
@@ -558,6 +614,60 @@ def test_breach_exposes_stale_first_pit_response_and_recovers(monkeypatch):
     assert second_coverage["authoritative"] is True
     assert len(second["data_sources"]["candles"]["5m"]) == 2
     assert calls_by_interval == {"15min": 1, "5min": 2}
+
+
+@pytest.mark.parametrize("interval", ["5m", "15m"])
+def test_complete_frozen_pit_evidence_outranks_stale_provider(interval, monkeypatch):
+    trigger = datetime(2026, 9, 11, 14, 7, tzinfo=timezone.utc)
+    if interval == "5m":
+        provider_rows = [_bar(datetime(2026, 9, 11, 13, 55, tzinfo=timezone.utc))]
+        frozen_rows = [_bar(datetime(2026, 9, 11, 14, 0, tzinfo=timezone.utc), price=130.50)]
+        provider_interval = "5min"
+        provenance_key = "intraday_5m"
+        interval_minutes = 5
+    else:
+        provider_rows = [_bar(datetime(2026, 9, 11, 13, 30, tzinfo=timezone.utc))]
+        frozen_rows = [_bar(datetime(2026, 9, 11, 13, 45, tzinfo=timezone.utc), price=130.50)]
+        provider_interval = "15min"
+        provenance_key = "intraday"
+        interval_minutes = 15
+    expected_observed_close = (
+        datetime.fromisoformat(frozen_rows[-1]["time"])
+        + timedelta(minutes=interval_minutes)
+    ).astimezone(imd.ET).isoformat()
+
+    def responder(params, _call_number):
+        if params["interval"] == provider_interval:
+            return provider_rows
+        return []
+
+    broker = _Broker(responder)
+    monkeypatch.setattr(
+        fvg, "_resolve_base_url", lambda _broker: "https://api.tradier.com"
+    )
+    monkeypatch.setattr(imd, "_history", lambda *_a, **_k: [])
+    signal = _breach_signal(
+        trigger_crossed_at=trigger.isoformat(),
+        breach_price=130.50,
+        candles_5m=frozen_rows if interval == "5m" else [],
+        candles_15m=frozen_rows if interval == "15m" else [],
+    )
+
+    result = imd.collect_point_in_time_context(signal, broker=broker, phase="BREACH")
+    selected = result["data_sources"]["candles"][interval]
+    coverage = result["data_sources"]["coverage"][interval]
+
+    assert result["as_of"] == trigger.isoformat()
+    assert selected == frozen_rows
+    assert provider_rows[0] not in selected
+    assert coverage["status"] == "COMPLETE"
+    assert coverage["coverage_complete"] is True
+    assert coverage["authoritative"] is True
+    assert coverage["source"] == "signal_frozen"
+    assert coverage["latest_observed_close"] == expected_observed_close
+    assert result["provenance"][provenance_key] == (
+        "signal_frozen_5min" if interval == "5m" else "signal_frozen_15min"
+    )
 
 
 def test_failed_pit_request_is_not_cached_as_authoritative_empty(monkeypatch):

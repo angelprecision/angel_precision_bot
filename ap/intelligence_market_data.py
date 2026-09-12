@@ -414,6 +414,25 @@ def _describe_pit_coverage(
     }
 
 
+def _select_pit_interval_source(
+    provider_bars: list[dict[str, Any]],
+    frozen_bars: list[dict[str, Any]],
+    *,
+    provider_coverage: dict[str, Any],
+    frozen_coverage: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any], bool]:
+    """Choose one interval source without merging or inventing evidence."""
+    if provider_coverage.get("coverage_complete") is True:
+        return provider_bars, provider_coverage, False
+    if frozen_coverage.get("coverage_complete") is True:
+        return frozen_bars, frozen_coverage, True
+    if provider_bars:
+        return provider_bars, provider_coverage, False
+    if frozen_bars:
+        return frozen_bars, frozen_coverage, True
+    return provider_bars, provider_coverage, False
+
+
 def _strict_breach_numeric(value: Any) -> Optional[float]:
     if value is None or isinstance(value, bool):
         return None
@@ -595,18 +614,25 @@ def _collect_breach_context(
     frozen_15m = _filter_completed_bars(
         extract_candles(signal, "15m"), interval_minutes=15, as_of=evidence_now
     )
-    used_frozen_15m = not bars_15m and bool(frozen_15m)
-    if used_frozen_15m:
-        bars_15m = frozen_15m
-        coverage_15m_source = "signal_frozen"
-    else:
-        coverage_15m_source = "provider_response" if fetched_15m else "unavailable"
-    coverage_15m = _describe_pit_coverage(
+    provider_coverage_15m = _describe_pit_coverage(
         bars_15m,
         interval_minutes=15,
         as_of=evidence_now,
-        source=coverage_15m_source,
-        authoritative_source=bool(bars_15m) and coverage_15m_source != "unavailable",
+        source="provider_response" if fetched_15m else "unavailable",
+        authoritative_source=fetched_15m,
+    )
+    frozen_coverage_15m = _describe_pit_coverage(
+        frozen_15m,
+        interval_minutes=15,
+        as_of=evidence_now,
+        source="signal_frozen",
+        authoritative_source=True,
+    )
+    bars_15m, coverage_15m, used_frozen_15m = _select_pit_interval_source(
+        bars_15m,
+        frozen_15m,
+        provider_coverage=provider_coverage_15m,
+        frozen_coverage=frozen_coverage_15m,
     )
 
     bars_5m = _filter_completed_bars(
@@ -615,18 +641,25 @@ def _collect_breach_context(
     frozen_5m = _filter_completed_bars(
         extract_candles(signal, "5m"), interval_minutes=5, as_of=evidence_now
     )
-    used_frozen_5m = not bars_5m and bool(frozen_5m)
-    if used_frozen_5m:
-        bars_5m = frozen_5m
-        coverage_5m_source = "signal_frozen"
-    else:
-        coverage_5m_source = "provider_response" if fetched_5m else "unavailable"
-    coverage_5m = _describe_pit_coverage(
+    provider_coverage_5m = _describe_pit_coverage(
         bars_5m,
         interval_minutes=5,
         as_of=evidence_now,
-        source=coverage_5m_source,
-        authoritative_source=bool(bars_5m) and coverage_5m_source != "unavailable",
+        source="provider_response" if fetched_5m else "unavailable",
+        authoritative_source=fetched_5m,
+    )
+    frozen_coverage_5m = _describe_pit_coverage(
+        frozen_5m,
+        interval_minutes=5,
+        as_of=evidence_now,
+        source="signal_frozen",
+        authoritative_source=True,
+    )
+    bars_5m, coverage_5m, used_frozen_5m = _select_pit_interval_source(
+        bars_5m,
+        frozen_5m,
+        provider_coverage=provider_coverage_5m,
+        frozen_coverage=frozen_coverage_5m,
     )
 
     try:

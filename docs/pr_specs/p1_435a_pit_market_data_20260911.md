@@ -81,6 +81,8 @@ For `now is None`, preserve the existing live/TTL behavior, but interval identit
 
 A cached series may satisfy an as-of request when its latest completed-bar coverage reaches the RTH close boundary that should exist at that exact as-of time. A successful exact-bucket provider response may also be reused when no current-session RTH close is expected yet, such as 09:32 ET for a 5-minute request. Once an RTH bar should exist, successful-but-stale data must not be blessed by cache authority. A transport/provider exception must never be marked as authoritative empty and must remain retryable.
 
+Callers that join the same successful singleflight must receive the leader's exact response snapshot, including a successful but stale PIT response. This handoff does not make stale data reusable by later independent calls; those calls must continue to reject stale cache coverage and refetch.
+
 After provider normalization and completed-bar filtering, BREACH evidence must expose explicit interval coverage metadata: `coverage_complete`, `latest_expected_close`, `latest_observed_close`, `status`, and whether the response is authoritative. If the expected RTH close is missing, older returned bars are `STALE` and no returned completed bars are `MISSING`; neither state is authoritative for the latest interval condition. Older bars may remain available for 1h/4h structure, but they must not be indistinguishable from complete 5m/15m evidence. A later refetch may replace the stale result with `COMPLETE` coverage.
 
 ### C. Exclude incomplete/future candles
@@ -103,7 +105,7 @@ For `phase == "BREACH"`:
 3. Set `evidence_now = trigger_crossed_at`.
 4. Fetch daily history bounded to `evidence_now`.
 5. Fetch 15m and 5m timesales with `now=evidence_now`.
-6. If contemporaneously frozen `candles_15m` / `candles_5m` already exist in the signal, they may be used as fail-soft fallback only after filtering to the same as-of boundary.
+6. Provider and contemporaneously frozen `candles_15m` / `candles_5m` are filtered and assessed independently at the same as-of boundary. A `COMPLETE` provider interval wins; when provider coverage is `STALE` or `MISSING` and the frozen interval is `COMPLETE`, select the frozen interval with `source: signal_frozen` and do not merge the two sources. If both are incomplete, retain one deterministic source according to the existing provenance preference and expose its honest `STALE`/`MISSING` coverage.
 7. Return completed `5m`, `15m`, derived `1h`, and derived `4h` candles under `data_sources.candles`.
 8. Return an explicit `as_of` field equal to the breach timestamp.
 9. Never call the current quote, market quote, or sector quote readers for BREACH.
