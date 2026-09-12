@@ -72,8 +72,8 @@ _CacheKey = tuple[str, str, Optional[int]]
 _cache_lock = threading.Lock()
 _candle_cache: dict[_CacheKey, tuple[float, list[dict[str, Any]]]] = {}
 # Exact PIT keys in this set were produced by a successful provider response.
-# That makes an empty list authoritative for that immutable bucket without
-# conflating it with a transport/provider failure, which is never marked.
+# They may satisfy a no-current-RTH-bar-yet bucket even when the latest bar is
+# from an earlier session. Transport/provider failures are never marked.
 _pit_snapshot_authoritative: set[_CacheKey] = set()
 
 # ── singleflight (#283 review amendment, round 2) ────────────────────────────
@@ -133,6 +133,36 @@ def _as_of_bucket(now: datetime, *, interval_minutes: int) -> Optional[int]:
     bucket_seconds = interval_minutes * 60
     epoch_seconds = int(now.astimezone(timezone.utc).timestamp())
     return epoch_seconds - (epoch_seconds % bucket_seconds)
+
+
+def _required_rth_close(
+    now: datetime, *, interval_minutes: int
+) -> Optional[datetime]:
+    """Latest RTH candle close that should exist at ``now``.
+
+    ``None`` means no current-session close is expected yet.  Weekends are
+    treated the same way; weekday exchange holidays conservatively remain
+    retryable rather than being guessed as authoritative no-session days.
+    """
+    if now.tzinfo is None or now.utcoffset() is None or interval_minutes <= 0:
+        return None
+    now_et = now.astimezone(ET)
+    if now_et.weekday() >= 5:
+        return None
+    session_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    session_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    first_close = session_open + timedelta(minutes=interval_minutes)
+    if now_et < first_close:
+        return None
+    effective = min(now_et, session_close)
+    elapsed_minutes = int((effective - session_open).total_seconds() // 60)
+    completed_intervals = elapsed_minutes // interval_minutes
+    if completed_intervals <= 0:
+        return None
+    return min(
+        session_open + timedelta(minutes=completed_intervals * interval_minutes),
+        session_close,
+    )
 
 
 def _cache_key(
@@ -201,10 +231,11 @@ def _filter_completed_bars(
 def _cache_covers_as_of(
     bars: list[dict[str, Any]], *, interval_minutes: int, as_of: datetime
 ) -> bool:
-    bucket = _as_of_bucket(as_of, interval_minutes=interval_minutes)
-    if bucket is None:
+    required_boundary = _required_rth_close(
+        as_of, interval_minutes=interval_minutes
+    )
+    if required_boundary is None:
         return False
-    required_boundary = datetime.fromtimestamp(bucket, tz=timezone.utc)
     interval = timedelta(minutes=interval_minutes)
     latest_close: Optional[datetime] = None
     for bar in bars:
@@ -227,10 +258,17 @@ def _cached_bars(
         pit_authoritative = cache_key in _pit_snapshot_authoritative
     if not hit or (time.monotonic() - hit[0]) >= CANDLE_TTL_SEC:
         return None
-    if now is not None and not pit_authoritative and not _cache_covers_as_of(
-        hit[1], interval_minutes=interval_minutes, as_of=now
-    ):
-        return None
+    if now is not None:
+        required_boundary = _required_rth_close(
+            now, interval_minutes=interval_minutes
+        )
+        if required_boundary is None:
+            if not pit_authoritative:
+                return None
+        elif not _cache_covers_as_of(
+            hit[1], interval_minutes=interval_minutes, as_of=now
+        ):
+            return None
     return hit[1]
 
 
