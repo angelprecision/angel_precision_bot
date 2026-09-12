@@ -79,7 +79,7 @@ For `now is not None`, cache and singleflight identity must include at least:
 
 For `now is None`, preserve the existing live/TTL behavior, but interval identity must still prevent 5m and 15m collisions.
 
-A cached series may satisfy an as-of request only if its latest completed-bar coverage reaches the completed boundary required by that request.
+A cached series may satisfy an as-of request only if its latest completed-bar coverage reaches the completed boundary required by that request, **or** the exact immutable PIT key was populated by a successful provider response that authoritatively returned no completed bars for that bucket. A transport/provider exception must never be marked as authoritative empty and must remain retryable.
 
 ### C. Exclude incomplete/future candles
 
@@ -89,7 +89,8 @@ When an as-of timestamp is supplied:
 - a candle is usable only when `bar_open + interval <= as_of`;
 - malformed/naive candle timestamps are ignored;
 - bars after the as-of timestamp never influence derived data;
-- the current in-progress 5m/15m candle is excluded.
+- the current in-progress 5m/15m candle is excluded;
+- derived 1h/4h candles are emitted only when every expected 15m constituent slot for the completed RTH bucket exists exactly once; a missing, duplicate, or misaligned constituent makes that derived bucket unavailable rather than synthesizing partial OHLC.
 
 ### D. BREACH as-of authority in `collect_point_in_time_context`
 
@@ -133,14 +134,16 @@ Minimum matrix:
 3. Missing/malformed/naive `trigger_crossed_at` causes a fail-closed BREACH context and zero broker/market-data reads.
 4. 5m candle whose close boundary is after `as_of` is excluded.
 5. 15m candle whose close boundary is after `as_of` is excluded.
-6. Derived 1h contains only fully completed 15m input buckets.
-7. Derived 4h contains only fully completed RTH-session-anchored input buckets.
+6. Derived 1h contains only fully completed 15m input buckets and is omitted when any expected constituent is missing.
+7. Derived 4h contains only fully completed RTH-session-anchored input buckets and is omitted when any expected constituent is missing.
 8. Two as-of reads crossing a completed 15m boundary cannot share stale cached coverage.
 9. 5m and 15m cache/singleflight keys cannot collide.
 10. Same ticker + same live interval still coalesces under existing TTL behavior.
 11. PRETRIGGER/PREOPEN current-quote behavior remains unchanged.
 12. Any market-data exception remains fail-soft and cannot raise into trading.
 13. No broker submit/cancel/order/position/proof/queue mutation is reachable from the new foundation.
+14. Two reads of the same exact PIT bucket reuse a successful authoritative empty snapshot instead of refetching.
+15. A provider/transport failure returning no data is not cached as authoritative empty and is retried on the next request.
 
 ## Required fail-first evidence
 
