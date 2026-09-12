@@ -79,7 +79,7 @@ For `now is not None`, cache and singleflight identity must include at least:
 
 For `now is None`, preserve the existing live/TTL behavior, but interval identity must still prevent 5m and 15m collisions.
 
-A cached series may satisfy an as-of request only if its latest completed-bar coverage reaches the completed boundary required by that request, **or** the exact immutable PIT key was populated by a successful provider response that authoritatively returned no completed bars for that bucket. A transport/provider exception must never be marked as authoritative empty and must remain retryable.
+A cached series may satisfy an as-of request when its latest completed-bar coverage reaches the RTH close boundary that should exist at that exact as-of time. A successful exact-bucket provider response may also be reused when no current-session RTH close is expected yet, such as 09:32 ET for a 5-minute request. Once an RTH bar should exist, successful-but-stale data must not be blessed by cache authority. A transport/provider exception must never be marked as authoritative empty and must remain retryable.
 
 ### C. Exclude incomplete/future candles
 
@@ -142,8 +142,9 @@ Minimum matrix:
 11. PRETRIGGER/PREOPEN current-quote behavior remains unchanged.
 12. Any market-data exception remains fail-soft and cannot raise into trading.
 13. No broker submit/cancel/order/position/proof/queue mutation is reachable from the new foundation.
-14. Two reads of the same exact PIT bucket reuse a successful authoritative empty snapshot instead of refetching.
-15. A provider/transport failure returning no data is not cached as authoritative empty and is retried on the next request.
+14. Two reads of the same exact PIT bucket reuse a successful response when no current-session RTH close is expected yet.
+15. A successful but stale in-session PIT response is not reused after the expected RTH close exists.
+16. A provider/transport failure returning no data is not cached as authoritative empty and is retried on the next request.
 
 ## Required fail-first evidence
 
