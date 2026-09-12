@@ -1,0 +1,1 @@
+This branch contains specification material only for a future FVG hold/bounce classifier. The binding spec is `p1_fvg_hold_bounce_classifier_binding_20260912.md`.
