@@ -74,21 +74,25 @@ A wick through that closes back inside is `WICK_ONLY`.
 These values are telemetry. They cannot allow, block, delay, rearm,
 terminalize, or submit a trade in #435-B.
 
-## Current production-data limitation
+## #614 point-in-time contract
 
-Current market-data infrastructure already sources 15-minute RTH bars and
-aggregates them into 1H/4H FVG candles. Current `main` does not expose a
-canonical exact 5-minute series to this new helper.
+Merged #614 now supplies the canonical BREACH envelope consumed by this PR:
 
-Therefore:
+- `point_in_time["as_of"]` is the exact `trigger_crossed_at` evidence boundary;
+- `point_in_time["data_sources"]["candles"]` contains exact frozen 5m and 15m
+  rows plus complete session-anchored 1H and 4H rows derived from 15m;
+- `point_in_time["data_sources"]["coverage"]` and
+  `point_in_time["provenance"]` travel with the snapshot;
+- `point_in_time["underlying_observation"]` is the frozen breach observation.
 
-- 15m evidence can be consumed when supplied by the BREACH snapshot caller;
-- 5m remains `MISSING` unless an exact point-in-time 5m source is supplied;
-- this PR does not synthesize 5m candles from another timeframe;
-- this PR adds no extra Tradier request.
+`freeze_breach_market_structure_from_pit()` is a narrow adapter from that
+envelope to the existing freezer. It uses `as_of`, never `collected_at`, and
+does not refetch, aggregate, or synthesize candles. Exact 5m evidence is now
+usable when #614 supplies it; a missing, stale, failed, or non-authoritative
+source remains non-authoritative and cannot produce a trustworthy strong break.
 
-Caller/wiring into the BREACH snapshot lifecycle is intentionally outside this
-recut so the helper cannot silently become money-path authority.
+Caller/wiring into entry authority remains intentionally outside this recut so
+the helper cannot silently become money-path authority.
 
 ## Authority and money-path invariants
 
@@ -107,8 +111,10 @@ It has:
 
 ## Point-in-time rules
 
-- Missing `data_as_of` means no candle can be proven complete, so candle-derived
-  evidence stays missing.
+- Missing or invalid PIT `as_of` means no candle can be proven complete, so
+  candle-derived evidence stays missing.
+- `collected_at` is descriptive worker metadata only; it cannot move the
+  evidence boundary.
 - Timestamps must be timezone-aware. Naive or malformed timestamps are excluded;
   the helper never guesses that a naive value is ET.
 - OHLC bars must start on the session-aligned 09:30 ET grid and fall inside
@@ -139,6 +145,12 @@ The focused suite executes:
 - strong PUT 15m >=50% body break;
 - symmetric CALL break through bearish FVG resistance;
 - pre-formation penetration exclusion;
+- 5m/15m straddling-breach completion-boundary timestamps;
+- real #614 BREACH envelope -> #615 adapter integration for exact 5m/15m and
+  derived 1H/4H candles;
+- frozen-observation precedence over contradictory current aliases;
+- stale/provider-failure coverage cannot assert a strong break, while
+  authoritative frozen coverage can measure one;
 - completed-close pullback -> reclaim -> re-breach;
 - exact-VI-or-MISSING provenance and approximation contract;
 - regime no-fabrication;
@@ -146,7 +158,7 @@ The focused suite executes:
 - input immutability + zero-authority invariant.
 
 Local isolated execution against the current canonical detector contract:
-`18 passed` after the PIT/session hardening amendment.
+`33 passed` after the #614 envelope adapter and completion-boundary amendment.
 
 Repository CI remains the merge proof. Any exact-head and merge-ref checks from
 the prior head must rerun for this amendment. This PR stays HARD HOLD.

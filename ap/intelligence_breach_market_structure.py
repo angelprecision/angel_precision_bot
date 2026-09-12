@@ -7,6 +7,7 @@ strength" result is telemetry only; later policy may consume it after replay.
 
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import math
 from datetime import datetime, timedelta, timezone
@@ -174,6 +175,31 @@ def _frozen_breach_price(
     cutoff = _ts(as_of)
     if cutoff is None:
         return None, None
+    if "_pit_underlying_observation" in signal:
+        raw = signal.get("_pit_underlying_observation")
+        if not isinstance(raw, Mapping):
+            return None, None
+        price = next(
+            (
+                _num(raw.get(key))
+                for key in ("price", "underlying_price", "breach_price", "value")
+                if _num(raw.get(key)) is not None
+            ),
+            None,
+        )
+        observed = _ts(
+            next(
+                (
+                    raw.get(key)
+                    for key in ("as_of", "data_as_of", "timestamp", "observed_at", "time")
+                    if raw.get(key) not in (None, "")
+                ),
+                None,
+            )
+        )
+        if price is None or observed is None or observed > cutoff:
+            return None, None
+        return price, "point_in_time.underlying_observation"
     candidates = (
         ("signal.breach_price", signal.get("breach_price")),
         ("signal.frozen_underlying_price", signal.get("frozen_underlying_price")),
@@ -404,9 +430,65 @@ def _last_boundary_interaction(
     return None
 
 
+def _coverage_is_authoritative(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    status = str(value.get("status") or "").upper()
+    provider_status = str(value.get("provider_status") or "").lower()
+    return (
+        value.get("authoritative") is True
+        and value.get("coverage_complete") is True
+        and status not in {"STALE", "MISSING", "ERROR", "FAILED"}
+        and provider_status not in {"error", "failed", "failure"}
+    )
+
+
+def _provenance_for_timeframe(
+    provenance: Mapping[str, Any] | None, timeframe: str
+) -> Any:
+    if not isinstance(provenance, Mapping):
+        return None
+    key = "intraday_5m" if timeframe == "5m" else "intraday"
+    return deepcopy(provenance.get(key, provenance.get(timeframe)))
+
+
+def _apply_penetration_authority(
+    measured: dict[str, Any], *, coverage: Any, provenance: Any, timeframe: str
+) -> dict[str, Any]:
+    """Keep raw measurements visible while refusing untrusted break authority."""
+    if not isinstance(coverage, Mapping):
+        return measured
+
+    source_coverage = coverage.get(timeframe)
+    authoritative = _coverage_is_authoritative(source_coverage)
+    measured["source_coverage"] = deepcopy(source_coverage)
+    measured["source_provenance"] = _provenance_for_timeframe(provenance, timeframe)
+    measured["coverage_authoritative"] = authoritative
+    measured["measured_style"] = measured.get("style")
+    measured["measured_fifty_percent_body_through"] = bool(
+        measured.get("fifty_percent_body_through")
+    )
+    measured["measured_strong_body"] = bool(measured.get("strong_body"))
+    measured["measured_strong_break_observed"] = bool(
+        measured.get("strong_break_observed")
+    )
+    if not authoritative:
+        if measured.get("status") == "AVAILABLE":
+            measured["style"] = f"NON_AUTHORITATIVE_{measured.get('style')}"
+        measured["fifty_percent_body_through"] = False
+        measured["strong_body"] = False
+        measured["strong_break_observed"] = False
+    measured["strong_break_authoritative"] = bool(
+        authoritative and measured.get("strong_break_observed") is True
+    )
+    return measured
+
+
 def freeze_penetration(
     *, side: str, zone: Mapping[str, Any] | None,
     candles: Mapping[str, Any], as_of: Any,
+    coverage: Mapping[str, Any] | None = None,
+    provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     boundary = _break_boundary(zone, side)
     not_before = None
@@ -427,8 +509,13 @@ def freeze_penetration(
             minutes=minutes,
             not_before=not_before,
         )
-        results[tf] = measure_boundary_penetration(
-            side=side, boundary=boundary, candle=candle, timeframe=tf
+        results[tf] = _apply_penetration_authority(
+            measure_boundary_penetration(
+                side=side, boundary=boundary, candle=candle, timeframe=tf
+            ),
+            coverage=coverage,
+            provenance=provenance,
+            timeframe=tf,
         )
     return {
         "status": "AVAILABLE" if boundary is not None else "NO_OPPOSING_FVG",
@@ -436,6 +523,14 @@ def freeze_penetration(
         "boundary": boundary, **results,
         "strong_break_on_5m_or_15m": any(
             results[tf]["strong_break_observed"] for tf in ("5m", "15m")
+        ),
+        "strong_break_authoritative": (
+            any(
+                results[tf].get("strong_break_authoritative") is True
+                for tf in ("5m", "15m")
+            )
+            if isinstance(coverage, Mapping)
+            else None
         ),
         "observe_only": True, "affected_eligibility": False,
     }
@@ -466,7 +561,7 @@ def freeze_pullback_reclaim_rebreach(
     """Completed-close sequence only; supplied lifecycle lineage stays separate."""
     t = _num(trigger)
     breach_dt = _ts(breach_at) if breach_at not in (None, "") else None
-    source_tf, rows = None, []
+    source_tf, source_minutes, rows = None, None, []
     for tf, minutes in (("5m", 5), ("15m", 15)):
         raw = candles.get(tf) or candles.get(tf.upper()) or (
             candles.get("15min") if tf == "15m" else []
@@ -477,10 +572,14 @@ def freeze_pullback_reclaim_rebreach(
         elif breach_dt is not None:
             completed = [
                 row for row in completed
-                if (_row_ts(row) is not None and _row_ts(row) >= breach_dt)
+                if (
+                    _row_ts(row) is not None
+                    and _bucket_end(_row_ts(row), minutes) is not None
+                    and _bucket_end(_row_ts(row), minutes) > breach_dt
+                )
             ]
         if completed:
-            source_tf, rows = tf, completed
+            source_tf, source_minutes, rows = tf, minutes, completed
             break
     lineage = str(supplied_lineage or "UNKNOWN").upper()
     if (
@@ -519,7 +618,8 @@ def freeze_pullback_reclaim_rebreach(
     def stamp(index: Optional[int]) -> Optional[str]:
         if index is None:
             return None
-        dt = _row_ts(rows[index])
+        start = _row_ts(rows[index])
+        dt = _bucket_end(start, source_minutes or 0) if start is not None else None
         return dt.isoformat() if dt else None
 
     return {
@@ -610,7 +710,12 @@ def freeze_breach_market_structure(
     )
     zone = _nearest_opposing(zones)
     penetration = freeze_penetration(
-        side=side, zone=zone, candles=candles, as_of=as_of
+        side=side,
+        zone=zone,
+        candles=candles,
+        as_of=as_of,
+        coverage=ctx.get("_pit_coverage"),
+        provenance=ctx.get("_pit_provenance"),
     )
     pullback = freeze_pullback_reclaim_rebreach(
         side=side, trigger=trigger, candles=candles, as_of=as_of,
@@ -641,3 +746,120 @@ def freeze_breach_market_structure(
             "proof_trade_mutation_authority": False, "queue_mutation_authority": False,
         },
     }
+
+
+def _pit_candles(raw: Any) -> list[dict[str, Any]]:
+    return [dict(row) for row in raw if isinstance(row, Mapping)] if isinstance(raw, list) else []
+
+
+def _pit_observation(
+    raw: Any, *, as_of: Optional[datetime]
+) -> Optional[dict[str, Any]]:
+    if as_of is None or not isinstance(raw, Mapping):
+        return None
+    price = next(
+        (
+            _num(raw.get(key))
+            for key in ("price", "underlying_price", "breach_price", "value")
+            if _num(raw.get(key)) is not None
+        ),
+        None,
+    )
+    source = raw.get("source")
+    if price is None or not isinstance(source, str) or not source.strip():
+        return None
+    for key in ("observed_at", "source_timestamp"):
+        value = raw.get(key)
+        if value in (None, ""):
+            continue
+        parsed = _ts(value)
+        if parsed is None or parsed > as_of:
+            return None
+    return {
+        "price": price,
+        "source": source,
+        "observed_at": raw.get("observed_at") or as_of.isoformat(),
+        "source_timestamp": raw.get("source_timestamp") or as_of.isoformat(),
+        "as_of": as_of.isoformat(),
+    }
+
+
+def freeze_breach_market_structure_from_pit(
+    signal: Mapping[str, Any],
+    point_in_time: Mapping[str, Any] | None,
+    *,
+    volume_imbalance: Any = None,
+    boundary_tolerance: float = 0.01,
+) -> dict[str, Any]:
+    """Adapt the canonical #614 BREACH envelope without refetching or rebuilding."""
+    pit = dict(point_in_time) if isinstance(point_in_time, Mapping) else {}
+    parsed_as_of = _ts(pit.get("as_of"))
+    data_sources = pit.get("data_sources")
+    data_sources = data_sources if isinstance(data_sources, Mapping) else {}
+    raw_candles = data_sources.get("candles")
+    raw_candles = raw_candles if isinstance(raw_candles, Mapping) else {}
+    intervals = {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
+    candles = {
+        timeframe: (
+            completed_bars_as_of(
+                _pit_candles(raw_candles.get(timeframe)),
+                as_of=parsed_as_of,
+                minutes=minutes,
+            )
+            if parsed_as_of is not None
+            else []
+        )
+        for timeframe, minutes in intervals.items()
+    }
+    raw_coverage = data_sources.get("coverage")
+    coverage = dict(raw_coverage) if isinstance(raw_coverage, Mapping) else {}
+    raw_provenance = pit.get("provenance")
+    provenance = dict(raw_provenance) if isinstance(raw_provenance, Mapping) else {}
+    observation = _pit_observation(
+        pit.get("underlying_observation"), as_of=parsed_as_of
+    )
+
+    canonical_signal = dict(signal or {})
+    for key in (
+        "breach_price",
+        "frozen_underlying_price",
+        "underlying_at_breach",
+        "price_at_breach",
+        "breach_evidence",
+        "volume_imbalance",
+    ):
+        canonical_signal.pop(key, None)
+    canonical_signal["_pit_underlying_observation"] = observation
+    if parsed_as_of is None:
+        for key in ("trigger_crossed_at", "breach_at", "data_as_of"):
+            canonical_signal.pop(key, None)
+        candles = {timeframe: [] for timeframe in ("5m", "15m", "1h", "4h")}
+
+    frozen = freeze_breach_market_structure(
+        canonical_signal,
+        market_context={
+            "candles": candles,
+            "_pit_coverage": coverage,
+            "_pit_provenance": provenance,
+        },
+        data_as_of=parsed_as_of.isoformat() if parsed_as_of else None,
+        volume_imbalance=volume_imbalance,
+        boundary_tolerance=boundary_tolerance,
+    )
+    frozen["point_in_time"] = {
+        "phase": pit.get("phase"),
+        "as_of": pit.get("as_of"),
+        "collected_at": pit.get("collected_at"),
+        "data_sources": {
+            "candles": deepcopy(candles),
+            "coverage": deepcopy(coverage),
+        },
+        "underlying_observation": deepcopy(pit.get("underlying_observation")),
+        "errors": deepcopy(pit.get("errors") or []),
+        "provenance": deepcopy(provenance),
+    }
+    frozen["data_coverage"] = deepcopy(coverage)
+    frozen["data_provenance"] = deepcopy(provenance)
+    frozen["underlying_observation"] = deepcopy(pit.get("underlying_observation"))
+    frozen["market_data"] = {"candles": deepcopy(candles)}
+    return frozen

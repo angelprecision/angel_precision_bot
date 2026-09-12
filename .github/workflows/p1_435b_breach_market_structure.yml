@@ -47,12 +47,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas
 
-      - name: Run 435-B behavioral tests
+      - name: Run 435-B plus canonical PIT/FVG tests
         env:
           PGSSLMODE: "disable"
           DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
         run: |
-          python -m pytest tests/test_p0_435b_breach_market_structure.py -v --tb=short
+          python -m pytest \
+            tests/test_p0_435b_breach_market_structure.py \
+            tests/test_p0_435a_pit_market_data.py \
+            tests/test_p1_fvg_telemetry.py \
+            tests/test_position_score_profile.py \
+            -v --tb=short
 
   merge-ref:
     runs-on: ubuntu-latest
@@ -90,9 +95,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas
 
-      - name: Run identical 435-B behavioral tests
+      - name: Run identical 435-B plus canonical PIT/FVG tests
         env:
           PGSSLMODE: "disable"
           DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
         run: |
-          python -m pytest tests/test_p0_435b_breach_market_structure.py -v --tb=short
+          python -m pytest \
+            tests/test_p0_435b_breach_market_structure.py \
+            tests/test_p0_435a_pit_market_data.py \
+            tests/test_p1_fvg_telemetry.py \
+            tests/test_position_score_profile.py \
+            -v --tb=short
