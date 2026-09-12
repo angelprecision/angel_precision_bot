@@ -1,0 +1,1 @@
+This branch contains specification material only for a future FVG bounce candidate promotion seam. The binding spec is `p1_fvg_bounce_candidate_promotion_binding_20260912.md`.
