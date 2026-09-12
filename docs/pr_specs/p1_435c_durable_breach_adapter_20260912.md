@@ -41,10 +41,15 @@ into:
 without refetching, recomputing, interpreting, delaying, rejecting, or changing
 a trade.
 
-## Production surface (exactly two files)
+## Production surface (two #621 files)
 - `ap/intelligence_breach_snapshot_adapter.py` — new.
 - `ap/intelligence_context_materializer.py` — 1 dispatch guard, 1 import block,
   otherwise unchanged byte-for-byte.
+
+The only amendment to an already-merged owner is the deterministic
+`assembly_proof_hash` helper/output in
+`ap/intelligence_breach_snapshot_assembly.py` (the #625 authority seam). No
+#622 caller or runtime activation is added here.
 
 No new table, migration, worker, queue, retry subsystem, revision allocator, or
 BREACH identity model. `ap_execution_core`, entry watcher, master control,
@@ -77,6 +82,9 @@ existing generic path unchanged, byte-for-byte.
 - trigger_crossed_at (== canonical BREACH as-of)
 - profile_version, model_version, structure_schema_version, structure_model_version
 - `#625` identity_hash and input_hash (both persisted)
+- deterministic `#625` assembly_proof_hash binding status, candidate and
+  authoritative parents, parent validation/lineage, missing phases, and safety
+  flags (persisted and reverified by the worker)
 - deterministic structure_hash (payload integrity, NOT a second identity)
 
 ## Invariants
@@ -101,6 +109,18 @@ existing generic path unchanged, byte-for-byte.
 - Enqueue recomputes the merged `#625` `identity_hash` and `input_hash` from
   the exact canonical identity, evidence, candidate parent map, and frozen
   structure before touching `#327`; mismatch is fail-soft with no job mutation.
+- Enqueue requires a non-empty exact `#625` `assembly_proof_hash` and verifies
+  it before any status, parent, flag, or `#327` decision; proof mismatch uses
+  `BREACH_ENVELOPE_ASSEMBLY_PROOF_MISMATCH` and leaves the store untouched.
+- `PARTIAL` / `COMPLETE` status and parent authority are accepted only from the
+  sealed #625 proof. A candidate parent is never promoted, and only a sealed
+  authoritative PREOPEN parent may become the top-level parent.
+- `#327` identity is copied from the nested canonical #625 identity only.
+  Top-level compatibility aliases must normalize equal or the envelope is
+  rejected before job allocation.
+- The worker recomputes identity/input/assembly/structure hashes from the
+  frozen payload before writing a snapshot; failures affect the intelligence
+  job only.
 - `structure_hash` accepts only strict JSON-shaped values and rejects custom
   objects, unordered collections, non-string keys, and non-finite numbers.
 - Top-level `parent_snapshot_id` is authoritative PREOPEN only (or `None`);
@@ -123,6 +143,12 @@ Focused suite `tests/test_p1_435c_durable_breach_adapter.py`:
   malformed/naive/later-time rejection;
 - #625 hash-authority verification with post-assembly evidence, structure,
   candidate-parent, identity, and as-of mutation rejection;
+- #625 assembly-proof replay stability and fail-first rejection for status
+  promotion, authoritative PREOPEN/PRETRIGGER mutation, parent validation,
+  parent lineage, missing phases, candidate parents, and safety flags;
+- conflicting top-level client/mode/signal/canonical/local-order/profile
+  aliases reject before #327 mutation, while the nested canonical identity is
+  used when aliases are absent;
 - enqueue contract (rejects non-mapping, REJECTED envelope, wrong phase,
   observe_only=false, affected_eligibility=true, missing evidence_as_of,
   COMPLETE without structure);
@@ -130,7 +156,7 @@ Focused suite `tests/test_p1_435c_durable_breach_adapter.py`:
   new generation and new evidence both produce new context_revision);
 - isolation (client, LIVE/PAPER, CALL/PUT);
 - dispatch predicate and worker cross-check (fails closed on identity /
-  input-hash mismatch);
+  input-hash, assembly-proof, or frozen-structure mismatch);
 - candidate vs authoritative parent invariant (top-level = authoritative
   PREOPEN only; None when no authoritative PREOPEN, candidate PREOPEN
   present in payload but NOT promoted);

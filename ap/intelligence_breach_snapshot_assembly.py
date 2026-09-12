@@ -1275,6 +1275,38 @@ def _canonicalize(value: Any, *, omit_volatile: bool = True) -> Any:
     raise TypeError(f"unsupported hash input type: {type(value).__name__}")
 
 
+def _canonicalize_assembly_proof(value: Any) -> Any:
+    """Canonicalize the non-volatile fields sealed by the assembly proof.
+
+    This is intentionally stricter than the compatibility canonicalizer above:
+    proof inputs must already be JSON-shaped, with string keys, lists instead
+    of tuples, and no datetime/object fallback.  Volatile fields are rejected
+    instead of being silently incorporated into the proof.
+    """
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("non-finite assembly proof value cannot be hashed")
+        return 0.0 if value == 0 else value
+    if isinstance(value, Mapping):
+        for key in value:
+            if not isinstance(key, str):
+                raise TypeError("assembly proof mapping keys must be strings")
+            if key.lower() in _VOLATILE_HASH_KEYS:
+                raise ValueError("volatile assembly proof field cannot be hashed")
+        return {
+            key: _canonicalize_assembly_proof(value[key])
+            for key in sorted(value)
+        }
+    if isinstance(value, list):
+        return [_canonicalize_assembly_proof(item) for item in value]
+    raise TypeError(
+        "unsupported assembly proof type: "
+        f"{type(value).__name__}"
+    )
+
+
 def _identity_for_hash(identity: Any) -> dict[str, Any]:
     candidate = _identity_mapping(identity)
     if candidate is None:
@@ -1362,6 +1394,45 @@ def hash_breach_snapshot_input(
 def hash_breach_identity(identity: Mapping[str, Any]) -> str:
     """Hash only the canonical BREACH identity (no parent/evidence input)."""
     return hash_breach_snapshot_input(identity, {}, parent_snapshot_ids={})
+
+
+def hash_breach_assembly_proof(envelope: Mapping[str, Any]) -> str:
+    """Hash the final #625 assembly authority fields.
+
+    The proof binds the exact status, both parent maps, parent validation and
+    lineage, missing phases, safety flags, and the already-computed #625
+    identity/input hashes.  It deliberately excludes evidence bodies and all
+    worker/collection/current timestamps; those are covered by the existing
+    input hash or are not assembly authority.
+    """
+    if not isinstance(envelope, Mapping):
+        raise TypeError("BREACH assembly proof input must be a mapping")
+    proof_input = {
+        "assembly_version": ASSEMBLY_VERSION,
+        "identity_hash": envelope.get("identity_hash"),
+        "input_hash": envelope.get("input_hash"),
+        "status": envelope.get("status"),
+        "candidate_parent_snapshot_ids": envelope.get(
+            "candidate_parent_snapshot_ids"
+        ),
+        "authoritative_parent_snapshot_ids": envelope.get(
+            "authoritative_parent_snapshot_ids"
+        ),
+        "parent_validation": envelope.get("parent_validation"),
+        "parent_lineage": envelope.get("parent_lineage"),
+        "missing_parent_phases": envelope.get("missing_parent_phases"),
+        "observe_only": envelope.get("observe_only"),
+        "affected_eligibility": envelope.get("affected_eligibility"),
+    }
+    canonical = _canonicalize_assembly_proof(proof_input)
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _evidence_as_of(evidence: Mapping[str, Any], *, errors: list[str]) -> Optional[str]:
@@ -1932,6 +2003,7 @@ def build_breach_snapshot_envelope(
             "identity": None,
             "identity_hash": None,
             "input_hash": None,
+            "assembly_proof_hash": None,
             "parent_snapshot_ids": {"PRETRIGGER": None, "PREOPEN": None},
             "candidate_parent_snapshot_ids": {"PRETRIGGER": None, "PREOPEN": None},
             "authoritative_parent_snapshot_ids": {"PRETRIGGER": None, "PREOPEN": None},
@@ -1952,6 +2024,7 @@ def build_breach_snapshot_envelope(
             "identity": None,
             "identity_hash": None,
             "input_hash": None,
+            "assembly_proof_hash": None,
             "parent_snapshot_ids": {"PRETRIGGER": None, "PREOPEN": None},
             "candidate_parent_snapshot_ids": {"PRETRIGGER": None, "PREOPEN": None},
             "authoritative_parent_snapshot_ids": {"PRETRIGGER": None, "PREOPEN": None},
@@ -2103,6 +2176,26 @@ def build_breach_snapshot_envelope(
         or evidence_errors
         or structure_copy is None
     ) else "COMPLETE"
+    assembly_proof_hash: Optional[str] = None
+    if not errors:
+        try:
+            assembly_proof_hash = hash_breach_assembly_proof(
+                {
+                    "identity_hash": identity_hash,
+                    "input_hash": input_hash,
+                    "status": status,
+                    "candidate_parent_snapshot_ids": candidate_parent_ids,
+                    "authoritative_parent_snapshot_ids": parent_ids,
+                    "parent_validation": parent_results,
+                    "parent_lineage": lineage,
+                    "missing_parent_phases": missing_parents,
+                    "observe_only": True,
+                    "affected_eligibility": False,
+                }
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            errors.append(f"breach_assembly_proof_invalid:{type(exc).__name__}")
+            status = "REJECTED"
     result: dict[str, Any] = {
         "ok": not errors,
         "status": status,
@@ -2111,6 +2204,7 @@ def build_breach_snapshot_envelope(
         "breach_identity": copy.deepcopy(identity_value),
         "identity_hash": identity_hash,
         "input_hash": input_hash,
+        "assembly_proof_hash": assembly_proof_hash,
         "client_id": identity_value["client_id"],
         "execution_mode": identity_value["execution_mode"],
         "signal_id": identity_value["signal_id"],
@@ -2163,6 +2257,7 @@ __all__ = [
     "BREACH_PHASE",
     "build_breach_snapshot",
     "build_breach_snapshot_envelope",
+    "hash_breach_assembly_proof",
     "hash_breach_identity",
     "hash_breach_snapshot_input",
     "normalize_breach_identity",

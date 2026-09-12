@@ -34,6 +34,8 @@ Public surface
   :mod:`ap.intelligence_context_materializer` when its dispatch guard fires).
 - :func:`hash_frozen_breach_structure` — deterministic checksum for the
   already-frozen #615 structure (payload integrity, not semantic identity).
+- :func:`hash_breach_assembly_proof` — the merged #625 authority seal used to
+  bind status, parents, lineage, and safety flags before #327 mutation.
 - :func:`is_frozen_breach_job` — cheap predicate used by the dispatch seam.
 """
 
@@ -50,6 +52,7 @@ from typing import Any, Mapping, Optional
 from ap.intelligence_breach_snapshot_assembly import (
     ASSEMBLY_VERSION as _BREACH_ASSEMBLY_VERSION,
     BREACH_PHASE,
+    hash_breach_assembly_proof,
     hash_breach_identity,
     hash_breach_snapshot_input,
 )
@@ -413,6 +416,22 @@ def _verify_envelope_hashes(
     return not errors, errors
 
 
+def _verify_envelope_assembly_proof(
+    envelope: Mapping[str, Any],
+) -> tuple[bool, list[str]]:
+    """Verify the exact authority seal emitted by the merged #625 owner."""
+    supplied = envelope.get("assembly_proof_hash")
+    if not isinstance(supplied, str) or not supplied:
+        return False, ["envelope_assembly_proof_hash_missing"]
+    try:
+        expected = hash_breach_assembly_proof(envelope)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return False, [f"envelope_assembly_proof_recompute_invalid:{type(exc).__name__}"]
+    if supplied != expected:
+        return False, ["envelope_assembly_proof_mismatch"]
+    return True, []
+
+
 def _envelope_structure(envelope: Mapping[str, Any]) -> Any:
     """Return the frozen #615 structure attached to the envelope, if any."""
     return _get_first(envelope, ("structure", "frozen_structure"))
@@ -438,6 +457,57 @@ def _candidate_parent_ids(envelope: Mapping[str, Any]) -> dict[str, Optional[str
         "PRETRIGGER": raw.get("PRETRIGGER"),
         "PREOPEN": raw.get("PREOPEN"),
     }
+
+
+def _canonical_identity_key(identity: Mapping[str, Any]) -> dict[str, str]:
+    """Normalize the canonical nested #625 identity for #327 comparison."""
+    return {
+        "client_id": str(identity.get("client_id") or ""),
+        "execution_mode": normalize_execution_mode(identity.get("execution_mode")),
+        "signal_id": str(identity.get("signal_id") or ""),
+        "canonical_signal_id": str(identity.get("canonical_signal_id") or ""),
+        "local_order_id": normalized_local_order_id(identity.get("local_order_id") or ""),
+        "profile_version": str(
+            identity.get("profile_version") or DEFAULT_PROFILE_VERSION
+        ),
+    }
+
+
+def _normalize_identity_alias(key: str, value: Any) -> str:
+    """Apply the same #327 normalization used for the stored identity."""
+    if key == "execution_mode":
+        return normalize_execution_mode(value)
+    if key == "local_order_id":
+        return normalized_local_order_id(value)
+    if key == "profile_version":
+        return str(value or DEFAULT_PROFILE_VERSION)
+    return str(value or "") if isinstance(value, str) else ""
+
+
+def _top_level_identity_alias_errors(
+    envelope: Mapping[str, Any], identity: Mapping[str, Any]
+) -> list[str]:
+    """Reject contradictory compatibility aliases before #327 allocation.
+
+    #625's nested ``identity`` mapping is the only authority.  The envelope's
+    top-level copies are accepted only when their normalized values agree;
+    they can never select a different durable identity.
+    """
+    canonical = _canonical_identity_key(identity)
+    errors: list[str] = []
+    for key in (
+        "client_id",
+        "execution_mode",
+        "signal_id",
+        "canonical_signal_id",
+        "local_order_id",
+        "profile_version",
+    ):
+        if key not in envelope:
+            continue
+        if _normalize_identity_alias(key, envelope.get(key)) != canonical[key]:
+            errors.append(f"envelope_identity_alias_mismatch:{key}")
+    return errors
 
 
 def _top_level_parent_snapshot_id(envelope: Mapping[str, Any]) -> Optional[str]:
@@ -473,6 +543,7 @@ def _validate_envelope_for_enqueue(envelope: Any) -> tuple[bool, Optional[str], 
     - ``observe_only is True``;
     - ``affected_eligibility is False``;
     - valid #625 identity;
+    - non-empty, exact #625 assembly proof;
     - non-empty identity_hash;
     - non-empty input_hash;
     - normalized aware ``trigger_crossed_at`` on envelope and identity;
@@ -486,6 +557,16 @@ def _validate_envelope_for_enqueue(envelope: Any) -> tuple[bool, Optional[str], 
     hash_error_code: Optional[str] = None
     if not isinstance(envelope, Mapping):
         return False, "BREACH_ENVELOPE_NOT_MAPPING", ["envelope_not_mapping"]
+
+    # This is intentionally the first accepted-envelope check.  Status,
+    # parent authority, lineage, and safety flags come only from a sealed
+    # #625 result; none may be edited before #327 allocation.
+    proof_ok, proof_errors = _verify_envelope_assembly_proof(envelope)
+    if not proof_ok:
+        hash_error_code = "BREACH_ENVELOPE_ASSEMBLY_PROOF_MISMATCH"
+        if "envelope_assembly_proof_mismatch" not in proof_errors:
+            errors.append("envelope_assembly_proof_mismatch")
+        errors.extend(proof_errors)
 
     status = _envelope_status(envelope)
     if status in _REJECTED_ENVELOPE_STATUSES:
@@ -503,6 +584,8 @@ def _validate_envelope_for_enqueue(envelope: Any) -> tuple[bool, Optional[str], 
     identity = _envelope_identity(envelope)
     if identity is None:
         errors.append("envelope_identity_missing")
+    else:
+        errors.extend(_top_level_identity_alias_errors(envelope, identity))
 
     identity_hash = envelope.get("identity_hash")
     if not isinstance(identity_hash, str) or not identity_hash:
@@ -530,12 +613,16 @@ def _validate_envelope_for_enqueue(envelope: Any) -> tuple[bool, Optional[str], 
     ) and input_hash:
         hashes_ok, hash_errors = _verify_envelope_hashes(envelope, identity, structure)
         if not hashes_ok:
-            if any(error.startswith("envelope_hash_recompute_invalid") for error in hash_errors):
-                hash_error_code = "BREACH_ENVELOPE_HASH_INVALID"
-                errors.append("envelope_hash_recompute_invalid")
-            else:
-                hash_error_code = "BREACH_ENVELOPE_HASH_MISMATCH"
-                errors.append("envelope_hash_mismatch")
+            if hash_error_code is None:
+                if any(
+                    error.startswith("envelope_hash_recompute_invalid")
+                    for error in hash_errors
+                ):
+                    hash_error_code = "BREACH_ENVELOPE_HASH_INVALID"
+                    errors.append("envelope_hash_recompute_invalid")
+                else:
+                    hash_error_code = "BREACH_ENVELOPE_HASH_MISMATCH"
+                    errors.append("envelope_hash_mismatch")
             errors.extend(hash_errors)
 
     if errors:
@@ -547,34 +634,13 @@ def _validate_envelope_for_enqueue(envelope: Any) -> tuple[bool, Optional[str], 
 def _identity_key_from_envelope(envelope: Mapping[str, Any]) -> Mapping[str, str]:
     """Extract the identity fields required by #327 enqueue.
 
-    Falls back through envelope top-level -> ``identity`` mapping so we support
-    both places without ever mixing them.  Every value is coerced to string and
-    normalized where #327 normalizes.
+    The nested canonical #625 ``identity`` mapping is the sole authority.  The
+    top-level compatibility copies are checked for equality during validation
+    but are never allowed to choose the durable key.
     """
     identity = _envelope_identity(envelope) or {}
     return {
-        "client_id": str(
-            envelope.get("client_id") or identity.get("client_id") or ""
-        ),
-        "execution_mode": normalize_execution_mode(
-            envelope.get("execution_mode") or identity.get("execution_mode")
-        ),
-        "signal_id": str(
-            envelope.get("signal_id") or identity.get("signal_id") or ""
-        ),
-        "canonical_signal_id": str(
-            envelope.get("canonical_signal_id")
-            or identity.get("canonical_signal_id")
-            or ""
-        ),
-        "local_order_id": normalized_local_order_id(
-            envelope.get("local_order_id") or identity.get("local_order_id") or ""
-        ),
-        "profile_version": str(
-            envelope.get("profile_version")
-            or identity.get("profile_version")
-            or DEFAULT_PROFILE_VERSION
-        ),
+        **_canonical_identity_key(identity),
     }
 
 
@@ -640,6 +706,7 @@ def _build_frozen_payload(envelope: Mapping[str, Any]) -> dict[str, Any]:
         "identity": identity_copy,
         "identity_hash": envelope.get("identity_hash"),
         "input_hash": envelope.get("input_hash"),
+        "assembly_proof_hash": envelope.get("assembly_proof_hash"),
         # Timing authority.
         "trigger_crossed_at": trigger,
         "evidence_as_of": evidence_as_of,
@@ -809,32 +876,7 @@ def _job_vs_envelope_identity_ok(
     errors: list[str] = []
 
     envelope_identity = _envelope_identity(envelope) or {}
-    envelope_fields = {
-        "client_id": str(
-            envelope.get("client_id") or envelope_identity.get("client_id") or ""
-        ),
-        "execution_mode": normalize_execution_mode(
-            envelope.get("execution_mode") or envelope_identity.get("execution_mode")
-        ),
-        "signal_id": str(
-            envelope.get("signal_id") or envelope_identity.get("signal_id") or ""
-        ),
-        "canonical_signal_id": str(
-            envelope.get("canonical_signal_id")
-            or envelope_identity.get("canonical_signal_id")
-            or ""
-        ),
-        "local_order_id": normalized_local_order_id(
-            envelope.get("local_order_id")
-            or envelope_identity.get("local_order_id")
-            or ""
-        ),
-        "profile_version": str(
-            envelope.get("profile_version")
-            or envelope_identity.get("profile_version")
-            or DEFAULT_PROFILE_VERSION
-        ),
-    }
+    envelope_fields = _canonical_identity_key(envelope_identity)
     job_fields = {
         "client_id": str(job.get("client_id") or ""),
         "execution_mode": normalize_execution_mode(job.get("execution_mode")),
@@ -863,6 +905,15 @@ def _frozen_payload_integrity_errors(payload: Mapping[str, Any]) -> list[str]:
     identity = payload.get("identity")
     if not isinstance(identity, Mapping):
         return ["job_payload_identity_missing"]
+
+    # Recreate the #625 proof input using the frozen status field.  The worker
+    # must never infer a new status or parent authority from mutable aliases.
+    proof_source = dict(payload)
+    proof_source["status"] = payload.get("envelope_status")
+    proof_ok, proof_errors = _verify_envelope_assembly_proof(proof_source)
+    if not proof_ok:
+        errors.extend(f"job_payload_{error}" for error in proof_errors)
+
     if payload.get("assembly_version") != _BREACH_ASSEMBLY_VERSION:
         errors.append("job_payload_assembly_version_mismatch")
 
@@ -920,7 +971,7 @@ def build_breach_snapshot_kwargs(job: Mapping[str, Any]) -> dict[str, Any]:
             "BREACH_JOB_IDENTITY_MISMATCH errors=" + ",".join(errors)
         )
 
-    envelope_status = str(payload.get("envelope_status") or "").upper()
+    envelope_status = payload.get("envelope_status")
     if envelope_status == _STATUS_COMPLETE:
         snapshot_status = "COMPLETE"
     elif envelope_status == _STATUS_PARTIAL:
@@ -951,6 +1002,7 @@ def build_breach_snapshot_kwargs(job: Mapping[str, Any]) -> dict[str, Any]:
         "identity": copy.deepcopy(payload.get("identity") or {}),
         "identity_hash": payload.get("identity_hash"),
         "input_hash": payload.get("input_hash"),
+        "assembly_proof_hash": payload.get("assembly_proof_hash"),
         "context_revision": int(job.get("context_revision") or 1),
         # TIMING
         "trigger_crossed_at": payload.get("trigger_crossed_at"),
@@ -1009,6 +1061,7 @@ __all__ = [
     "FROZEN_BREACH_PAYLOAD_KIND",
     "build_breach_snapshot_kwargs",
     "enqueue_breach_snapshot_job",
+    "hash_breach_assembly_proof",
     "hash_frozen_breach_structure",
     "is_frozen_breach_job",
 ]

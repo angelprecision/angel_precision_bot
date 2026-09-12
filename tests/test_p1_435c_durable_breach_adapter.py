@@ -49,7 +49,7 @@ from ap.intelligence_breach_snapshot_assembly import (  # noqa: E402
     ASSEMBLY_VERSION,
     BREACH_PHASE,
     build_breach_snapshot_envelope,
-    hash_breach_snapshot_input,
+    hash_breach_assembly_proof,
     normalize_breach_identity,
 )
 from ap.intelligence_breach_market_structure import (  # noqa: E402
@@ -602,7 +602,6 @@ class TestEnqueueHashAuthority:
         [
             lambda env: env["evidence"]["point_in_time"]["underlying_observation"].update(price=999.0),
             lambda env: env["structure"]["fvg_4h"][0].update(high=999.0),
-            lambda env: env["candidate_parent_snapshot_ids"].update(PREOPEN="different-parent"),
             lambda env: env["identity"].update(ticker="QQQ"),
         ],
     )
@@ -636,6 +635,99 @@ class TestEnqueueHashAuthority:
         assert result["error_code"] == "BREACH_ENVELOPE_INVALID"
         assert _MEMORY_JOBS == {}
 
+
+class TestAssemblyProofAuthority:
+    def test_proof_is_replay_stable_and_excludes_collection_time(self):
+        env = _inject_authoritative_parents(_build_complete_envelope())
+        proof = env["assembly_proof_hash"]
+        assert isinstance(proof, str) and proof
+        assert proof == hash_breach_assembly_proof(env)
+
+        replay = copy.deepcopy(env)
+        replay["evidence"]["point_in_time"]["collected_at"] = (
+            "2099-01-01T00:00:00+00:00"
+        )
+        replay["worker_started_at"] = "2099-01-01T00:00:01+00:00"
+        assert hash_breach_assembly_proof(replay) == proof
+
+    def test_partial_cannot_be_promoted_to_complete(self):
+        env = _build_complete_envelope()
+        assert env["status"] == "PARTIAL"
+        env["status"] = "COMPLETE"
+        result = enqueue_breach_snapshot_job(env)
+        assert result["ok"] is False
+        assert result["error_code"] == "BREACH_ENVELOPE_ASSEMBLY_PROOF_MISMATCH"
+        assert _MEMORY_JOBS == {}
+
+    @pytest.mark.parametrize(
+        "mutator",
+        [
+            lambda env: env["authoritative_parent_snapshot_ids"].update(
+                PREOPEN="attacker-preopen"
+            ),
+            lambda env: env["authoritative_parent_snapshot_ids"].update(
+                PRETRIGGER="attacker-pretrigger"
+            ),
+            lambda env: env["parent_validation"]["PREOPEN"].update(
+                status="MISSING"
+            ),
+            lambda env: env["parent_lineage"].update(status="UNPROVEN"),
+            lambda env: env["missing_parent_phases"].append("PREOPEN"),
+            lambda env: env["candidate_parent_snapshot_ids"].update(
+                PREOPEN="attacker-candidate"
+            ),
+            lambda env: env.update(observe_only=False),
+            lambda env: env.update(affected_eligibility=True),
+        ],
+    )
+    def test_mutated_assembly_authority_is_rejected_before_store_mutation(self, mutator):
+        env = _inject_authoritative_parents(_build_complete_envelope())
+        mutator(env)
+        result = enqueue_breach_snapshot_job(env)
+        assert result["ok"] is False
+        assert result["error_code"] == "BREACH_ENVELOPE_ASSEMBLY_PROOF_MISMATCH"
+        assert _MEMORY_JOBS == {}
+
+    @pytest.mark.parametrize(
+        ("alias", "value"),
+        [
+            ("client_id", "attacker@example.com"),
+            ("execution_mode", "LIVE"),
+            ("signal_id", "attacker-signal"),
+            ("canonical_signal_id", "attacker-canonical"),
+            ("local_order_id", "attacker-local"),
+            ("profile_version", "attacker-profile"),
+        ],
+    )
+    def test_conflicting_top_level_identity_alias_is_rejected(self, alias, value):
+        env = _inject_authoritative_parents(_build_complete_envelope())
+        env[alias] = value
+        result = enqueue_breach_snapshot_job(env)
+        assert result["ok"] is False
+        assert result["error_code"] == "BREACH_ENVELOPE_INVALID"
+        assert f"envelope_identity_alias_mismatch:{alias}" in result["errors"]
+        assert _MEMORY_JOBS == {}
+
+    def test_nested_identity_is_used_when_compatibility_aliases_are_absent(self):
+        env = _inject_authoritative_parents(_build_complete_envelope())
+        for alias in (
+            "client_id",
+            "execution_mode",
+            "signal_id",
+            "canonical_signal_id",
+            "local_order_id",
+            "profile_version",
+        ):
+            env.pop(alias, None)
+        result = enqueue_breach_snapshot_job(env)
+        assert result["ok"] is True
+        job = next(iter(_MEMORY_JOBS.values()))
+        assert job["client_id"] == env["identity"]["client_id"]
+        assert job["execution_mode"] == env["identity"]["execution_mode"]
+        assert job["signal_id"] == env["identity"]["signal_id"]
+        assert job["canonical_signal_id"] == env["identity"]["canonical_signal_id"]
+        assert job["local_order_id"] == env["identity"]["local_order_id"]
+        assert job["profile_version"] == env["identity"]["profile_version"]
 
 # ---------------------------------------------------------------------------
 # §6, §16  Enqueue succeeds and is idempotent for identical envelope
@@ -769,6 +861,7 @@ class TestDispatchAndWorkerValidation:
         assert payload["candidate_parent_snapshot_ids"] == env["candidate_parent_snapshot_ids"]
         assert payload["authoritative_parent_snapshot_ids"] == env["authoritative_parent_snapshot_ids"]
         assert payload["identity_hash"] == env["identity_hash"]
+        assert payload["assembly_proof_hash"] == env["assembly_proof_hash"]
         assert payload["structure_hash"].startswith("sha256:")
         assert payload["observe_only"] is True
         assert payload["affected_eligibility"] is False
@@ -802,6 +895,24 @@ class TestDispatchAndWorkerValidation:
         with pytest.raises(RuntimeError, match="BREACH_JOB_IDENTITY_MISMATCH"):
             build_breach_snapshot_kwargs(job)
 
+    @pytest.mark.parametrize(
+        "mutator",
+        [
+            lambda payload: payload.update(envelope_status="PARTIAL"),
+            lambda payload: payload["authoritative_parent_snapshot_ids"].update(
+                PREOPEN="attacker-preopen"
+            ),
+            lambda payload: payload.update(assembly_proof_hash="tampered-proof"),
+        ],
+    )
+    def test_worker_reverifies_frozen_assembly_proof(self, mutator):
+        env = _inject_authoritative_parents(_build_complete_envelope())
+        enqueue_breach_snapshot_job(env)
+        job = copy.deepcopy(next(iter(_MEMORY_JOBS.values())))
+        mutator(job["payload"])
+        with pytest.raises(RuntimeError, match="BREACH_JOB_IDENTITY_MISMATCH"):
+            build_breach_snapshot_kwargs(job)
+
 
 # ---------------------------------------------------------------------------
 # §11  Candidate vs authoritative parent invariant
@@ -810,42 +921,28 @@ class TestDispatchAndWorkerValidation:
 
 class TestParentInvariants:
     def test_top_level_parent_is_none_when_no_authoritative_preopen(self):
-        env = _build_complete_envelope()  # not injected → no authoritative parents
-        env = _inject_authoritative_parents(env)
-        env["authoritative_parent_snapshot_ids"] = {"PRETRIGGER": None, "PREOPEN": None}
-        # Keep candidate PREOPEN populated — this must NOT be promoted.
-        env["candidate_parent_snapshot_ids"] = {
-            "PRETRIGGER": "pt-candidate",
-            "PREOPEN": "po-candidate",
-        }
-        # Recompute the #625 input hash for this deliberately non-authoritative
-        # candidate map.  The adapter must still refuse to promote it.
-        env["input_hash"] = hash_breach_snapshot_input(
-            env["identity"],
-            env["evidence"],
-            parent_snapshot_ids=env["candidate_parent_snapshot_ids"],
-            structure=env["structure"],
-        )
+        # Use the genuine #625 PARTIAL result with missing parents.  It has no
+        # authoritative PREOPEN, so the adapter must preserve None rather than
+        # infer a direct parent from any candidate metadata.
+        env = _build_complete_envelope()
+        assert env["status"] == "PARTIAL"
         result = enqueue_breach_snapshot_job(env)
         assert result["ok"] is True
         job = next(iter(_MEMORY_JOBS.values()))
         kwargs = build_breach_snapshot_kwargs(job)
         assert kwargs["parent_snapshot_id"] is None
         payload = kwargs["payload"]
-        assert payload["candidate_parent_snapshot_ids"]["PREOPEN"] == "po-candidate"
+        assert payload["candidate_parent_snapshot_ids"]["PREOPEN"] is None
         assert payload["authoritative_parent_snapshot_ids"]["PREOPEN"] is None
 
     def test_top_level_parent_only_preopen_authoritative(self):
         env = _inject_authoritative_parents(_build_complete_envelope())
         # Even with an authoritative PRETRIGGER, the top-level id is PREOPEN.
-        env["authoritative_parent_snapshot_ids"] = {
-            "PRETRIGGER": "pretrigger-authoritative-id",
-            "PREOPEN": "preopen-authoritative-id",
-        }
-        enqueue_breach_snapshot_job(env)
+        result = enqueue_breach_snapshot_job(env)
+        assert result["ok"] is True
         job = next(iter(_MEMORY_JOBS.values()))
         kwargs = build_breach_snapshot_kwargs(job)
-        assert kwargs["parent_snapshot_id"] == "preopen-authoritative-id"
+        assert kwargs["parent_snapshot_id"] == "parent-preopen-abc"
 
 
 # ---------------------------------------------------------------------------

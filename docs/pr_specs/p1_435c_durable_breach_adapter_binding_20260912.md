@@ -22,7 +22,13 @@ Merged `#625` owns the BREACH assembly owner:
 - canonical BREACH identity normalization;
 - parent validation (candidate vs authoritative);
 - deterministic identity_hash and input_hash;
-- assembly envelope with observe-only / affected_eligibility=false stamps.
+- assembly envelope with observe-only / affected_eligibility=false stamps;
+- deterministic `assembly_proof_hash` sealing final status, candidate and
+  authoritative parent maps, parent validation/lineage, missing phases, and
+  safety flags.
+
+This amendment extends only that existing #625 authority seam. It does not add
+the #622 runtime caller or any execution/trading policy.
 
 Merged `#615` owns FVG geometry / lifecycle / opposing / strong-break / VI /
 regime / setup / structure schema / model version.
@@ -37,13 +43,16 @@ worker, no second table, no second retry, no second revision allocator.
 envelope and the merged `#327` job/snapshot store, plus a small guarded
 dispatch inside `build_snapshot_kwargs`.
 
-## Production files
+## #621 production files
 
-Exactly two, per spec §21:
+Exactly two new/adapter files, per spec §21:
 
 1. `ap/intelligence_breach_snapshot_adapter.py` (new).
 2. `ap/intelligence_context_materializer.py` (one import, one dispatch guard;
    otherwise unchanged byte-for-byte).
+
+The amendment also extends the existing #625 assembly owner with its proof
+helper/output; it does not add a #621 runtime caller or execution policy.
 
 ## Canonical caller trace
 
@@ -75,6 +84,7 @@ Enqueue serializes the following into `job.payload` (spec §7):
 - `payload_kind = "FROZEN_BREACH_V1"`, `adapter_version`, `assembly_version`;
 - complete `#625` canonical identity;
 - `#625` identity_hash and input_hash;
+- `#625` assembly_proof_hash;
 - exact `trigger_crossed_at` and `evidence_as_of`;
 - exact `candidate_parent_snapshot_ids` and `authoritative_parent_snapshot_ids`;
 - exact `parent_lineage`, `parent_validation`, `missing_parent_phases`;
@@ -83,7 +93,8 @@ Enqueue serializes the following into `job.payload` (spec §7):
 - deterministic `structure_hash` (sha256 of canonicalized structure);
 - structure_schema_version, structure_model_version, source_versions;
 - observe_only=true, affected_eligibility=false;
-- envelope_status (COMPLETE or PARTIAL only).
+- envelope_status (COMPLETE or PARTIAL only);
+- assembly proof is reverified from this frozen payload before snapshot write.
 
 No mutable latest-market aliases, no worker-now price, no fresh market context,
 no later candle, no current FVG reconstruction.
@@ -102,6 +113,16 @@ no later candle, no current FVG reconstruction.
 - Enqueue recomputes `#625` `hash_breach_identity` and
   `hash_breach_snapshot_input` over the exact canonical inputs and rejects
   stale hashes fail-soft.
+- Enqueue requires and recomputes the exported #625 assembly proof before any
+  #327 mutation. A status, parent, lineage, missing-phase, candidate, or flag
+  mismatch returns `BREACH_ENVELOPE_ASSEMBLY_PROOF_MISMATCH` with no job or
+  context-revision mutation.
+- Status comes only from the sealed #625 output: no PARTIAL-to-COMPLETE
+  promotion or structure inference exists in #621. Only the exact sealed
+  authoritative PREOPEN parent is eligible for the top-level parent.
+- #327 store identity comes only from nested canonical #625 identity. Top-level
+  client/mode/signal/canonical/local-order/profile aliases must normalize equal
+  or are rejected before allocation.
 - `hash_frozen_breach_structure` is strict JSON-only: custom objects, sets,
   bytes, non-string keys, and non-finite numbers are rejected.
 - Snapshot status: `#625` COMPLETE -> `COMPLETE`; `#625` PARTIAL -> `PARTIAL`;
@@ -114,9 +135,11 @@ no later candle, no current FVG reconstruction.
 
 `build_breach_snapshot_kwargs(job)` cross-checks the durable job row against
 its frozen payload identity: client_id, execution_mode, signal_id,
-canonical_signal_id, local_order_id, phase, profile_version, input_hash. Any
-mismatch raises `RuntimeError` so `#327` retry/terminal machinery marks the
-INTELLIGENCE job (not the trade) failed. Trading is unaffected.
+canonical_signal_id, local_order_id, phase, profile_version, input_hash. It
+also recomputes the frozen identity/input/assembly/structure hashes before
+mapping the sealed status. Any mismatch raises `RuntimeError` so `#327`
+retry/terminal machinery marks the intelligence job (not the trade) failed.
+Trading is unaffected.
 
 ## Persistence failure behavior
 
@@ -148,7 +171,7 @@ Verified by tests that monkeypatch these to raise on invocation.
 
 ## Test evidence
 
-`tests/test_p1_435c_durable_breach_adapter.py` (37 focused tests):
+`tests/test_p1_435c_durable_breach_adapter.py` (81 focused tests):
 
 1. structure hash: deterministic, order-stable, evidence-sensitive;
 2. enqueue contract: rejects non-mapping, REJECTED envelope, wrong phase,
@@ -171,7 +194,12 @@ Verified by tests that monkeypatch these to raise on invocation.
     `#327` memory backend, with exact versions, FVG/coverage/provenance,
     parent/hash retention, and no-refetch assertions;
 11. exact-time, hash-mutation, and strict-JSON fail-first coverage;
-12. money-path isolation via source-string audit.
+12. assembly-proof status/parent/lineage/candidate/flag mutation and replay
+    stability;
+13. nested canonical identity authority and all six compatibility-alias
+    conflict cases;
+14. worker-side frozen assembly-proof revalidation;
+15. money-path isolation via source-string audit.
 
 Adjacent intelligence suites (`#614` PIT, `#615` structure, `#625` identity,
 `#327` snapshot/job) all continue to pass without change.
