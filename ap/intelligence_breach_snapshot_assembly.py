@@ -40,16 +40,6 @@ _IDENTITY_FIELDS = (
     "context_revision",
     "phase",
 )
-_REQUIRED_IDENTITY_FIELDS = (
-    "client_id",
-    "execution_mode",
-    "signal_id",
-    "canonical_signal_id",
-    "ticker",
-    "side",
-    "trigger_crossed_at",
-    "profile_version",
-)
 _VOLATILE_HASH_KEYS = frozenset(
     {
         "collected_at",
@@ -66,20 +56,6 @@ _VOLATILE_HASH_KEYS = frozenset(
 
 def _unique(values: list[str]) -> list[str]:
     return sorted({str(value) for value in values if str(value)})
-
-
-def _text(value: Any, *, field: str, errors: list[str], required: bool = False) -> str:
-    if value is None or value == "":
-        if required:
-            errors.append(f"{field}_missing")
-        return ""
-    if not isinstance(value, str):
-        errors.append(f"{field}_invalid_type")
-        return ""
-    value = value.strip()
-    if not value and required:
-        errors.append(f"{field}_missing")
-    return value
 
 
 def _source_mappings(source: Any) -> list[Mapping[str, Any]]:
