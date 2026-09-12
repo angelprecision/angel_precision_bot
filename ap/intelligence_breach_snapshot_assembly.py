@@ -46,6 +46,9 @@ _PARENT_NON_AUTHORITATIVE_STATUSES = frozenset(
 _PARENT_KNOWN_STATUSES = _PARENT_NON_AUTHORITATIVE_STATUSES | {
     _PARENT_COMPLETE_STATUS
 }
+_PARENT_LINK_STATUSES = frozenset(
+    {"LINKED", "PRETRIGGER_NOT_AVAILABLE", "PRETRIGGER_LOOKUP_FAILED"}
+)
 _VOLATILE_HASH_KEYS = frozenset(
     {
         "collected_at",
@@ -728,7 +731,7 @@ def _strict_safety_errors(source: Any, *, prefix: str) -> list[str]:
 
 
 def _parent_status(snapshot: Mapping[str, Any]) -> tuple[Optional[str], list[str]]:
-    """Read row/payload status without treating a non-complete row as proof."""
+    """Read every row/payload status assertion without selecting proof by preference."""
     mappings: list[Mapping[str, Any]] = []
     pending: list[Mapping[str, Any]] = [snapshot]
     seen: set[int] = set()
@@ -746,6 +749,7 @@ def _parent_status(snapshot: Mapping[str, Any]) -> tuple[Optional[str], list[str
 
     statuses: list[str] = []
     warnings: list[str] = []
+    invalid_assertion = False
     for mapping in mappings:
         for key in ("status", "snapshot_status"):
             if key not in mapping:
@@ -753,21 +757,30 @@ def _parent_status(snapshot: Mapping[str, Any]) -> tuple[Optional[str], list[str
             value = mapping.get(key)
             if value in (None, ""):
                 warnings.append("parent_snapshot_status_missing")
+                invalid_assertion = True
             elif not isinstance(value, str):
                 warnings.append("parent_snapshot_status_invalid_type")
+                invalid_assertion = True
             else:
-                statuses.append(value.strip().upper())
+                normalized = value.strip().upper()
+                if not normalized:
+                    warnings.append("parent_snapshot_status_missing")
+                    invalid_assertion = True
+                else:
+                    statuses.append(normalized)
     distinct = sorted(set(statuses))
     if len(distinct) > 1:
         warnings.append("parent_snapshot_status_conflict")
+    if any(status not in _PARENT_KNOWN_STATUSES for status in distinct):
+        warnings.append("parent_snapshot_status_unrecognized")
+    # A malformed, unknown, or contradictory assertion can never be repaired
+    # by selecting a recognized COMPLETE assertion beside it.
+    if invalid_assertion or len(distinct) > 1 or any(
+        status not in _PARENT_KNOWN_STATUSES for status in distinct
+    ):
+        return None, _unique(warnings)
     if not distinct:
         return None, _unique(warnings)
-    for preferred in ("ERROR", "UNAVAILABLE", "STALE", "PARTIAL", "COMPLETE"):
-        if preferred in distinct:
-            if preferred not in _PARENT_KNOWN_STATUSES:
-                warnings.append("parent_snapshot_status_unrecognized")
-            return preferred, _unique(warnings)
-    warnings.append("parent_snapshot_status_unrecognized")
     return distinct[0], _unique(warnings)
 
 
@@ -794,15 +807,37 @@ def _parent_pointer(
     return distinct[0] if distinct else None
 
 
-def _parent_link_status(snapshot: Mapping[str, Any]) -> Optional[str]:
+def _parent_link_status(
+    snapshot: Mapping[str, Any], *, diagnostics: Optional[list[str]] = None
+) -> Optional[str]:
+    """Read all durable PREOPEN linkage assertions without inventing LINKED."""
     values: list[str] = []
+    local_diagnostics: list[str] = []
     for mapping in _source_mappings(snapshot):
         for key in ("parent_link_status",):
+            if key not in mapping:
+                continue
             value = mapping.get(key)
-            if isinstance(value, str) and value.strip():
+            if value in (None, ""):
+                local_diagnostics.append("parent_link_status_missing")
+            elif not isinstance(value, str):
+                local_diagnostics.append("parent_link_status_invalid_type")
+            elif not value.strip():
+                local_diagnostics.append("parent_link_status_missing")
+            else:
                 values.append(value.strip().upper())
     distinct = sorted(set(values))
-    return distinct[0] if distinct else None
+    if len(distinct) > 1:
+        local_diagnostics.append("parent_link_status_conflict")
+    if any(value not in _PARENT_LINK_STATUSES for value in distinct):
+        local_diagnostics.append("parent_link_status_unrecognized")
+    if local_diagnostics or len(distinct) != 1:
+        if diagnostics is not None:
+            diagnostics.extend(_unique(local_diagnostics))
+        return None
+    if diagnostics is not None:
+        diagnostics.extend(_unique(local_diagnostics))
+    return distinct[0]
 
 
 def validate_breach_parent_snapshot(
@@ -830,6 +865,8 @@ def validate_breach_parent_snapshot(
     requested_phase = str(phase or "").strip().upper()
     errors: list[str] = []
     warnings: list[str] = []
+    parent_link_status: Optional[str] = None
+    parent_link_diagnostics: list[str] = []
     if requested_phase not in {"PRETRIGGER", "PREOPEN"}:
         errors.append("parent_phase_invalid")
     expected, expected_errors = _expected_identity(
@@ -859,6 +896,8 @@ def validate_breach_parent_snapshot(
             "candidate_snapshot_id": None,
             "authoritative_parent_snapshot_id": None,
             "parent_snapshot_id": None,
+            "parent_link_status": parent_link_status,
+            "parent_link_status_diagnostics": parent_link_diagnostics,
             "snapshot": None,
             "missing": True,
             "mismatches": [],
@@ -880,6 +919,8 @@ def validate_breach_parent_snapshot(
             "candidate_snapshot_id": None,
             "authoritative_parent_snapshot_id": None,
             "parent_snapshot_id": None,
+            "parent_link_status": parent_link_status,
+            "parent_link_status_diagnostics": parent_link_diagnostics,
             "snapshot": None,
             "missing": False,
             "mismatches": _unique(errors),
@@ -902,6 +943,11 @@ def validate_breach_parent_snapshot(
     candidate_errors: list[str] = []
     candidate_snapshot_id = _snapshot_id(snapshot, errors=candidate_errors)
     parent_pointer = _parent_pointer(snapshot, errors=errors)
+    if requested_phase == "PREOPEN":
+        parent_link_status = _parent_link_status(
+            snapshot, diagnostics=parent_link_diagnostics
+        )
+        warnings.extend(parent_link_diagnostics)
     snapshot_copy = copy.deepcopy(dict(snapshot))
     status_name, status_warnings = _parent_status(snapshot)
     warnings.extend(status_warnings)
@@ -919,6 +965,8 @@ def validate_breach_parent_snapshot(
             "candidate_snapshot_id": candidate_snapshot_id or None,
             "authoritative_parent_snapshot_id": None,
             "parent_snapshot_id": parent_pointer,
+            "parent_link_status": parent_link_status,
+            "parent_link_status_diagnostics": parent_link_diagnostics,
             "snapshot": None,
             "missing": False,
             "mismatches": errors,
@@ -1034,6 +1082,8 @@ def validate_breach_parent_snapshot(
             "candidate_snapshot_id": snapshot_id or None,
             "authoritative_parent_snapshot_id": None,
             "parent_snapshot_id": parent_pointer,
+            "parent_link_status": parent_link_status,
+            "parent_link_status_diagnostics": parent_link_diagnostics,
             "context_revision": actual_context_revision,
             "snapshot": None,
             "missing": False,
@@ -1054,6 +1104,8 @@ def validate_breach_parent_snapshot(
             "candidate_snapshot_id": snapshot_id or None,
             "authoritative_parent_snapshot_id": None,
             "parent_snapshot_id": parent_pointer,
+            "parent_link_status": parent_link_status,
+            "parent_link_status_diagnostics": parent_link_diagnostics,
             "context_revision": actual_context_revision,
             "snapshot": snapshot_copy,
             "missing": False,
@@ -1073,6 +1125,8 @@ def validate_breach_parent_snapshot(
         "candidate_snapshot_id": snapshot_id,
         "authoritative_parent_snapshot_id": snapshot_id,
         "parent_snapshot_id": parent_pointer,
+        "parent_link_status": parent_link_status,
+        "parent_link_status_diagnostics": parent_link_diagnostics,
         "context_revision": actual_context_revision,
         "snapshot": snapshot_copy,
         "missing": False,
@@ -1643,6 +1697,10 @@ def _compact_parent_result(result: Mapping[str, Any]) -> dict[str, Any]:
             "authoritative_parent_snapshot_id"
         ),
         "parent_snapshot_id": result.get("parent_snapshot_id"),
+        "parent_link_status": result.get("parent_link_status"),
+        "parent_link_status_diagnostics": list(
+            result.get("parent_link_status_diagnostics") or []
+        ),
         "context_revision": result.get("context_revision"),
         "mismatches": list(result.get("mismatches") or []),
         "errors": list(result.get("errors") or []),
@@ -1654,64 +1712,88 @@ def _validate_parent_lineage(
     pretrigger_result: Mapping[str, Any],
     preopen_result: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Validate the exact #327 PREOPEN -> PRETRIGGER pointer when supplied."""
+    """Validate exact #327 pointer and durable PREOPEN link status."""
     pretrigger_candidate = pretrigger_result.get("candidate_snapshot_id")
     preopen_pointer = preopen_result.get("parent_snapshot_id")
-    if preopen_result.get("status") == "MISSING":
+    parent_link_status = preopen_result.get("parent_link_status")
+    parent_link_diagnostics = list(
+        preopen_result.get("parent_link_status_diagnostics") or []
+    )
+
+    def _link_warnings(*, pointer_present: bool) -> list[str]:
+        warnings = list(parent_link_diagnostics)
+        if parent_link_status is None:
+            if not parent_link_diagnostics:
+                warnings.append("PREOPEN_parent_link_status_missing")
+        elif parent_link_status == "LINKED":
+            if not pointer_present:
+                warnings.append("PREOPEN_parent_link_status_linked_without_pointer")
+        elif parent_link_status == "PRETRIGGER_LOOKUP_FAILED":
+            warnings.append("PREOPEN_parent_link_status_lookup_failed")
+        elif parent_link_status == "PRETRIGGER_NOT_AVAILABLE":
+            warnings.append("PREOPEN_parent_link_status_not_available")
+        else:
+            warnings.append("PREOPEN_parent_link_status_unproven")
+        return _unique(warnings)
+
+    def _result(
+        *, status: str, errors: list[str], warnings: list[str]
+    ) -> dict[str, Any]:
         return {
-            "status": "MISSING",
-            "preopen_parent_snapshot_id": None,
+            "status": status,
+            "preopen_parent_snapshot_id": preopen_pointer,
             "expected_pretrigger_snapshot_id": pretrigger_candidate,
-            "errors": [],
-            "warnings": ["PREOPEN_parent_lineage_missing"],
+            "parent_link_status": parent_link_status,
+            "parent_link_status_diagnostics": parent_link_diagnostics,
+            "errors": _unique(errors),
+            "warnings": _unique(warnings),
         }
+
+    if preopen_result.get("status") == "MISSING":
+        return _result(
+            status="MISSING",
+            errors=[],
+            warnings=["PREOPEN_parent_lineage_missing"],
+        )
 
     if preopen_pointer:
         if not pretrigger_candidate:
-            return {
-                "status": "UNPROVEN",
-                "preopen_parent_snapshot_id": preopen_pointer,
-                "expected_pretrigger_snapshot_id": None,
-                "errors": [],
-                "warnings": ["PREOPEN_parent_lineage_unproven"],
-            }
+            return _result(
+                status="UNPROVEN",
+                errors=[],
+                warnings=_link_warnings(pointer_present=True)
+                + ["PREOPEN_parent_lineage_unproven"],
+            )
         if str(preopen_pointer) != str(pretrigger_candidate):
-            return {
-                "status": "REJECTED",
-                "preopen_parent_snapshot_id": preopen_pointer,
-                "expected_pretrigger_snapshot_id": pretrigger_candidate,
-                "errors": ["PREOPEN_parent_snapshot_id_mismatch"],
-                "warnings": [],
-            }
+            return _result(
+                status="REJECTED",
+                errors=["PREOPEN_parent_snapshot_id_mismatch"],
+                warnings=_link_warnings(pointer_present=True),
+            )
+        if parent_link_status != "LINKED":
+            return _result(
+                status="UNPROVEN",
+                errors=[],
+                warnings=_link_warnings(pointer_present=True)
+                + ["PREOPEN_parent_lineage_unproven"],
+            )
         if not pretrigger_result.get("proven") or not preopen_result.get("proven"):
-            return {
-                "status": "UNPROVEN",
-                "preopen_parent_snapshot_id": preopen_pointer,
-                "expected_pretrigger_snapshot_id": pretrigger_candidate,
-                "errors": [],
-                "warnings": ["PREOPEN_parent_lineage_unproven"],
-            }
-        return {
-            "status": "PROVEN",
-            "preopen_parent_snapshot_id": preopen_pointer,
-            "expected_pretrigger_snapshot_id": pretrigger_candidate,
-            "errors": [],
-            "warnings": [],
-        }
+            return _result(
+                status="UNPROVEN",
+                errors=[],
+                warnings=_link_warnings(pointer_present=True)
+                + ["PREOPEN_parent_lineage_unproven"],
+            )
+        return _result(status="PROVEN", errors=[], warnings=[])
 
     # A missing pointer is preserved as missing.  Even when a PRETRIGGER row
     # is supplied later, this owner must not invent a historical relationship.
-    return {
-        "status": "UNPROVEN" if pretrigger_candidate else "MISSING",
-        "preopen_parent_snapshot_id": None,
-        "expected_pretrigger_snapshot_id": pretrigger_candidate,
-        "errors": [],
-        "warnings": [
-            "PREOPEN_parent_lineage_unproven"
-            if pretrigger_candidate
-            else "PREOPEN_parent_lineage_missing"
-        ],
-    }
+    return _result(
+        status="UNPROVEN",
+        errors=[],
+        warnings=_link_warnings(pointer_present=False)
+        + ["PREOPEN_parent_lineage_unproven"],
+    )
 
 
 def build_breach_snapshot_envelope(

@@ -31,6 +31,7 @@ AS_OF = "2026-09-11T17:30:00+00:00"
 PROFILE = "profile-breach-v1"
 GENERATION = 7
 REPO_ROOT = Path(__file__).resolve().parents[1]
+_PARENT_LINK_STATUS_UNSET = object()
 
 
 def _signal(**updates: object) -> dict:
@@ -76,6 +77,7 @@ def _parent(
     status: str | None = "COMPLETE",
     context_revision: int | None = 1,
     parent_snapshot_id: str | None = None,
+    parent_link_status: object = _PARENT_LINK_STATUS_UNSET,
 ) -> dict:
     signal = _signal(
         client_id=client_id,
@@ -105,6 +107,12 @@ def _parent(
     }
     if generation is not None:
         payload["materialization_generation"] = generation
+    if phase == "PREOPEN":
+        if parent_link_status is _PARENT_LINK_STATUS_UNSET:
+            parent_link_status = (
+                "LINKED" if parent_snapshot_id else "PRETRIGGER_NOT_AVAILABLE"
+            )
+        payload["parent_link_status"] = parent_link_status
     return {
         "id": snapshot_id,
         "client_id": client_id,
@@ -442,6 +450,133 @@ def test_preopen_lineage_requires_exact_pretrigger_pointer():
     assert correct["status"] == "PARTIAL"  # structure remains reserved for #621
     assert wrong["status"] == "REJECTED"
     assert "PREOPEN_parent_snapshot_id_mismatch" in wrong["errors"]
+
+
+def test_identical_complete_parent_status_assertions_can_prove():
+    result = validate_breach_parent_snapshot(
+        _parent(
+            "PREOPEN",
+            local_order_id="local-order-1",
+            parent_snapshot_id="pretrigger-exact",
+            parent_link_status="LINKED",
+        ),
+        identity=_identity(local_order_id="local-order-1"),
+        phase="PREOPEN",
+    )
+    assert result["status"] == "PROVEN"
+    assert result["accepted"] is True
+    assert result["proven"] is True
+
+
+@pytest.mark.parametrize(
+    "payload_status",
+    ["PARTIAL", "ERROR", "SOME_UNKNOWN_STATUS", "", None, True, 1],
+)
+def test_contradictory_or_malformed_parent_status_cannot_prove(payload_status):
+    parent = _parent("PREOPEN", local_order_id="local-order-1")
+    parent["payload"]["status"] = payload_status
+    result = validate_breach_parent_snapshot(
+        parent,
+        identity=_identity(local_order_id="local-order-1"),
+        phase="PREOPEN",
+    )
+    assert result["accepted"] is False
+    assert result["proven"] is False
+    assert result["status"] == "UNPROVEN"
+    assert result["candidate_snapshot_id"] == "snapshot-1"
+    if payload_status == "SOME_UNKNOWN_STATUS":
+        assert "parent_snapshot_status_unrecognized" in result["warnings"]
+    elif payload_status is None or payload_status == "":
+        assert "parent_snapshot_status_missing" in result["warnings"]
+    elif isinstance(payload_status, bool) or isinstance(payload_status, int):
+        assert "parent_snapshot_status_invalid_type" in result["warnings"]
+    else:
+        assert "parent_snapshot_status_conflict" in result["warnings"]
+
+
+def test_exact_preopen_pointer_requires_linked_status_for_proven_lineage():
+    result = _envelope(
+        pretrigger_snapshot=_parent("PRETRIGGER", snapshot_id="pretrigger-exact"),
+        preopen_snapshot=_parent(
+            "PREOPEN",
+            snapshot_id="preopen-exact",
+            local_order_id="local-order-1",
+            parent_snapshot_id="pretrigger-exact",
+            parent_link_status="LINKED",
+        ),
+    )
+    assert result["parent_lineage"]["status"] == "PROVEN"
+    assert result["parent_lineage"]["parent_link_status"] == "LINKED"
+
+
+@pytest.mark.parametrize(
+    "link_status",
+    ["PRETRIGGER_LOOKUP_FAILED", "PRETRIGGER_NOT_AVAILABLE", "UNKNOWN_LINK_STATUS", True],
+)
+def test_exact_preopen_pointer_with_nonlinked_status_is_unproven(link_status):
+    result = _envelope(
+        pretrigger_snapshot=_parent("PRETRIGGER", snapshot_id="pretrigger-exact"),
+        preopen_snapshot=_parent(
+            "PREOPEN",
+            snapshot_id="preopen-exact",
+            local_order_id="local-order-1",
+            parent_snapshot_id="pretrigger-exact",
+            parent_link_status=link_status,
+        ),
+    )
+    assert result["ok"] is True
+    assert result["status"] == "PARTIAL"
+    assert result["parent_lineage"]["status"] == "UNPROVEN"
+    assert result["parent_lineage"]["preopen_parent_snapshot_id"] == "pretrigger-exact"
+    assert result["parent_lineage"]["expected_pretrigger_snapshot_id"] == "pretrigger-exact"
+
+
+def test_exact_preopen_pointer_with_missing_link_status_is_unproven():
+    preopen = _parent(
+        "PREOPEN",
+        snapshot_id="preopen-exact",
+        local_order_id="local-order-1",
+        parent_snapshot_id="pretrigger-exact",
+    )
+    del preopen["payload"]["parent_link_status"]
+    result = _envelope(
+        pretrigger_snapshot=_parent("PRETRIGGER", snapshot_id="pretrigger-exact"),
+        preopen_snapshot=preopen,
+    )
+    assert result["parent_lineage"]["status"] == "UNPROVEN"
+    assert "PREOPEN_parent_link_status_missing" in result["warnings"]
+
+
+def test_no_preopen_pointer_with_linked_status_cannot_prove():
+    result = _envelope(
+        pretrigger_snapshot=_parent("PRETRIGGER", snapshot_id="pretrigger-exact"),
+        preopen_snapshot=_parent(
+            "PREOPEN",
+            snapshot_id="preopen-no-pointer",
+            local_order_id="local-order-1",
+            parent_link_status="LINKED",
+        ),
+    )
+    assert result["parent_lineage"]["status"] == "UNPROVEN"
+    assert "PREOPEN_parent_link_status_linked_without_pointer" in result["warnings"]
+
+
+@pytest.mark.parametrize(
+    "link_status",
+    ["PRETRIGGER_NOT_AVAILABLE", "PRETRIGGER_LOOKUP_FAILED"],
+)
+def test_no_preopen_pointer_with_unresolved_link_status_is_unproven(link_status):
+    result = _envelope(
+        pretrigger_snapshot=_parent("PRETRIGGER", snapshot_id="pretrigger-exact"),
+        preopen_snapshot=_parent(
+            "PREOPEN",
+            snapshot_id="preopen-no-pointer",
+            local_order_id="local-order-1",
+            parent_link_status=link_status,
+        ),
+    )
+    assert result["parent_lineage"]["status"] == "UNPROVEN"
+    assert result["parent_lineage"]["parent_link_status"] == link_status
 
 
 def test_unrelated_valid_pretrigger_and_unresolved_lineage_are_not_consumed():
@@ -816,6 +951,7 @@ def test_current_327_snapshot_shape_retains_non_authoritative_row_identity():
         "PREOPEN": preopen["id"],
     }
     assert envelope["parent_lineage"]["status"] == "UNPROVEN"
+    assert envelope["parent_lineage"]["parent_link_status"] == "LINKED"
 
 
 def test_pure_assembly_does_not_mutate_inputs():
