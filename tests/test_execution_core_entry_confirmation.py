@@ -771,6 +771,100 @@ def test_real_entry_trigger_accepted_bridge_has_no_duplicate_selector_surface(
     selector.select.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "bridge_behavior",
+    [
+        (
+            "accepted",
+            lambda: {
+                "ok": True,
+                "accepted": True,
+                "handoff_status": "ACCEPTED",
+            },
+        ),
+        (
+            "bridge-exception",
+            lambda: (_ for _ in ()).throw(RuntimeError("bridge unavailable")),
+        ),
+        (
+            "saturated-or-rejected",
+            lambda: {
+                "ok": True,
+                "accepted": False,
+                "handoff_status": "SATURATED_OR_REJECTED",
+            },
+        ),
+        (
+            "missing-or-invalid-intelligence",
+            lambda: {
+                "ok": False,
+                "accepted": False,
+                "handoff_status": "INVALID_ARTIFACT",
+                "fallback_reason": "BREACH_INTEL_EVIDENCE_MISSING",
+            },
+        ),
+    ],
+    ids=lambda item: item[0] if isinstance(item, tuple) else str(item),
+)
+def test_real_deferred_entry_trigger_calls_selector_once_for_each_bridge_outcome(
+    monkeypatch, bridge_behavior
+):
+    """The observe-only bridge never suppresses the deferred selector path."""
+
+    _label, behavior = bridge_behavior
+
+    class _RecordingSelector:
+        def __init__(self):
+            self.calls = 0
+            self.last_plan = None
+            self.last_request_context = None
+
+        def select(self, plan, *, request_context=None):
+            self.calls += 1
+            self.last_plan = plan
+            self.last_request_context = request_context
+            return None
+
+    selector = _RecordingSelector()
+
+    def bridge_result(*_args, **_kwargs):
+        result = behavior()
+        if isinstance(result, dict):
+            return dict(result)
+        return result
+
+    monkeypatch.setattr(
+        breach_bridge_mod,
+        "submit_breach_intelligence_nonblocking",
+        bridge_result,
+    )
+    monkeypatch.setenv("SELECTOR_DURABLE_RECOVERY_CURSOR_ENABLED", "0")
+
+    result = _run_entry_trigger(
+        monkeypatch,
+        mode="off",
+        execution_mode="paper",
+        invoke_direct_trigger=False,
+        contract_selector=selector,
+    )
+    core = result["core"]
+    plan = result["core"]._recover_plan_for_revalidation.return_value
+    plan.contract_symbol = "DEFERRED:AAPL"
+    plan.metadata["contract_deferred"] = True
+    result["watched"].signal["contract_deferred"] = True
+    result["watched"].signal["contract_symbol"] = "DEFERRED:AAPL"
+    durable_row = result["osm"].get_order("local-1")
+    durable_row["contract"] = "DEFERRED:AAPL"
+
+    # This is the real callback entrypoint and the real selector attribute used
+    # by its deferred branch; no synthetic selector marker is consulted.
+    core._on_entry_trigger(result["watched"])
+
+    assert selector.calls == 1
+    assert selector.last_plan is plan
+    assert selector.last_request_context is not None
+
+
 @pytest.mark.parametrize("accepted", [True, False], ids=["accepted", "rejected"])
 def test_real_entry_trigger_bridge_result_cannot_change_disposition(
     monkeypatch, accepted

@@ -89,6 +89,24 @@ Missing intelligence is not adverse truth.
 
 Late intelligence may enrich later analytics but cannot retroactively mutate a selector/broker decision already made for that generation.
 
+## Normalized structure-view API
+
+The implementation owns one provider-neutral read-side helper:
+`resolve_breach_structure_view(frozen_context, expected_identity=...)`.
+It consumes only an already-produced/frozen mapping and returns the complete
+identity, exact `as_of`/`decision_boundary`, source/profile/model versions,
+structure and point-in-time provenance, normalized zones, frozen lower-TF
+acceptance/rejection/reclaim/penetration facts, and diagnostics. It performs no
+provider, history, network, database, selector, or eligibility work.
+
+Its only normalized statuses are `AUTHORITATIVE`, `STALE`, `UNKNOWN`, and
+`INVALID`. An authoritative empty zone set is `AUTHORITATIVE` with
+`zones=[]`; unavailable evidence is `UNKNOWN`; stale evidence or an older
+generation is `STALE`; malformed or contradictory input is `INVALID`. Missing
+zones are never fabricated and no volume imbalance is inferred. The same
+frozen input must yield identical output through uninterrupted, restart, and
+materialized/deferred paths.
+
 ## Runtime authority
 
 #622 adds zero admission authority.
@@ -120,8 +138,16 @@ The runtime bridge must preserve exact:
 - canonical_signal_id;
 - local_order_id;
 - current lifecycle/materialization generation;
+- profile_version;
+- model_version;
+- phase;
 - trigger_crossed_at;
 - BREACH snapshot identity.
+
+The process-local duplicate key is exactly the full #625 semantic tuple above;
+generation is removed only when deriving the generation-fence scope. A profile
+or model change is therefore a new identity, while an older generation remains
+stale within the same semantic scope.
 
 Stale generation or identity mismatch:
 - may prevent intelligence enrichment;
@@ -168,8 +194,12 @@ At minimum:
 16. no watcher/OSM/broker/order/position/proof/queue mutation from intelligence path;
 17. restart/recovered breach uses the same durable identity/frozen evidence contract where existing runtime permits replay;
 18. PAPER/LIVE share intelligence taxonomy but never execution identity;
-19. the real `_on_entry_trigger()` continuation submits unchanged when the
-    bridge throws, rejects/saturates, or reports missing/invalid evidence.
+19. the real deferred `_on_entry_trigger()` invokes the existing
+    `self.contract_selector.select(...)` exactly once under each bridge outcome:
+    ACCEPTED, bridge exception, SATURATED/REJECTED, and missing/invalid
+    intelligence; no synthetic selector marker stands in for that call;
+20. the real continuation submits unchanged when the bridge throws,
+    rejects/saturates, or reports missing/invalid evidence.
 
 ## Explicit non-scope
 

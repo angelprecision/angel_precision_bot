@@ -132,6 +132,91 @@ def _watched(signal: dict | None = None, *, trigger=TRIGGER) -> SimpleNamespace:
     )
 
 
+def _view_identity(**overrides) -> dict:
+    value = {
+        "client_id": CLIENT,
+        "execution_mode": "PAPER",
+        "signal_id": SIGNAL_ID,
+        "canonical_signal_id": "CANONICAL:sig-622",
+        "local_order_id": LOCAL_ORDER_ID,
+        "ticker": "SPY",
+        "side": "CALL",
+        "trigger_crossed_at": TRIGGER,
+        "materialization_generation": 7,
+        "profile_version": "profile-622",
+        "model_version": "model-622",
+        "phase": "BREACH",
+    }
+    value.update(overrides)
+    return value
+
+
+def _view_structure(*, zones=None, as_of=TRIGGER) -> dict:
+    return {
+        "schema_version": "breach_market_structure_v1",
+        "model_version": "structure-model-622",
+        "data_as_of": as_of,
+        "fvg_zones": copy.deepcopy(
+            zones
+            if zones is not None
+            else [
+                {
+                    "zone_id": "fvg_4h_622",
+                    "timeframe": "4h",
+                    "direction": "bearish",
+                    "low": 499.0,
+                    "midpoint": 499.5,
+                    "high": 500.0,
+                    "lifecycle_status": "active",
+                }
+            ]
+        ),
+        "fvg_penetration": {
+            "status": "AVAILABLE",
+            "5m": {"strong_break_authoritative": False},
+            "15m": {"strong_break_authoritative": True},
+        },
+        "pullback_reclaim_rebreach": {
+            "status": "AVAILABLE",
+            "pullback_state": "RECLAIMING",
+            "rebreach_after_pullback": True,
+        },
+        "data_coverage": {
+            "5m": {
+                "status": "COMPLETE",
+                "coverage_complete": True,
+                "authoritative": True,
+            },
+            "15m": {
+                "status": "COMPLETE",
+                "coverage_complete": True,
+                "authoritative": True,
+            },
+        },
+        "data_provenance": {
+            "provider": "precomputed.435d",
+            "interval": "4h/1h",
+            "session": "US_EQUITY_RTH",
+            "canonicalizer": "canonical_fvg_435b_v1",
+        },
+        "point_in_time": _pit(as_of),
+    }
+
+
+def _view_context(*, status="AUTHORITATIVE", zones=None, as_of=TRIGGER) -> dict:
+    return {
+        "status": status,
+        "identity": _view_identity(),
+        "evidence_as_of": as_of,
+        "source_versions": {
+            "profile_version": "profile-622",
+            "model_version": "model-622",
+            "canonicalizer_version": "canonicalizer-622",
+        },
+        "structure": _view_structure(zones=zones, as_of=as_of),
+    }
+
+
 @pytest.fixture(autouse=True)
 def _reset_bridge_and_store(monkeypatch):
     monkeypatch.setenv("INTELLIGENCE_CONTEXT_STORE_BACKEND", "memory")
@@ -329,6 +414,128 @@ def test_stale_evidence_becomes_non_authoritative_partial_diagnostic():
     assert artifact["evidence"]["point_in_time"]["errors"] == [
         "BREACH_INTEL_EVIDENCE_STALE_OR_MISMATCH"
     ]
+
+
+def test_structure_view_preserves_identity_provenance_zones_and_lower_tf_facts():
+    context = _view_context()
+    view = bridge.resolve_breach_structure_view(
+        context, expected_identity=_view_identity()
+    )
+
+    assert view["status"] == "AUTHORITATIVE"
+    assert view["as_of"] == TRIGGER
+    assert view["decision_boundary"] == TRIGGER
+    assert view["identity"] == _view_identity()
+    assert view["zones"] == context["structure"]["fvg_zones"]
+    assert view["provenance"]["structure"]["provider"] == "precomputed.435d"
+    assert view["provenance"]["point_in_time"]["source"] == "test.614"
+    assert view["source_versions"]["canonicalizer_version"] == "canonicalizer-622"
+    assert view["lower_tf"]["penetration"] == context["structure"]["fvg_penetration"]
+    assert view["lower_tf"]["reclaim"] == context["structure"]["pullback_reclaim_rebreach"]
+    assert view["observe_only"] is True
+    assert view["affected_eligibility"] is False
+
+
+def test_structure_view_distinguishes_authoritative_empty_unknown_stale_and_invalid():
+    authoritative_empty = bridge.resolve_breach_structure_view(
+        _view_context(zones=[]), expected_identity=_view_identity()
+    )
+    unknown = bridge.resolve_breach_structure_view(
+        {
+            "status": "UNAVAILABLE",
+            "identity": _view_identity(),
+            "evidence_as_of": TRIGGER,
+        },
+        expected_identity=_view_identity(),
+    )
+    stale = bridge.resolve_breach_structure_view(
+        _view_context(status="STALE"), expected_identity=_view_identity()
+    )
+    invalid = bridge.resolve_breach_structure_view(
+        _view_context(zones="not-a-zone-list"), expected_identity=_view_identity()
+    )
+
+    assert authoritative_empty["status"] == "AUTHORITATIVE"
+    assert authoritative_empty["zones"] == []
+    assert unknown["status"] == "UNKNOWN"
+    assert unknown["zones"] is None
+    assert stale["status"] == "STALE"
+    assert stale["zones"]
+    assert invalid["status"] == "INVALID"
+    assert "fvg_zones_invalid_type" in invalid["diagnostics"]["errors"]
+
+
+def test_structure_view_normalizes_the_same_frozen_context_across_runtime_restart_and_materialization():
+    expected = _view_identity()
+    runtime_context = _view_context()
+    frozen_payload = {
+        "payload_kind": "FROZEN_BREACH_V1",
+        "envelope_status": "COMPLETE",
+        **runtime_context,
+    }
+    restart_context = {"payload": copy.deepcopy(frozen_payload)}
+    materialized_context = {
+        "status": "COMPLETE",
+        "data_as_of": TRIGGER,
+        "payload": copy.deepcopy(frozen_payload),
+    }
+
+    views = [
+        bridge.resolve_breach_structure_view(value, expected_identity=expected)
+        for value in (runtime_context, restart_context, materialized_context)
+    ]
+
+    assert views[0] == views[1] == views[2]
+
+
+def test_structure_view_rejects_identity_mismatch_but_marks_older_generation_stale():
+    mismatched = bridge.resolve_breach_structure_view(
+        _view_context(),
+        expected_identity=_view_identity(model_version="other-model"),
+    )
+    older_generation = bridge.resolve_breach_structure_view(
+        _view_context(),
+        expected_identity=_view_identity(materialization_generation=8),
+    )
+
+    assert mismatched["status"] == "INVALID"
+    assert "identity_model_version_mismatch" in mismatched["diagnostics"]["errors"]
+    assert older_generation["status"] == "STALE"
+    assert "identity_generation_stale" in older_generation["diagnostics"]["errors"]
+
+
+def test_local_duplicate_key_contains_the_complete_625_identity_tuple(monkeypatch):
+    accepted: list[dict] = []
+
+    def fake_handoff(_fn, artifact, **_kwargs):
+        accepted.append(artifact)
+        return {"ok": True, "accepted": True}
+
+    monkeypatch.setattr(bridge, "submit_intelligence_enqueue", fake_handoff)
+    base = _signal(profile_version="profile-a", model_version="model-a")
+    same = bridge.submit_breach_intelligence_nonblocking(
+        base, _plan(), _watched(base)
+    )
+    duplicate = bridge.submit_breach_intelligence_nonblocking(
+        copy.deepcopy(base), _plan(), _watched(copy.deepcopy(base))
+    )
+    profile_change = _signal(profile_version="profile-b", model_version="model-a")
+    model_change = _signal(profile_version="profile-a", model_version="model-b")
+    profile_result = bridge.submit_breach_intelligence_nonblocking(
+        profile_change, _plan(), _watched(profile_change)
+    )
+    model_result = bridge.submit_breach_intelligence_nonblocking(
+        model_change, _plan(), _watched(model_change)
+    )
+
+    key = bridge._identity_key(accepted[0]["identity"])
+    assert len(key) == 12
+    assert key[9:] == ("profile-a", "model-a", "BREACH")
+    assert same["accepted"] is True
+    assert duplicate["handoff_status"] == "DUPLICATE"
+    assert profile_result["accepted"] is True
+    assert model_result["accepted"] is True
+    assert len(accepted) == 3
 
 
 def test_handoff_returns_before_background_and_suppresses_repeated_callback(monkeypatch):

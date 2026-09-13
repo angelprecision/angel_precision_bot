@@ -9,12 +9,17 @@ bounded intelligence executor; the worker then calls the canonical #615,
 This module deliberately has no selector, watcher, order, broker, position,
 queue, database, history, or network dependency.  A failure here is
 telemetry-only and cannot change the trading lifecycle.
+
+``resolve_breach_structure_view`` is the provider-neutral read-side surface for
+already-frozen structure payloads.  It performs only local normalization and
+returns explicit AUTHORITATIVE/STALE/UNKNOWN/INVALID diagnostics.
 """
 
 from __future__ import annotations
 
 import copy
 import logging
+import math
 import threading
 import time
 from collections import OrderedDict
@@ -27,6 +32,59 @@ from ap.intelligence_context_handoff import submit_intelligence_enqueue
 BRIDGE_VERSION = "breach_runtime_bridge_v1"
 BREACH_PHASE = "BREACH"
 MAX_SEEN_IDENTITIES = 4096
+_DEFAULT_PROFILE_VERSION = "intelligence_context_v1_observe_only"
+_IDENTITY_KEY_FIELDS = (
+    "client_id",
+    "execution_mode",
+    "signal_id",
+    "canonical_signal_id",
+    "local_order_id",
+    "ticker",
+    "side",
+    "trigger_crossed_at",
+    "materialization_generation",
+    "profile_version",
+    "model_version",
+    "phase",
+)
+_GENERATION_KEY_INDEX = _IDENTITY_KEY_FIELDS.index("materialization_generation")
+
+_STRUCTURE_VIEW_STATUSES = frozenset(
+    {"AUTHORITATIVE", "STALE", "UNKNOWN", "INVALID"}
+)
+_STRUCTURE_VIEW_STATUS_ALIASES = {
+    "AUTHORITATIVE": "AUTHORITATIVE",
+    "COMPLETE": "AUTHORITATIVE",
+    "VALID": "AUTHORITATIVE",
+    "AVAILABLE": "AUTHORITATIVE",
+    "OK": "AUTHORITATIVE",
+    "PROVEN": "AUTHORITATIVE",
+    "STALE": "STALE",
+    "UNKNOWN": "UNKNOWN",
+    "MISSING": "UNKNOWN",
+    "UNAVAILABLE": "UNKNOWN",
+    "PARTIAL": "UNKNOWN",
+    "UNPROVEN": "UNKNOWN",
+    "ERROR": "UNKNOWN",
+    "FAILED": "UNKNOWN",
+    "INVALID": "INVALID",
+    "MALFORMED": "INVALID",
+    "REJECTED": "INVALID",
+}
+_STRUCTURE_VIEW_IDENTITY_FIELDS = (
+    "client_id",
+    "execution_mode",
+    "signal_id",
+    "canonical_signal_id",
+    "local_order_id",
+    "ticker",
+    "side",
+    "trigger_crossed_at",
+    "materialization_generation",
+    "profile_version",
+    "model_version",
+    "phase",
+)
 
 _MISSING = object()
 _SEEN_LOCK = threading.Lock()
@@ -651,10 +709,872 @@ def freeze_breach_runtime_artifact(
     return artifact
 
 
+def _structure_view_layers(source: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Return known frozen-context wrappers without recursively inspecting data."""
+    layers: list[Mapping[str, Any]] = []
+    pending: list[Mapping[str, Any]] = [source]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop(0)
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        layers.append(current)
+        for key in ("payload", "snapshot", "context", "frozen_context", "envelope"):
+            nested = current.get(key)
+            if isinstance(nested, Mapping):
+                pending.append(nested)
+    return layers
+
+
+def _structure_view_nested_layers(
+    layers: list[Mapping[str, Any]], structure: Mapping[str, Any] | None
+) -> list[Mapping[str, Any]]:
+    """Return only documented evidence/provenance wrapper levels."""
+    result = list(layers)
+    if structure is not None:
+        result.append(structure)
+    pending = list(result)
+    seen = {id(value) for value in result}
+    while pending:
+        current = pending.pop(0)
+        for key in (
+            "point_in_time",
+            "evidence",
+            "canonical_evidence",
+            "breach_evidence",
+            "frozen_evidence",
+            "data_sources",
+            "underlying_observation",
+            "diagnostics",
+        ):
+            nested = current.get(key)
+            if isinstance(nested, Mapping) and id(nested) not in seen:
+                seen.add(id(nested))
+                result.append(nested)
+                pending.append(nested)
+    return result
+
+
+def _view_structure_candidate(
+    source: Mapping[str, Any], layers: list[Mapping[str, Any]]
+) -> tuple[Mapping[str, Any] | None, list[str]]:
+    errors: list[str] = []
+    candidates: list[Mapping[str, Any]] = []
+    for layer in layers:
+        for key in ("structure", "frozen_structure", "normalized_structure"):
+            if key not in layer or layer.get(key) is None:
+                continue
+            value = layer.get(key)
+            if not isinstance(value, Mapping):
+                errors.append(f"{key}_invalid_type")
+            else:
+                candidates.append(value)
+
+    direct_keys = {
+        "schema_version",
+        "fvg_zones",
+        "zones",
+        "fvg_4h",
+        "fvg_1h",
+        "data_as_of",
+        "structure_status",
+    }
+    if not candidates and any(key in source for key in direct_keys):
+        candidates.append(source)
+
+    if not candidates:
+        return None, errors
+    first = candidates[0]
+    for candidate in candidates[1:]:
+        try:
+            equal = candidate == first
+        except Exception:
+            equal = False
+        if not equal:
+            errors.append("structure_conflict")
+            break
+    return first, errors
+
+
+def _view_identity_mappings(
+    layers: list[Mapping[str, Any]], structure: Mapping[str, Any] | None
+) -> tuple[list[Mapping[str, Any]], list[str]]:
+    """Collect identity-shaped mappings and reject malformed identity wrappers."""
+    result: list[Mapping[str, Any]] = []
+    errors: list[str] = []
+    for layer in layers:
+        for key in ("identity", "breach_identity"):
+            if key not in layer or layer.get(key) is None:
+                continue
+            value = layer.get(key)
+            if not isinstance(value, Mapping):
+                errors.append(f"{key}_invalid_type")
+            else:
+                result.append(value)
+        direct = {
+            key: layer.get(key)
+            for key in _STRUCTURE_VIEW_IDENTITY_FIELDS
+            if key in layer
+        }
+        if direct:
+            result.append(direct)
+
+        source_versions = layer.get("source_versions")
+        if source_versions is not None:
+            if not isinstance(source_versions, Mapping):
+                errors.append("source_versions_invalid_type")
+            else:
+                version_identity = {
+                    key: source_versions.get(key)
+                    for key in ("profile_version", "model_version")
+                    if key in source_versions
+                }
+                if version_identity:
+                    result.append(version_identity)
+
+    # A standalone frozen structure can be consumed directly.  In a wrapped
+    # payload its model_version is a structure/source version, not a second
+    # semantic identity, so it is only a fallback when no identity was found.
+    if not result and structure is not None:
+        direct = {
+            key: structure.get(key)
+            for key in _STRUCTURE_VIEW_IDENTITY_FIELDS
+            if key in structure
+        }
+        if direct:
+            result.append(direct)
+    return result, errors
+
+
+def _normalize_view_identity_value(field: str, value: Any) -> Any:
+    if value in (None, ""):
+        return None
+    if field == "materialization_generation":
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{field}_invalid")
+        return value
+    if field == "trigger_crossed_at":
+        parsed = _parse_aware(value)
+        if parsed is None:
+            raise ValueError(f"{field}_invalid")
+        return parsed.isoformat()
+    if not isinstance(value, str):
+        raise ValueError(f"{field}_invalid")
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if field in {"execution_mode", "ticker", "side", "phase"}:
+        normalized = normalized.upper()
+    return normalized
+
+
+def _resolve_view_identity(
+    mappings: list[Mapping[str, Any]], errors: list[str]
+) -> dict[str, Any]:
+    aliases = {
+        "client_id": ("client_id", "client_email"),
+        "execution_mode": ("execution_mode", "mode"),
+        "signal_id": ("signal_id",),
+        "canonical_signal_id": ("canonical_signal_id",),
+        "local_order_id": ("local_order_id",),
+        "ticker": ("ticker", "symbol"),
+        "side": ("side", "direction"),
+        "trigger_crossed_at": (
+            "trigger_crossed_at",
+            "breach_at",
+            "trigger_at",
+        ),
+        "materialization_generation": (
+            "materialization_generation",
+            "lifecycle_generation",
+            "generation",
+        ),
+        "profile_version": ("profile_version",),
+        "model_version": (
+            "model_version",
+            "intelligence_model_version",
+            "breach_model_version",
+        ),
+        "phase": ("phase",),
+    }
+    result: dict[str, Any] = {}
+    for field in _STRUCTURE_VIEW_IDENTITY_FIELDS:
+        normalized_values: list[Any] = []
+        for mapping in mappings:
+            for key in aliases[field]:
+                if key not in mapping or mapping.get(key) in (None, ""):
+                    continue
+                try:
+                    normalized_values.append(
+                        _normalize_view_identity_value(field, mapping.get(key))
+                    )
+                except ValueError:
+                    errors.append(f"{field}_invalid")
+        distinct = {value for value in normalized_values if value is not None}
+        if len(distinct) > 1:
+            errors.append(f"{field}_conflict")
+        result[field] = next(iter(distinct), None)
+
+    if result.get("execution_mode") not in (None, "LIVE", "PAPER"):
+        errors.append("execution_mode_invalid")
+    if result.get("side") not in (None, "CALL", "PUT"):
+        errors.append("side_invalid")
+    if result.get("phase") not in (None, BREACH_PHASE):
+        errors.append("phase_mismatch")
+    return result
+
+
+def _view_time_mappings(
+    layers: list[Mapping[str, Any]], structure: Mapping[str, Any] | None
+) -> list[Mapping[str, Any]]:
+    return _structure_view_nested_layers(layers, structure)
+
+
+def _view_timestamp_candidate(value: Any, field: str) -> str:
+    if isinstance(value, Mapping):
+        value = value.get(BREACH_PHASE) or value.get("breach") or value.get("as_of")
+    parsed = _parse_aware(value)
+    if parsed is None:
+        raise ValueError(f"{field}_invalid")
+    return parsed.isoformat()
+
+
+def _resolve_view_as_of(
+    mappings: list[Mapping[str, Any]], errors: list[str]
+) -> tuple[str | None, str | None, str | None]:
+    candidates: list[str] = []
+    boundary_candidates: list[str] = []
+    evidence_candidates: list[str] = []
+    for mapping in mappings:
+        for key in ("evidence_as_of", "decision_boundary", "as_of", "data_as_of"):
+            if key not in mapping or mapping.get(key) in (None, ""):
+                continue
+            try:
+                value = _view_timestamp_candidate(mapping.get(key), key)
+                candidates.append(value)
+                if key == "decision_boundary":
+                    boundary_candidates.append(value)
+                elif key in {"evidence_as_of", "as_of"}:
+                    evidence_candidates.append(value)
+            except ValueError:
+                errors.append(f"{key}_invalid")
+
+    def choose(values: list[str], label: str) -> str | None:
+        distinct = sorted(set(values))
+        if len(distinct) > 1:
+            errors.append(f"{label}_conflict")
+        return distinct[0] if distinct else None
+
+    as_of = choose(candidates, "as_of")
+    decision_boundary = choose(boundary_candidates, "decision_boundary") or as_of
+    evidence_as_of = choose(evidence_candidates, "evidence_as_of") or as_of
+    if len(set(evidence_candidates + boundary_candidates)) > 1:
+        # Preserve both named fields in the result, but reject a frozen source
+        # that presents incompatible values for the evidence boundary.
+        if evidence_candidates and boundary_candidates:
+            errors.append("decision_boundary_as_of_conflict")
+    if len(set(candidates)) > 1:
+        errors.append("as_of_conflict")
+    return as_of, decision_boundary, evidence_as_of
+
+
+def _view_status_value(value: Any, field: str, errors: list[str]) -> str | None:
+    if not isinstance(value, str):
+        errors.append(f"{field}_invalid_type")
+        return None
+    normalized = _STRUCTURE_VIEW_STATUS_ALIASES.get(value.strip().upper())
+    if normalized is None:
+        errors.append(f"{field}_unrecognized")
+    return normalized
+
+
+def _resolve_view_status(
+    layers: list[Mapping[str, Any]],
+    structure: Mapping[str, Any] | None,
+    errors: list[str],
+) -> tuple[str | None, list[str]]:
+    direct: list[str] = []
+    wrapper: list[str] = []
+    if structure is not None:
+        for key in ("structure_status", "authority_status", "status"):
+            if key in structure and structure.get(key) not in (None, ""):
+                value = _view_status_value(structure.get(key), key, errors)
+                if value:
+                    direct.append(value)
+    for layer in layers:
+        for key in (
+            "snapshot_status",
+            "envelope_status",
+            "structure_status",
+            "authority_status",
+            "status",
+        ):
+            if key not in layer or layer.get(key) in (None, ""):
+                continue
+            value = _view_status_value(layer.get(key), key, errors)
+            if value:
+                wrapper.append(value)
+
+    bool_hints: list[str] = []
+    for mapping in [*layers, *([structure] if structure is not None else [])]:
+        for key in ("authoritative", "is_authoritative"):
+            if key not in mapping or mapping.get(key) is None:
+                continue
+            value = mapping.get(key)
+            if type(value) is not bool:
+                errors.append(f"{key}_invalid_type")
+            else:
+                bool_hints.append("AUTHORITATIVE" if value else "UNKNOWN")
+
+    status_values = direct or wrapper
+    status_values.extend(bool_hints)
+    if status_values and len(set(status_values)) > 1:
+        errors.append("status_conflict")
+    return (status_values[0] if status_values else None), status_values
+
+
+def _resolve_view_evidence_status(
+    mappings: list[Mapping[str, Any]], errors: list[str]
+) -> str | None:
+    hints: list[str] = []
+    for mapping in mappings:
+        if "evidence_status" not in mapping or mapping.get("evidence_status") in (None, ""):
+            continue
+        value = _view_status_value(mapping.get("evidence_status"), "evidence_status", errors)
+        if value:
+            hints.append(value)
+    if hints and len(set(hints)) > 1:
+        errors.append("evidence_status_conflict")
+    return hints[0] if hints else None
+
+
+def _resolve_view_coverage(
+    mappings: list[Mapping[str, Any]], errors: list[str]
+) -> str | None:
+    hints: list[str] = []
+    for mapping in mappings:
+        for key in ("data_coverage", "coverage"):
+            if key not in mapping or mapping.get(key) in (None, {}):
+                continue
+            coverage = mapping.get(key)
+            if not isinstance(coverage, Mapping):
+                errors.append(f"{key}_invalid_type")
+                continue
+            entries = list(coverage.values())
+            if not entries:
+                continue
+            entry_hints: list[str] = []
+            for entry in entries:
+                if not isinstance(entry, Mapping):
+                    errors.append(f"{key}_entry_invalid_type")
+                    continue
+                status = str(entry.get("status") or "").strip().upper()
+                if status == "STALE":
+                    entry_hints.append("STALE")
+                elif status in {"MISSING", "UNAVAILABLE", "ERROR", "FAILED"}:
+                    entry_hints.append("UNKNOWN")
+                elif (
+                    entry.get("authoritative") is True
+                    and entry.get("coverage_complete") is True
+                ):
+                    entry_hints.append("AUTHORITATIVE")
+                else:
+                    entry_hints.append("UNKNOWN")
+            if entry_hints:
+                if "STALE" in entry_hints:
+                    hints.append("STALE")
+                elif all(value == "AUTHORITATIVE" for value in entry_hints):
+                    hints.append("AUTHORITATIVE")
+                else:
+                    hints.append("UNKNOWN")
+    if hints and "STALE" in hints:
+        return "STALE"
+    if hints and all(value == "AUTHORITATIVE" for value in hints):
+        return "AUTHORITATIVE"
+    return "UNKNOWN" if hints else None
+
+
+def _view_source_errors(mappings: list[Mapping[str, Any]], errors: list[str]) -> list[str]:
+    source_errors: list[str] = []
+    for mapping in mappings:
+        for key in ("errors", "warnings"):
+            if key not in mapping or mapping.get(key) in (None, []):
+                continue
+            value = mapping.get(key)
+            if not isinstance(value, list):
+                errors.append(f"{key}_invalid_type")
+                continue
+            for item in value:
+                if not isinstance(item, str):
+                    errors.append(f"{key}_entry_invalid_type")
+                else:
+                    source_errors.append(item)
+        diagnostics = mapping.get("diagnostics")
+        if isinstance(diagnostics, Mapping):
+            diagnostic_errors = diagnostics.get("errors")
+            if isinstance(diagnostic_errors, list):
+                source_errors.extend(
+                    item for item in diagnostic_errors if isinstance(item, str)
+                )
+    return source_errors
+
+
+def _view_source_diagnostics(
+    mappings: list[Mapping[str, Any]], errors: list[str]
+) -> dict[str, Any]:
+    """Preserve producer diagnostics without treating them as policy input."""
+    result: dict[str, Any] = {}
+    reason_codes: list[str] = []
+    for mapping in mappings:
+        for key in ("reason_code", "fallback_reason", "error_code"):
+            value = mapping.get(key)
+            if value in (None, ""):
+                continue
+            if not isinstance(value, str):
+                errors.append(f"{key}_invalid_type")
+                continue
+            reason_codes.append(value)
+        value = mapping.get("diagnostics")
+        if value is None:
+            continue
+        if not isinstance(value, Mapping):
+            errors.append("diagnostics_invalid_type")
+            continue
+        copied = _safe_copy(dict(value))
+        if not isinstance(copied, dict):
+            errors.append("diagnostics_copy_failed")
+            continue
+        for key, item in copied.items():
+            if key in result and result[key] != item:
+                errors.append(f"diagnostics_conflict:{key}")
+            else:
+                result.setdefault(key, item)
+    if reason_codes:
+        result["reason_codes"] = sorted(set(reason_codes))
+    return result
+
+
+def _view_zone_values(
+    structure: Mapping[str, Any] | None, errors: list[str]
+) -> tuple[list[dict[str, Any]] | None, bool]:
+    if structure is None:
+        return None, False
+    candidates: list[list[dict[str, Any]]] = []
+    for key in ("zones", "normalized_zones", "fvg_zones"):
+        if key not in structure or structure.get(key) is None:
+            continue
+        raw_zones = structure.get(key)
+        if not isinstance(raw_zones, list):
+            errors.append(f"{key}_invalid_type")
+            continue
+        normalized: list[dict[str, Any]] = []
+        for zone in raw_zones:
+            if not isinstance(zone, Mapping):
+                errors.append(f"{key}_entry_invalid_type")
+                continue
+            copied = _safe_copy(dict(zone))
+            if not isinstance(copied, dict):
+                errors.append(f"{key}_entry_copy_failed")
+                continue
+            for numeric_key in ("low", "midpoint", "high", "fill_pct", "break_boundary"):
+                if numeric_key not in copied or copied.get(numeric_key) is None:
+                    continue
+                value = copied.get(numeric_key)
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    errors.append(f"{key}_{numeric_key}_invalid")
+                elif not math.isfinite(float(value)):
+                    errors.append(f"{key}_{numeric_key}_invalid")
+            if (
+                isinstance(copied.get("low"), (int, float))
+                and isinstance(copied.get("high"), (int, float))
+                and copied.get("high") < copied.get("low")
+            ):
+                errors.append(f"{key}_bounds_invalid")
+            if (
+                isinstance(copied.get("midpoint"), (int, float))
+                and isinstance(copied.get("low"), (int, float))
+                and isinstance(copied.get("high"), (int, float))
+                and not copied.get("low") <= copied.get("midpoint") <= copied.get("high")
+            ):
+                errors.append(f"{key}_midpoint_out_of_bounds")
+            normalized.append(copied)
+        candidates.append(normalized)
+
+    for timeframe in ("4h", "1h"):
+        key = f"fvg_{timeframe}"
+        if key not in structure or structure.get(key) is None:
+            continue
+        raw_zones = structure.get(key)
+        if not isinstance(raw_zones, list):
+            errors.append(f"{key}_invalid_type")
+            continue
+        normalized = []
+        for zone in raw_zones:
+            if not isinstance(zone, Mapping):
+                errors.append(f"{key}_entry_invalid_type")
+                continue
+            copied = _safe_copy(dict(zone))
+            if not isinstance(copied, dict):
+                errors.append(f"{key}_entry_copy_failed")
+                continue
+            existing_timeframe = copied.get("timeframe")
+            if existing_timeframe not in (None, "", timeframe):
+                errors.append(f"{key}_timeframe_conflict")
+            copied.setdefault("timeframe", timeframe)
+            if "zone_id" not in copied and "id" in copied:
+                copied["zone_id"] = _safe_copy(copied.get("id"))
+            normalized.append(copied)
+        candidates.append(normalized)
+
+    if not candidates:
+        return None, False
+    first = candidates[0]
+    for candidate in candidates[1:]:
+        if candidate != first:
+            errors.append("zones_conflict")
+            break
+    return first, True
+
+
+def _view_lower_tf(structure: Mapping[str, Any] | None) -> dict[str, Any]:
+    if structure is None:
+        return {}
+    result: dict[str, Any] = {}
+    aliases = {
+        "acceptance": ("lower_tf_acceptance", "acceptance"),
+        "rejection": ("lower_tf_rejection", "rejection"),
+        "reclaim": (
+            "lower_tf_reclaim",
+            "reclaim",
+            "pullback_reclaim_rebreach",
+        ),
+        "penetration": ("lower_tf_penetration", "penetration", "fvg_penetration"),
+    }
+    lower_context = structure.get("lower_tf")
+    if isinstance(lower_context, Mapping):
+        result["context"] = _safe_copy(dict(lower_context))
+        aliases = {
+            name: keys + (name,)
+            for name, keys in aliases.items()
+        }
+        source = {**structure, **lower_context}
+    else:
+        source = structure
+    for name, keys in aliases.items():
+        for key in keys:
+            if key in source and source.get(key) is not None:
+                copied = _safe_copy(source.get(key))
+                if copied is not _MISSING:
+                    result[name] = copied
+                break
+    return result
+
+
+def _view_provenance(
+    layers: list[Mapping[str, Any]], structure: Mapping[str, Any] | None, errors: list[str]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    def first_mapping(
+        mappings: list[Mapping[str, Any]], keys: tuple[str, ...], label: str
+    ) -> dict[str, Any]:
+        for mapping in mappings:
+            for key in keys:
+                if key not in mapping or mapping.get(key) is None:
+                    continue
+                value = mapping.get(key)
+                if not isinstance(value, Mapping):
+                    errors.append(f"{label}_invalid_type")
+                    return {}
+                copied = _safe_copy(dict(value))
+                if isinstance(copied, dict):
+                    return copied
+                errors.append(f"{label}_copy_failed")
+                return {}
+        return {}
+
+    structure_provenance = first_mapping(
+        [structure] if structure is not None else [],
+        ("structure_provenance", "data_provenance", "provenance", "source_provenance"),
+        "structure_provenance",
+    )
+    pit_sources: list[Mapping[str, Any]] = []
+    for mapping in layers:
+        for key in (
+            "point_in_time",
+            "evidence",
+            "canonical_evidence",
+            "breach_evidence",
+            "frozen_evidence",
+        ):
+            value = mapping.get(key)
+            if isinstance(value, Mapping):
+                pit_sources.append(value)
+    if structure is not None:
+        value = structure.get("point_in_time")
+        if isinstance(value, Mapping):
+            pit_sources.append(value)
+    pit_provenance = first_mapping(
+        pit_sources,
+        ("provenance", "data_provenance"),
+        "point_in_time_provenance",
+    )
+    context_provenance = first_mapping(
+        layers,
+        ("provenance", "data_provenance"),
+        "context_provenance",
+    )
+    return (
+        {
+            "structure": structure_provenance,
+            "point_in_time": pit_provenance,
+            "context": context_provenance,
+        },
+        structure_provenance,
+    )
+
+
+def _view_source_versions(
+    layers: list[Mapping[str, Any]],
+    structure: Mapping[str, Any] | None,
+    identity: Mapping[str, Any],
+    errors: list[str],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for mapping in [*layers, *([structure] if structure is not None else [])]:
+        value = mapping.get("source_versions")
+        if value is None:
+            continue
+        if not isinstance(value, Mapping):
+            errors.append("source_versions_invalid_type")
+            continue
+        for key, item in value.items():
+            if not isinstance(key, str):
+                errors.append("source_versions_key_invalid")
+                continue
+            if key in result and result[key] != item:
+                errors.append(f"source_version_conflict:{key}")
+            else:
+                copied = _safe_copy(item)
+                if copied is not _MISSING:
+                    result[key] = copied
+        for key in (
+            "assembly_version",
+            "adapter_version",
+            "structure_schema_version",
+            "structure_model_version",
+        ):
+            if key not in mapping or mapping.get(key) in (None, ""):
+                continue
+            item = _safe_copy(mapping.get(key))
+            if item is _MISSING:
+                continue
+            if key in result and result[key] != item:
+                errors.append(f"source_version_conflict:{key}")
+            else:
+                result.setdefault(key, item)
+    if identity.get("profile_version") is not None:
+        result.setdefault("profile_version", identity["profile_version"])
+    if identity.get("model_version") is not None:
+        result.setdefault("model_version", identity["model_version"])
+    if structure is not None:
+        if structure.get("schema_version") not in (None, ""):
+            result.setdefault("structure_schema_version", _safe_copy(structure.get("schema_version")))
+        if structure.get("model_version") not in (None, ""):
+            result.setdefault("structure_model_version", _safe_copy(structure.get("model_version")))
+    return result
+
+
+def resolve_breach_structure_view(
+    frozen_context: Any,
+    expected_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve an already-produced BREACH structure into one stable read view.
+
+    This function is intentionally pure: it accepts only frozen/precomputed
+    mappings, never fetches data, waits for persistence, or evaluates policy.
+    ``AUTHORITATIVE`` with ``zones=[]`` is distinct from ``UNKNOWN`` (no
+    source), ``STALE`` (explicitly stale source), and ``INVALID`` (malformed or
+    contradictory source).  The returned mappings are defensive copies.
+    """
+    base_identity = {
+        field: None for field in _STRUCTURE_VIEW_IDENTITY_FIELDS
+    }
+    empty = {
+        "status": "UNKNOWN",
+        "as_of": None,
+        "decision_boundary": None,
+        "evidence_as_of": None,
+        "identity": base_identity,
+        "source_versions": {},
+        "provenance": {"structure": {}, "point_in_time": {}, "context": {}},
+        "zones": None,
+        "lower_tf": {},
+        "diagnostics": {
+            "reason_code": "context_missing",
+            "errors": [],
+            "source_errors": [],
+            "source": {},
+        },
+        "observe_only": True,
+        "affected_eligibility": False,
+    }
+    if frozen_context is None:
+        return empty
+    if not isinstance(frozen_context, Mapping):
+        return {
+            **empty,
+            "status": "INVALID",
+            "diagnostics": {
+                "reason_code": "context_invalid_type",
+                "errors": ["context_invalid_type"],
+                "source_errors": [],
+                "source": {},
+            },
+        }
+
+    errors: list[str] = []
+    layers = _structure_view_layers(frozen_context)
+    structure, structure_errors = _view_structure_candidate(frozen_context, layers)
+    errors.extend(structure_errors)
+    identity_mappings, identity_errors = _view_identity_mappings(layers, structure)
+    errors.extend(identity_errors)
+    identity = _resolve_view_identity(identity_mappings, errors)
+    if expected_identity is not None:
+        if not isinstance(expected_identity, Mapping):
+            errors.append("expected_identity_invalid_type")
+        else:
+            expected_source = expected_identity.get("identity")
+            if expected_source is not None:
+                if not isinstance(expected_source, Mapping):
+                    errors.append("expected_identity_invalid_type")
+                    expected_source = {}
+            else:
+                expected_source = expected_identity
+            expected_errors: list[str] = []
+            expected = _resolve_view_identity([expected_source], expected_errors)
+            errors.extend(f"expected_{item}" for item in expected_errors)
+            for field in _STRUCTURE_VIEW_IDENTITY_FIELDS:
+                expected_value = expected.get(field)
+                actual_value = identity.get(field)
+                if expected_value is None:
+                    continue
+                if actual_value is None:
+                    errors.append(f"identity_{field}_missing")
+                elif actual_value != expected_value:
+                    if field == "materialization_generation":
+                        errors.append("identity_generation_stale")
+                    else:
+                        errors.append(f"identity_{field}_mismatch")
+
+    time_mappings = _view_time_mappings(layers, structure)
+    as_of, decision_boundary, evidence_as_of = _resolve_view_as_of(
+        time_mappings, errors
+    )
+    status_hint, _ = _resolve_view_status(layers, structure, errors)
+    evidence_hint = _resolve_view_evidence_status(time_mappings, errors)
+    coverage_hint = _resolve_view_coverage(time_mappings, errors)
+    source_errors = _view_source_errors(time_mappings, errors)
+    source_diagnostics = _view_source_diagnostics(time_mappings, errors)
+    for item in source_errors:
+        upper = item.upper()
+        if any(token in upper for token in ("MALFORMED", "INVALID", "CONFLICT")):
+            errors.append(f"source_error_invalid:{item}")
+
+    zones, zones_present = _view_zone_values(structure, errors)
+    lower_tf = _view_lower_tf(structure)
+    provenance, _ = _view_provenance(layers, structure, errors)
+    source_versions = _view_source_versions(layers, structure, identity, errors)
+
+    # Explicit structure/snapshot authority wins over lower-TF completeness:
+    # a valid authoritative structure with no relevant zone remains
+    # AUTHORITATIVE and does not become UNKNOWN merely because a lower-TF
+    # acceptance fact is absent.
+    status = status_hint or evidence_hint or coverage_hint
+    if status is None:
+        status = "UNKNOWN"
+    if evidence_hint == "STALE" or coverage_hint == "STALE":
+        status = "STALE"
+    if evidence_hint == "INVALID":
+        errors.append("evidence_invalid")
+    if source_errors and status == "UNKNOWN":
+        if any("STALE" in item.upper() for item in source_errors):
+            status = "STALE"
+
+    if structure is None:
+        status = "UNKNOWN"
+        reason = "structure_missing"
+    elif as_of is None:
+        status = "UNKNOWN" if status != "INVALID" else status
+        reason = "as_of_missing"
+    elif status == "AUTHORITATIVE" and not zones_present:
+        status = "UNKNOWN"
+        reason = "zones_missing"
+    elif status == "STALE":
+        reason = "stale_snapshot"
+    elif status == "INVALID":
+        reason = "invalid_structure"
+    elif status == "AUTHORITATIVE":
+        reason = "authoritative_snapshot"
+    else:
+        reason = "authority_unproven"
+
+    hard_errors = [
+        item for item in errors if item != "identity_generation_stale"
+    ]
+    if hard_errors:
+        status = "INVALID"
+        reason = hard_errors[0]
+    elif errors:
+        status = "STALE"
+        reason = "identity_generation_stale"
+
+    result_identity = {
+        field: _safe_copy(identity.get(field))
+        for field in _STRUCTURE_VIEW_IDENTITY_FIELDS
+    }
+    result: dict[str, Any] = {
+        "status": status if status in _STRUCTURE_VIEW_STATUSES else "INVALID",
+        "as_of": as_of,
+        "decision_boundary": decision_boundary,
+        "evidence_as_of": evidence_as_of,
+        "identity": result_identity,
+        "source_versions": source_versions,
+        "provenance": provenance,
+        "zones": _safe_copy(zones) if zones_present else None,
+        "lower_tf": lower_tf,
+        "diagnostics": {
+            "reason_code": reason,
+            "errors": sorted(set(errors)),
+            "source_errors": sorted(set(source_errors)),
+            "source": source_diagnostics,
+        },
+        "observe_only": True,
+        "affected_eligibility": False,
+    }
+    result.update(
+        {
+            field: _safe_copy(result_identity.get(field))
+            for field in _STRUCTURE_VIEW_IDENTITY_FIELDS
+        }
+    )
+    return result
+
+
 def _identity_key(identity: Mapping[str, Any]) -> tuple[str, ...]:
-    """Use semantic tuple fields only; no second identity hash is created."""
+    """Return the complete #625 semantic identity tuple.
+
+    Generation remains an explicit tuple member so the existing generation
+    fence can scope newer/older callbacks.  Profile/model/phase are also
+    members: changing any of them is a distinct BREACH identity, not a local
+    duplicate.
+    """
     def part(key: str, *, upper: bool = False) -> str:
         value = identity.get(key)
+        if key == "profile_version" and value in (None, ""):
+            value = _DEFAULT_PROFILE_VERSION
+        if key == "phase" and value in (None, ""):
+            value = BREACH_PHASE
         if isinstance(value, datetime):
             parsed = _parse_aware(value)
             value = parsed.isoformat() if parsed is not None else value.isoformat()
@@ -667,23 +1587,23 @@ def _identity_key(identity: Mapping[str, Any]) -> tuple[str, ...]:
                 value = parsed.isoformat()
         return value.upper() if upper else value
 
-    return (
-        part("client_id"),
-        part("execution_mode", upper=True),
-        part("signal_id"),
-        part("canonical_signal_id"),
-        part("local_order_id"),
-        part("ticker", upper=True),
-        part("side", upper=True),
-        part("trigger_crossed_at"),
-        str(identity.get("materialization_generation") or ""),
+    return tuple(
+        part(key, upper=key in {"execution_mode", "ticker", "side", "phase"})
+        if key != "materialization_generation"
+        else str(identity.get(key) or "")
+        for key in _IDENTITY_KEY_FIELDS
     )
+
+
+def _identity_scope_key(key: tuple[str, ...]) -> tuple[str, ...]:
+    """Remove only generation from the canonical tuple for generation fencing."""
+    return key[:_GENERATION_KEY_INDEX] + key[_GENERATION_KEY_INDEX + 1 :]
 
 
 def _reserve_identity(identity: Mapping[str, Any]) -> tuple[bool, str | None, tuple[str, ...]]:
     key = _identity_key(identity)
     generation = identity.get("materialization_generation")
-    scope_key = key[:-1]
+    scope_key = _identity_scope_key(key)
     with _SEEN_LOCK:
         previous_generation = _LATEST_GENERATIONS.get(scope_key)
         if generation is None and previous_generation is not None:
@@ -741,7 +1661,7 @@ def reset_breach_bridge_state_for_tests() -> None:
 
 def _generation_is_current(identity: Mapping[str, Any]) -> tuple[bool, str | None]:
     key = _identity_key(identity)
-    scope_key = key[:-1]
+    scope_key = _identity_scope_key(key)
     generation = identity.get("materialization_generation")
     with _SEEN_LOCK:
         latest = _LATEST_GENERATIONS.get(scope_key)
@@ -1062,6 +1982,7 @@ __all__ = [
     "BRIDGE_VERSION",
     "MAX_SEEN_IDENTITIES",
     "freeze_breach_runtime_artifact",
+    "resolve_breach_structure_view",
     "reset_breach_bridge_state_for_tests",
     "submit_breach_intelligence_nonblocking",
 ]

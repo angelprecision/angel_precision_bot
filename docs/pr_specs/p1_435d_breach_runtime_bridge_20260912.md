@@ -79,6 +79,29 @@ bridge diagnostic-only and do not hand off an identity-less sideband artifact.
 
 A cache miss must never become a selector delay.
 
+## Normalized structure consumer (read-side)
+
+The bridge also exposes the pure, provider-neutral
+`resolve_breach_structure_view(frozen_context, expected_identity=...)` helper.
+It accepts only an already-produced/frozen mapping and returns a defensive,
+read-only view containing `status`, the exact normalized `as_of` and
+`decision_boundary`, the complete identity, source versions, grouped
+provenance, normalized zones, lower-timeframe acceptance/rejection/reclaim and
+penetration facts, and diagnostics. It performs no provider/history/network
+read, database wait, persistence, selector call, or eligibility evaluation.
+
+The status taxonomy is deliberately explicit:
+
+- `AUTHORITATIVE`, including `zones=[]` when an authoritative source proves no
+  relevant zone exists;
+- `STALE` for stale snapshots or stale generations;
+- `UNKNOWN` for unavailable or unproven evidence; and
+- `INVALID` for malformed or contradictory frozen input.
+
+The helper never fabricates zones or infers volume imbalance. Restarted,
+uninterrupted, and materialized/deferred paths are required to produce the
+same view from the same frozen context.
+
 ## Authority
 - observe_only=true
 - affected_eligibility=false
@@ -104,6 +127,13 @@ Late results may enrich telemetry only for the same proven generation and may ne
 - accepted handoff -> #615/#625/#621 failure releases the retry reservation,
   while durable success/duplicate retains it;
 - restart/uninterrupted identity parity;
+- normalized structure-view parity across uninterrupted, restart, and
+  materialized/deferred inputs;
+- duplicate identity includes the complete #625 semantic tuple, including
+  profile/model/phase, while generation fencing remains isolated;
+- the real deferred `_on_entry_trigger()` calls the existing selector exactly
+  once for ACCEPTED, bridge-exception, SATURATED/REJECTED, and
+  missing/invalid-intelligence bridge outcomes;
 - LIVE/PAPER isolation;
 - zero duplicate submit/cancel behavior.
 
