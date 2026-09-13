@@ -714,6 +714,24 @@ def _release_identity(key: tuple[str, ...]) -> None:
         _SEEN_IDENTITIES.pop(key, None)
 
 
+def _release_artifact_identity(artifact: Mapping[str, Any]) -> None:
+    """Release an accepted reservation when its worker cannot persist it.
+
+    The reservation is process-local deduplication only.  It becomes durable
+    only when #621 accepts the assembled envelope (including a durable
+    duplicate).  Any earlier background failure must therefore leave the same
+    callback identity eligible for a later retry.
+    """
+    try:
+        identity = artifact.get("identity")
+        if isinstance(identity, Mapping):
+            _release_identity(_identity_key(identity))
+    except Exception:
+        # A malformed direct worker invocation must remain fail-soft and must
+        # never turn an intelligence cleanup attempt into callback work.
+        pass
+
+
 def reset_breach_bridge_state_for_tests() -> None:
     """Clear the bounded process-local duplicate guard for isolated tests."""
     with _SEEN_LOCK:
@@ -757,6 +775,8 @@ def _assemble_and_enqueue(artifact: Mapping[str, Any]) -> dict[str, Any]:
             "background_ms": duration_ms,
             **fields,
         }
+        if not ok:
+            _release_artifact_identity(artifact)
         # Keep the asynchronous outcome observable without logging the frozen
         # market-data payload.  These are identity/timing/status fields only.
         log.info(
@@ -869,7 +889,16 @@ def _assemble_and_enqueue(artifact: Mapping[str, Any]) -> dict[str, Any]:
         enqueue_started = time.perf_counter()
         enqueue_result = enqueue_breach_snapshot_job(envelope)
         enqueue_ms = round((time.perf_counter() - enqueue_started) * 1000.0, 3)
-        ok = bool(enqueue_result.get("ok"))
+        # #621's durable success contract is either an inserted job or an
+        # idempotent durable duplicate.  An ambiguous truthy response must not
+        # retain the process-local reservation and poison a later retry.
+        ok = bool(
+            enqueue_result.get("ok")
+            and (
+                enqueue_result.get("enqueued")
+                or enqueue_result.get("duplicate")
+            )
+        )
         return _background_result(
             ok,
             "ENQUEUED" if ok else "ENQUEUE_FAILED",

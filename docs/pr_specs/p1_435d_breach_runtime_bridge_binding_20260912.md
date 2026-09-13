@@ -23,6 +23,36 @@ engine. The bridge does not call `contract_selector.select()`.
 attached #614 evidence, then hands it to the bounded sideband worker. The
 worker calls #615, #625, and #621; #327 remains the durable persistence owner.
 
+## Current-main source and ordering audit
+
+The confirmed production PIT source is **NOT PRESENT at this runtime seam**.
+The exact current-main evidence path is:
+
+`ap.queue._dispatch()` -> `enqueue_pretrigger_context_best_effort()` ->
+`submit_intelligence_enqueue()` -> later
+`process_due_intelligence_jobs_once()` -> `build_snapshot_kwargs()` ->
+`build_intelligence_context_payload()` ->
+`collect_point_in_time_context()`.
+
+The collector is therefore a background materializer source, not a producer
+that writes an exact #614 envelope onto `WatchedSignal`, `approved_plan`, or
+`sig` before `_on_entry_trigger()`. In the separate runtime path,
+`entry_watcher.watch()` builds the watcher signal with identity, trigger, plan
+metadata, and durable `trigger_crossed_at`. Although caller-provided mappings
+can travel inside plan metadata, this path has no code that calls #614 or
+creates/attaches an authoritative PIT envelope. `WatchedSignal` stores that
+payload and parses the timestamp, and `APExecutionCore._on_entry_trigger()`
+receives it unchanged for the #622 projection. #622 consequently preserves
+missing evidence as explicit UNKNOWN/MISSING and performs no lookup to
+manufacture it.
+
+The seam is intentionally before hydration and before the existing selector
+continuation. `_refresh_hydrated_prebreach_plan()` currently mutates only
+contract/price/quantity/reserved-cost fields and contract-selection metadata;
+the focused test proves it leaves #622/#625 identity and evidence fields
+unchanged. If that owner later mutates a bridge identity/evidence field, the
+seam must move after hydration.
+
 ## Critical latency invariant
 
 The callback path must remain:
@@ -125,17 +155,21 @@ At minimum:
 4. malformed evidence -> fail-soft + selector path continues;
 5. #615 exception -> fail-soft + selector path continues;
 6. snapshot persistence/enqueue exception -> fail-soft + selector path continues;
-7. late result after broker-ready/submit cannot cancel or rewrite decision;
-8. stale generation cannot attach evidence;
-9. wrong client cannot attach evidence;
-10. wrong mode cannot attach evidence;
-11. same ticker concurrent clients stay isolated;
-12. same ticker opposite sides stay isolated;
-13. exactly one existing selector invocation remains reachable for the valid path;
-14. no additional network/history call occurs in synchronous bridge;
-15. no watcher/OSM/broker/order/position/proof/queue mutation from intelligence path;
-16. restart/recovered breach uses the same durable identity/frozen evidence contract where existing runtime permits replay;
-17. PAPER/LIVE share intelligence taxonomy but never execution identity.
+7. an accepted worker failure releases the exact identity for retry, including
+   #615 and #625 exceptions; durable #621 success/duplicate retains it;
+8. late result after broker-ready/submit cannot cancel or rewrite decision;
+9. stale generation cannot attach evidence;
+10. wrong client cannot attach evidence;
+11. wrong mode cannot attach evidence;
+12. same ticker concurrent clients stay isolated;
+13. same ticker opposite sides stay isolated;
+14. exactly one existing selector invocation remains reachable for the valid path;
+15. no additional network/history call occurs in synchronous bridge;
+16. no watcher/OSM/broker/order/position/proof/queue mutation from intelligence path;
+17. restart/recovered breach uses the same durable identity/frozen evidence contract where existing runtime permits replay;
+18. PAPER/LIVE share intelligence taxonomy but never execution identity;
+19. the real `_on_entry_trigger()` continuation submits unchanged when the
+    bridge throws, rejects/saturates, or reports missing/invalid evidence.
 
 ## Explicit non-scope
 

@@ -23,6 +23,7 @@ if _original_database_url is None:
 if _original_schema_attestation is None:
     os.environ["SCHEMA_ATTESTATION_ENABLED"] = "0"
 try:
+    import ap_execution_core as execution_core_mod  # noqa: E402
     import ap.intelligence_breach_market_structure as structure_mod  # noqa: E402
     import ap.intelligence_breach_snapshot_adapter as adapter_mod  # noqa: E402
     import ap.intelligence_breach_snapshot_assembly as assembly_mod  # noqa: E402
@@ -199,6 +200,122 @@ def test_missing_generation_is_not_handed_off():
 
     assert artifact["ok"] is False
     assert "materialization_generation_missing" in artifact["fallback_reason"]
+
+
+def test_prebreach_hydration_does_not_change_bridge_identity_or_evidence_fields():
+    contract = "SPY260117C00500000"
+    plan = SimpleNamespace(
+        contract_symbol="DEFERRED:SPY",
+        limit_price=0.0,
+        contracts=0,
+        max_position_usd=0.0,
+        client_id=CLIENT,
+        execution_mode="PAPER",
+        signal_id=SIGNAL_ID,
+        canonical_signal_id="CANONICAL:sig-622",
+        materialization_generation=7,
+        metadata={
+            "contract_deferred": True,
+            "client_id": CLIENT,
+            "execution_mode": "PAPER",
+            "signal_id": SIGNAL_ID,
+            "canonical_signal_id": "CANONICAL:sig-622",
+            "local_order_id": LOCAL_ORDER_ID,
+            "materialization_generation": 7,
+            "trigger_crossed_at": TRIGGER,
+            "point_in_time": _pit(),
+            "evidence": {"source": "test.614"},
+            "parent_snapshots": {"parent": "snapshot-1"},
+        },
+    )
+    signal = _signal()
+    signal.update(
+        {
+            "canonical_signal_id": "CANONICAL:sig-622",
+            "evidence": {"source": "test.614"},
+            "parent_snapshots": {"parent": "snapshot-1"},
+        }
+    )
+    order = {
+        "contract": contract,
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "limit_price": 1.25,
+        "qty": 2,
+        "reserved_cost": 250.0,
+    }
+    core = execution_core_mod.APExecutionCore.__new__(
+        execution_core_mod.APExecutionCore
+    )
+    core.order_state_machine = SimpleNamespace(get_order=lambda _local_id: order)
+
+    signal_identity_evidence_before = {
+        key: copy.deepcopy(signal.get(key))
+        for key in (
+            "client_id",
+            "execution_mode",
+            "signal_id",
+            "canonical_signal_id",
+            "local_order_id",
+            "ticker",
+            "side",
+            "trigger_crossed_at",
+            "materialization_generation",
+            "point_in_time",
+            "evidence",
+            "parent_snapshots",
+        )
+    }
+    plan_identity_evidence_before = {
+        key: copy.deepcopy(getattr(plan, key, None))
+        for key in (
+            "client_id",
+            "execution_mode",
+            "signal_id",
+            "canonical_signal_id",
+            "materialization_generation",
+        )
+    }
+    metadata_identity_evidence_before = {
+        key: copy.deepcopy(plan.metadata.get(key))
+        for key in (
+            "client_id",
+            "execution_mode",
+            "signal_id",
+            "canonical_signal_id",
+            "local_order_id",
+            "materialization_generation",
+            "trigger_crossed_at",
+            "point_in_time",
+            "evidence",
+            "parent_snapshots",
+        )
+    }
+
+    assert execution_core_mod.APExecutionCore._refresh_hydrated_prebreach_plan(
+        core,
+        approved_plan=plan,
+        sig=signal,
+        local_order_id=LOCAL_ORDER_ID,
+        ticker="SPY",
+    ) is True
+
+    assert plan.contract_symbol == contract
+    assert plan.limit_price == 1.25
+    assert plan.contracts == 2
+    assert plan.max_position_usd == 250.0
+    assert {
+        key: signal.get(key)
+        for key in signal_identity_evidence_before
+    } == signal_identity_evidence_before
+    assert {
+        key: getattr(plan, key, None)
+        for key in plan_identity_evidence_before
+    } == plan_identity_evidence_before
+    assert {
+        key: plan.metadata.get(key)
+        for key in metadata_identity_evidence_before
+    } == metadata_identity_evidence_before
 
 
 def test_stale_evidence_becomes_non_authoritative_partial_diagnostic():
@@ -412,6 +529,143 @@ def test_background_615_exception_is_fail_soft(monkeypatch):
     assert result["ok"] is False
     assert result["status"] == "BACKGROUND_FAILED"
     assert "PIT freezer unavailable" in result["fallback_reason"]
+
+
+def test_background_enqueue_failure_releases_reservation_until_durable_success(
+    monkeypatch,
+):
+    captured: list[tuple] = []
+    enqueue_results = iter(
+        (
+            {
+                "ok": False,
+                "enqueued": False,
+                "error_code": "BREACH_ENQUEUE_REJECTED",
+            },
+            {"ok": True, "enqueued": True, "job_id": "job-622-retry"},
+        )
+    )
+    structure = {
+        "schema_version": "breach_market_structure_v1",
+        "observe_only": True,
+        "affected_eligibility": False,
+    }
+
+    def fake_handoff(fn, artifact, **_kwargs):
+        captured.append((fn, artifact))
+        return {"ok": True, "accepted": True}
+
+    monkeypatch.setattr(bridge, "submit_intelligence_enqueue", fake_handoff)
+    monkeypatch.setattr(
+        structure_mod,
+        "freeze_breach_market_structure_from_pit",
+        lambda *_args: structure,
+    )
+    monkeypatch.setattr(
+        assembly_mod,
+        "build_breach_snapshot_envelope",
+        lambda *_args, **_kwargs: {"ok": True, "status": "PARTIAL"},
+    )
+    monkeypatch.setattr(
+        adapter_mod,
+        "enqueue_breach_snapshot_job",
+        lambda *_args: next(enqueue_results),
+    )
+
+    signal = _signal()
+    first = bridge.submit_breach_intelligence_nonblocking(
+        signal, _plan(), _watched(signal)
+    )
+    assert first["accepted"] is True
+    failed = captured[0][0](captured[0][1])
+    assert failed["status"] == "ENQUEUE_FAILED"
+
+    second = bridge.submit_breach_intelligence_nonblocking(
+        signal, _plan(), _watched(signal)
+    )
+    assert second["accepted"] is True
+    assert len(captured) == 2
+
+    succeeded = captured[1][0](captured[1][1])
+    assert succeeded["status"] == "ENQUEUED"
+    third = bridge.submit_breach_intelligence_nonblocking(
+        signal, _plan(), _watched(signal)
+    )
+    assert third["accepted"] is False
+    assert third["duplicate"] is True
+    assert third["handoff_status"] == "DUPLICATE"
+
+
+@pytest.mark.parametrize("failure_stage", ["615", "625", "621", "327"])
+def test_background_owner_exceptions_release_reservation_for_retry(
+    monkeypatch, failure_stage
+):
+    captured: list[tuple] = []
+    structure = {
+        "schema_version": "breach_market_structure_v1",
+        "observe_only": True,
+        "affected_eligibility": False,
+    }
+
+    def fake_handoff(fn, artifact, **_kwargs):
+        captured.append((fn, artifact))
+        return {"ok": True, "accepted": True}
+
+    monkeypatch.setattr(bridge, "submit_intelligence_enqueue", fake_handoff)
+    if failure_stage == "615":
+        monkeypatch.setattr(
+            structure_mod,
+            "freeze_breach_market_structure_from_pit",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("#615 freezer unavailable")
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            structure_mod,
+            "freeze_breach_market_structure_from_pit",
+            lambda *_args: structure,
+        )
+        if failure_stage == "625":
+            monkeypatch.setattr(
+                assembly_mod,
+                "build_breach_snapshot_envelope",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    RuntimeError("#625 assembly unavailable")
+                ),
+            )
+        elif failure_stage == "621":
+            monkeypatch.setattr(
+                adapter_mod,
+                "enqueue_breach_snapshot_job",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    RuntimeError("#621 adapter unavailable")
+                ),
+            )
+        else:
+            monkeypatch.setattr(
+                adapter_mod,
+                "enqueue_intelligence_job",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    RuntimeError("#327 store unavailable")
+                ),
+            )
+
+    signal = _signal()
+    first = bridge.submit_breach_intelligence_nonblocking(
+        signal, _plan(), _watched(signal)
+    )
+    assert first["accepted"] is True
+    failed = captured[0][0](captured[0][1])
+    assert failed["status"] == (
+        "ENQUEUE_FAILED" if failure_stage == "327" else "BACKGROUND_FAILED"
+    )
+
+    second = bridge.submit_breach_intelligence_nonblocking(
+        signal, _plan(), _watched(signal)
+    )
+    assert second["accepted"] is True
+    assert len(captured) == 2
 
 
 @pytest.mark.parametrize("failure_stage", ["assembly", "enqueue", "store"])

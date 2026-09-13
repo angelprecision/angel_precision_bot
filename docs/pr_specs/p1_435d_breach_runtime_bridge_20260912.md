@@ -19,6 +19,54 @@ The sideband worker consumes the frozen artifact through the existing owners:
 The established execution callback remains the primary path. The bridge never
 calls the selector and never waits for the sideband result.
 
+## Confirmed current-main PIT producer audit
+
+The exact #614 PIT producer is **NOT PRESENT at the confirmed-BREACH runtime
+seam** on this current main. The verified production path is:
+
+`ap.queue._dispatch()` -> `enqueue_pretrigger_context_best_effort()` ->
+`ap.intelligence_context_handoff.submit_intelligence_enqueue()` -> later
+`process_due_intelligence_jobs_once()` -> `build_snapshot_kwargs()` ->
+`build_intelligence_context_payload()` ->
+`collect_point_in_time_context()`.
+
+The collector is the production #614 implementation, but it is called by the
+background materializer (`ap/intelligence_context_materializer.py`,
+`build_intelligence_context_payload`, currently line 91), not by the watcher
+or the execution callback. The pretrigger job carries a copied signal and is
+not proven to be attached back to the callback payload before the trigger.
+
+The runtime continuation is separately:
+
+`ap.queue._dispatch()` -> `entry_watcher.watch()` ->
+`WatchedSignal(signal)` -> `APExecutionCore._on_entry_trigger()`.
+
+`watch()` currently copies identity, trigger, and plan metadata (which may
+carry caller-provided mappings) into `signal_dict`, along with the durable
+first-breach timestamp. It has no code that calls #614 or creates/attaches an
+authoritative PIT envelope. `WatchedSignal` retains that signal and parses the
+trigger timestamp, but does not call the #614 collector. Therefore #622 must
+not claim an authoritative production PIT writer before its seam. If the
+watcher/plan does not already contain exact evidence, the bridge emits an
+explicit `MISSING`/non-authoritative diagnostic and continues; it adds no
+synchronous lookup or network/history work. A future wiring PR must establish
+the producer-to-watcher attachment and prove the caller path before changing
+this conclusion.
+
+## Hydration ordering proof
+
+The bridge remains before `_refresh_hydrated_prebreach_plan()` and before the
+existing selector continuation. That ordering is safe for the current
+implementation because hydration changes only the executable contract fields
+(`contract_symbol`, `limit_price`, `contracts`, `max_position_usd`, reserved
+cost, and contract-selection metadata) and the corresponding contract fields
+on `sig`. It does not change client, mode, signal/canonical identity, local
+order, materialization generation, trigger timestamp, or PIT/evidence/parent
+fields. The focused hydration test snapshots those identity/evidence fields
+before and after the real helper. If hydration later expands into any #622 or
+#625 identity/evidence field, the bridge must move after hydration without
+adding a wait.
+
 ## Critical latency invariant
 The bridge may not synchronously fetch market history or wait on Tradier, option chain, external APIs, futures, sleeps, joins, or background results before selector execution.
 
@@ -53,6 +101,8 @@ Late results may enrich telemetry only for the same proven generation and may ne
 - provider/network functions are asserted not called synchronously by the bridge;
 - snapshot write failure -> trade path unchanged;
 - stale generation -> zero enrichment mutation and zero money-path change;
+- accepted handoff -> #615/#625/#621 failure releases the retry reservation,
+  while durable success/duplicate retains it;
 - restart/uninterrupted identity parity;
 - LIVE/PAPER isolation;
 - zero duplicate submit/cancel behavior.
