@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import math
 import sys
+import threading
 import types
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import ap_execution_core as core_mod
 import ap_entry_confirmation as entry_confirmation_mod
+import ap.intelligence_breach_runtime_bridge as breach_bridge_mod
 from ap_entry_watcher import APEntryWatcher, WatchedSignal
 
 
@@ -73,6 +76,8 @@ def _run_entry_trigger(
     plan_metadata=None,
     plan_side: str = "CALL",
     invoke_direct_trigger: bool = True,
+    bridge_signal_fields=None,
+    contract_selector=None,
 ):
     monkeypatch.delenv("ENABLE_DAILY_CONTINUATION_VALIDATION", raising=False)
     monkeypatch.setenv("ENABLE_DAILY_CONTINUATION_MODE", mode)
@@ -221,7 +226,7 @@ def _run_entry_trigger(
     )
     core.store = MagicMock()
     core.order_state_machine = osm
-    core.contract_selector = None
+    core.contract_selector = contract_selector
     core._breach_risk_check = MagicMock(return_value=True)
     core._recover_plan_for_revalidation = MagicMock(return_value=plan)
     core._refresh_hydrated_prebreach_plan = MagicMock(return_value=False)
@@ -231,23 +236,23 @@ def _run_entry_trigger(
         core,
     )
 
-    watched = WatchedSignal(
-        {
-            "ticker": "AAPL",
-            "side": plan_side,
-            "entry_price": 100.0,
-            "stop_price": 95.0 if plan_side == "CALL" else 105.0,
-            "target_price": 110.0 if plan_side == "CALL" else 90.0,
-            "signal_id": "sig-1",
-            "canonical_signal_id": "sig-1",
-            "local_order_id": "local-1",
-            "client_id": "client@example.com",
-            "execution_mode": execution_mode,
-            "timeframe": "1d",
-            "score": 78,
-        },
-        overnight=False,
-    )
+    watched_signal = {
+        "ticker": "AAPL",
+        "side": plan_side,
+        "entry_price": 100.0,
+        "stop_price": 95.0 if plan_side == "CALL" else 105.0,
+        "target_price": 110.0 if plan_side == "CALL" else 90.0,
+        "signal_id": "sig-1",
+        "canonical_signal_id": "sig-1",
+        "local_order_id": "local-1",
+        "client_id": "client@example.com",
+        "execution_mode": execution_mode,
+        "timeframe": "1d",
+        "score": 78,
+    }
+    if bridge_signal_fields:
+        watched_signal.update(bridge_signal_fields)
+    watched = WatchedSignal(watched_signal, overnight=False)
     watched.trigger_price = 100.0
     watched.last_quote_bid = underlying_last
     watched.last_quote_ask = underlying_last
@@ -616,3 +621,264 @@ def test_production_shaped_watcher_quote_age_reaches_submit_without_manual_seed(
     assert meta["quote_age_seconds"] == 1.0
     assert meta["underlying_quote_age_seconds"] == 1.0
     assert result["watcher"]._pending == []
+
+
+def test_real_entry_trigger_bridge_exception_preserves_existing_submission(monkeypatch):
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("bridge unavailable")
+
+    monkeypatch.setattr(
+        breach_bridge_mod,
+        "submit_breach_intelligence_nonblocking",
+        explode,
+    )
+    result = _run_entry_trigger(monkeypatch, mode="off")
+
+    result["osm"].submit_existing_entry.assert_called_once()
+    result["osm"].expire_pending_entry.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "bridge_result",
+    [
+        {
+            "ok": True,
+            "accepted": False,
+            "handoff_status": "SATURATED_OR_REJECTED",
+            "fallback_reason": "handoff_capacity_exhausted",
+        },
+        {
+            "ok": True,
+            "accepted": False,
+            "handoff_status": "INVALID_ARTIFACT",
+            "fallback_reason": "BREACH_INTEL_EVIDENCE_MISSING",
+        },
+    ],
+    ids=["saturated-or-rejected", "invalid-artifact"],
+)
+def test_real_entry_trigger_bridge_nonacceptance_preserves_existing_submission(
+    monkeypatch, bridge_result
+):
+    monkeypatch.setattr(
+        breach_bridge_mod,
+        "submit_breach_intelligence_nonblocking",
+        lambda *_args, **_kwargs: dict(bridge_result),
+    )
+    result = _run_entry_trigger(monkeypatch, mode="off")
+
+    result["osm"].submit_existing_entry.assert_called_once()
+    result["osm"].expire_pending_entry.assert_not_called()
+
+
+def test_real_entry_trigger_missing_intelligence_is_diagnostic_only(monkeypatch):
+    bridge_result = {}
+    real_bridge_submit = breach_bridge_mod.submit_breach_intelligence_nonblocking
+
+    def capture_bridge_result(*args, **kwargs):
+        result = real_bridge_submit(*args, **kwargs)
+        bridge_result.update(result)
+        return result
+
+    monkeypatch.setattr(
+        breach_bridge_mod,
+        "submit_breach_intelligence_nonblocking",
+        capture_bridge_result,
+    )
+    result = _run_entry_trigger(monkeypatch, mode="off")
+
+    assert bridge_result["handoff_status"] == "INVALID_ARTIFACT"
+    assert "materialization_generation_missing" in bridge_result["fallback_reason"]
+    result["osm"].submit_existing_entry.assert_called_once()
+    result["osm"].expire_pending_entry.assert_not_called()
+
+
+def test_real_entry_trigger_blocked_background_does_not_delay_existing_continuation(
+    monkeypatch,
+):
+    background_started = threading.Event()
+    release_background = threading.Event()
+    background_finished = threading.Event()
+    workers: list[threading.Thread] = []
+
+    def fake_handoff(_fn, _artifact, **_kwargs):
+        def worker():
+            background_started.set()
+            release_background.wait(5.0)
+            background_finished.set()
+
+        thread = threading.Thread(target=worker, daemon=True)
+        workers.append(thread)
+        thread.start()
+        assert background_started.wait(1.0)
+        return {"ok": True, "accepted": True}
+
+    monkeypatch.setattr(
+        breach_bridge_mod,
+        "submit_intelligence_enqueue",
+        fake_handoff,
+    )
+    bridge_signal_fields = {
+        "materialization_generation": 1,
+        "trigger_crossed_at": "2026-09-12T16:00:00+00:00",
+        "point_in_time": {
+            "phase": "BREACH",
+            "as_of": "2026-09-12T16:00:00+00:00",
+            "data_sources": {"candles": {}, "coverage": {}},
+            "underlying_observation": None,
+            "provenance": {"source": "test.614"},
+        },
+    }
+    try:
+        result = _run_entry_trigger(
+            monkeypatch,
+            mode="off",
+            bridge_signal_fields=bridge_signal_fields,
+        )
+
+        assert background_started.is_set()
+        assert not background_finished.is_set()
+        result["osm"].submit_existing_entry.assert_called_once()
+        result["osm"].expire_pending_entry.assert_not_called()
+    finally:
+        release_background.set()
+        assert background_finished.wait(1.0)
+        for thread in workers:
+            thread.join(timeout=1.0)
+        breach_bridge_mod.reset_breach_bridge_state_for_tests()
+
+
+def test_real_entry_trigger_accepted_bridge_has_no_duplicate_selector_surface(
+    monkeypatch,
+):
+    selector = MagicMock()
+    monkeypatch.setattr(
+        breach_bridge_mod,
+        "submit_breach_intelligence_nonblocking",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "accepted": True,
+            "handoff_status": "ACCEPTED",
+        },
+    )
+    result = _run_entry_trigger(
+        monkeypatch,
+        mode="off",
+        contract_selector=selector,
+    )
+
+    result["osm"].submit_existing_entry.assert_called_once()
+    result["osm"].expire_pending_entry.assert_not_called()
+    selector.select.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "bridge_behavior",
+    [
+        (
+            "accepted",
+            lambda: {
+                "ok": True,
+                "accepted": True,
+                "handoff_status": "ACCEPTED",
+            },
+        ),
+        (
+            "bridge-exception",
+            lambda: (_ for _ in ()).throw(RuntimeError("bridge unavailable")),
+        ),
+        (
+            "saturated-or-rejected",
+            lambda: {
+                "ok": True,
+                "accepted": False,
+                "handoff_status": "SATURATED_OR_REJECTED",
+            },
+        ),
+        (
+            "missing-or-invalid-intelligence",
+            lambda: {
+                "ok": False,
+                "accepted": False,
+                "handoff_status": "INVALID_ARTIFACT",
+                "fallback_reason": "BREACH_INTEL_EVIDENCE_MISSING",
+            },
+        ),
+    ],
+    ids=lambda item: item[0] if isinstance(item, tuple) else str(item),
+)
+def test_real_deferred_entry_trigger_calls_selector_once_for_each_bridge_outcome(
+    monkeypatch, bridge_behavior
+):
+    """The observe-only bridge never suppresses the deferred selector path."""
+
+    _label, behavior = bridge_behavior
+
+    class _RecordingSelector:
+        def __init__(self):
+            self.calls = 0
+            self.last_plan = None
+            self.last_request_context = None
+
+        def select(self, plan, *, request_context=None):
+            self.calls += 1
+            self.last_plan = plan
+            self.last_request_context = request_context
+            return None
+
+    selector = _RecordingSelector()
+
+    def bridge_result(*_args, **_kwargs):
+        result = behavior()
+        if isinstance(result, dict):
+            return dict(result)
+        return result
+
+    monkeypatch.setattr(
+        breach_bridge_mod,
+        "submit_breach_intelligence_nonblocking",
+        bridge_result,
+    )
+    monkeypatch.setenv("SELECTOR_DURABLE_RECOVERY_CURSOR_ENABLED", "0")
+
+    result = _run_entry_trigger(
+        monkeypatch,
+        mode="off",
+        execution_mode="paper",
+        invoke_direct_trigger=False,
+        contract_selector=selector,
+    )
+    core = result["core"]
+    plan = result["core"]._recover_plan_for_revalidation.return_value
+    plan.contract_symbol = "DEFERRED:AAPL"
+    plan.metadata["contract_deferred"] = True
+    result["watched"].signal["contract_deferred"] = True
+    result["watched"].signal["contract_symbol"] = "DEFERRED:AAPL"
+    durable_row = result["osm"].get_order("local-1")
+    durable_row["contract"] = "DEFERRED:AAPL"
+
+    # This is the real callback entrypoint and the real selector attribute used
+    # by its deferred branch; no synthetic selector marker is consulted.
+    core._on_entry_trigger(result["watched"])
+
+    assert selector.calls == 1
+    assert selector.last_plan is plan
+    assert selector.last_request_context is not None
+
+
+@pytest.mark.parametrize("accepted", [True, False], ids=["accepted", "rejected"])
+def test_real_entry_trigger_bridge_result_cannot_change_disposition(
+    monkeypatch, accepted
+):
+    monkeypatch.setattr(
+        breach_bridge_mod,
+        "submit_breach_intelligence_nonblocking",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "accepted": accepted,
+            "handoff_status": "ACCEPTED" if accepted else "SATURATED_OR_REJECTED",
+        },
+    )
+    result = _run_entry_trigger(monkeypatch, mode="off")
+
+    result["osm"].submit_existing_entry.assert_called_once()
+    result["osm"].expire_pending_entry.assert_not_called()
