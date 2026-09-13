@@ -47,7 +47,20 @@ _IDENTITY_KEY_FIELDS = (
     "model_version",
     "phase",
 )
-_GENERATION_KEY_INDEX = _IDENTITY_KEY_FIELDS.index("materialization_generation")
+_GENERATION_SCOPE_FIELDS = (
+    "client_id",
+    "execution_mode",
+    "signal_id",
+    "canonical_signal_id",
+    "local_order_id",
+    "ticker",
+    "side",
+    "trigger_crossed_at",
+    "phase",
+)
+_GENERATION_SCOPE_INDICES = tuple(
+    _IDENTITY_KEY_FIELDS.index(field) for field in _GENERATION_SCOPE_FIELDS
+)
 
 _STRUCTURE_VIEW_STATUSES = frozenset(
     {"AUTHORITATIVE", "STALE", "UNKNOWN", "INVALID"}
@@ -1596,8 +1609,13 @@ def _identity_key(identity: Mapping[str, Any]) -> tuple[str, ...]:
 
 
 def _identity_scope_key(key: tuple[str, ...]) -> tuple[str, ...]:
-    """Remove only generation from the canonical tuple for generation fencing."""
-    return key[:_GENERATION_KEY_INDEX] + key[_GENERATION_KEY_INDEX + 1 :]
+    """Return the stable opportunity scope used only for generation fencing.
+
+    Unlike the complete #625 semantic identity, this lifecycle scope excludes
+    materialization generation and profile/model snapshots so every callback
+    for one opportunity shares the same latest-generation owner.
+    """
+    return tuple(key[index] for index in _GENERATION_SCOPE_INDICES)
 
 
 def _reserve_identity(identity: Mapping[str, Any]) -> tuple[bool, str | None, tuple[str, ...]]:

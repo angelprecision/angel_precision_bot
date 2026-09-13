@@ -538,6 +538,65 @@ def test_local_duplicate_key_contains_the_complete_625_identity_tuple(monkeypatc
     assert len(accepted) == 3
 
 
+def test_generation_scope_excludes_generation_and_snapshot_versions():
+    key = bridge._identity_key(
+        _view_identity(
+            materialization_generation=8,
+            profile_version="profile-b",
+            model_version="model-b",
+        )
+    )
+
+    assert len(key) == 12
+    assert bridge._identity_scope_key(key) == (
+        "client@example.com",
+        "PAPER",
+        "sig-622",
+        "CANONICAL:sig-622",
+        "order-622",
+        "SPY",
+        "CALL",
+        TRIGGER,
+        "BREACH",
+    )
+
+
+def test_same_generation_profile_and_model_snapshots_remain_distinct(monkeypatch):
+    accepted: list[dict] = []
+
+    def fake_handoff(_fn, artifact, **_kwargs):
+        accepted.append(artifact)
+        return {"ok": True, "accepted": True}
+
+    monkeypatch.setattr(bridge, "submit_intelligence_enqueue", fake_handoff)
+    results = []
+    for profile, model in (
+        ("profile-a", "model-a"),
+        ("profile-a", "model-b"),
+        ("profile-b", "model-a"),
+    ):
+        signal = _signal(
+            materialization_generation=8,
+            profile_version=profile,
+            model_version=model,
+        )
+        results.append(
+            bridge.submit_breach_intelligence_nonblocking(
+                signal,
+                _plan(materialization_generation=8),
+                _watched(signal),
+            )
+        )
+
+    assert all(result["accepted"] is True for result in results)
+    assert len(accepted) == 3
+    assert len({bridge._identity_key(item["identity"]) for item in accepted}) == 3
+    assert all(
+        bridge._generation_is_current(item["identity"]) == (True, None)
+        for item in accepted
+    )
+
+
 def test_handoff_returns_before_background_and_suppresses_repeated_callback(monkeypatch):
     captured: list[tuple] = []
     release = threading.Event()
@@ -645,17 +704,33 @@ def test_older_generation_is_rejected_after_newer_generation_is_seen(monkeypatch
     assert len(accepted) == 1
 
 
-def test_background_rechecks_generation_before_persistence(monkeypatch):
+@pytest.mark.parametrize(
+    ("new_profile_version", "new_model_version"),
+    [
+        ("profile-a", "model-b"),
+        ("profile-b", "model-a"),
+        ("profile-b", "model-b"),
+    ],
+    ids=["model-change", "profile-change", "profile-and-model-change"],
+)
+def test_background_rechecks_generation_before_persistence(
+    monkeypatch, new_profile_version, new_model_version
+):
     calls: list[str] = []
     structure = {"schema_version": "breach_market_structure_v1", "observe_only": True,
                  "affected_eligibility": False}
 
     def fake_freeze(signal, pit):
         calls.append("615")
+        new_signal = _signal(
+            materialization_generation=8,
+            profile_version=new_profile_version,
+            model_version=new_model_version,
+        )
         bridge.submit_breach_intelligence_nonblocking(
-            _signal(materialization_generation=8),
+            new_signal,
             _plan(materialization_generation=8),
-            _watched(_signal(materialization_generation=8)),
+            _watched(new_signal),
         )
         return structure
 
@@ -674,7 +749,11 @@ def test_background_rechecks_generation_before_persistence(monkeypatch):
         "ok": True, "accepted": True
     }, raising=False)
 
-    old_signal = _signal(materialization_generation=7)
+    old_signal = _signal(
+        materialization_generation=7,
+        profile_version="profile-a",
+        model_version="model-a",
+    )
     artifact = bridge.freeze_breach_runtime_artifact(
         old_signal, _plan(materialization_generation=7), _watched(old_signal)
     )
@@ -682,6 +761,77 @@ def test_background_rechecks_generation_before_persistence(monkeypatch):
 
     assert result["status"] == "STALE_GENERATION"
     assert calls == ["615"]
+
+
+def test_persisted_new_generation_fences_all_late_snapshot_variants(monkeypatch):
+    calls: list[str] = []
+    captured: list[dict] = []
+    structure = {
+        "schema_version": "breach_market_structure_v1",
+        "observe_only": True,
+        "affected_eligibility": False,
+    }
+
+    def fake_handoff(_fn, artifact, **_kwargs):
+        captured.append(artifact)
+        return {"ok": True, "accepted": True}
+
+    def fake_freeze(*_args, **_kwargs):
+        calls.append("615")
+        return structure
+
+    def fake_assemble(*_args, **_kwargs):
+        calls.append("625")
+        return {"ok": True, "status": "PARTIAL"}
+
+    def fake_enqueue(*_args, **_kwargs):
+        calls.append("621")
+        return {"ok": True, "enqueued": True, "job_id": "job-622"}
+
+    monkeypatch.setattr(bridge, "submit_intelligence_enqueue", fake_handoff)
+    monkeypatch.setattr(
+        structure_mod, "freeze_breach_market_structure_from_pit", fake_freeze
+    )
+    monkeypatch.setattr(assembly_mod, "build_breach_snapshot_envelope", fake_assemble)
+    monkeypatch.setattr(adapter_mod, "enqueue_breach_snapshot_job", fake_enqueue)
+
+    latest_signal = _signal(
+        materialization_generation=8,
+        profile_version="profile-b",
+        model_version="model-b",
+    )
+    latest_result = bridge.submit_breach_intelligence_nonblocking(
+        latest_signal,
+        _plan(materialization_generation=8),
+        _watched(latest_signal),
+    )
+    latest_persisted = bridge._assemble_and_enqueue(captured[0])
+
+    assert latest_result["accepted"] is True
+    assert latest_persisted["status"] == "ENQUEUED"
+    assert calls == ["615", "625", "621"]
+
+    for profile, model in (
+        ("profile-a", "model-a"),
+        ("profile-a", "model-b"),
+        ("profile-b", "model-a"),
+        ("profile-b", "model-b"),
+    ):
+        late_signal = _signal(
+            materialization_generation=7,
+            profile_version=profile,
+            model_version=model,
+        )
+        late_artifact = bridge.freeze_breach_runtime_artifact(
+            late_signal,
+            _plan(materialization_generation=7),
+            _watched(late_signal),
+        )
+        late_result = bridge._assemble_and_enqueue(late_artifact)
+        assert late_result["status"] == "STALE_GENERATION"
+        assert late_result["fallback_reason"] == "stale_generation"
+
+    assert calls == ["615", "625", "621"]
 
 
 def test_background_chain_calls_615_then_625_then_621(monkeypatch):
