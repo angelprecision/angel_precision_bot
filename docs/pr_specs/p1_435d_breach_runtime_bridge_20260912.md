@@ -1,19 +1,33 @@
 # P1 435-D — Observe-Only BREACH Runtime Bridge
 
 ## Status
-DRAFT / HARD HOLD / SPEC ONLY. Do not merge or deploy.
+DRAFT / HARD HOLD. Implementation is present for review only. Do not merge or deploy.
 
 ## Purpose
-Reuse the BREACH dispatch seam already merged in #330. Do not create a second execution path.
+Use the current-main confirmed-trigger seam in `APExecutionCore._on_entry_trigger()`.
+Do not create a second execution path or resurrect the historical #330 runtime
+implementation.
 
 Canonical path:
 
-`existing confirmed BREACH -> consume already-available #614 PIT/cached evidence -> run #615 freeze -> append/enrich existing BREACH snapshot`
+`existing confirmed BREACH -> freeze immutable identity/evidence -> bounded nonblocking sideband -> existing selector/submission path`
+
+The sideband worker consumes the frozen artifact through the existing owners:
+
+`#615 freeze -> #625 canonical identity/assembly -> #621 adapter -> #327 job/snapshot`
+
+The established execution callback remains the primary path. The bridge never
+calls the selector and never waits for the sideband result.
 
 ## Critical latency invariant
 The bridge may not synchronously fetch market history or wait on Tradier, option chain, external APIs, futures, sleeps, joins, or background results before selector execution.
 
-If the exact #614 evidence is not already available/cached/frozen inside the allowed budget, record `UNKNOWN/MISSING` and continue the existing trade path unchanged.
+If the exact #614 evidence is not already attached to the watcher/plan, record
+an explicit `UNKNOWN/MISSING` diagnostic artifact and continue the existing
+trade path unchanged. #615 runs only in the bounded background handoff.
+
+If the current positive materialization generation cannot be proven, keep the
+bridge diagnostic-only and do not hand off an identity-less sideband artifact.
 
 A cache miss must never become a selector delay.
 
@@ -44,4 +58,6 @@ Late results may enrich telemetry only for the same proven generation and may ne
 - zero duplicate submit/cancel behavior.
 
 ## Dependency
-Implement after #615 and 435-C are cleared.
+Depends on the current-main #615 freezer, #625 assembly owner, #621 durable
+adapter, and #327 job/snapshot substrate. The shared P0 inventory includes the
+focused #622 runtime-bridge tests in both exact-head and merge-ref runs.

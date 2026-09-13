@@ -2,40 +2,53 @@
 
 ## Status
 
-**DRAFT / HARD HOLD / SPEC ONLY. DO NOT MERGE OR DEPLOY.**
+**DRAFT / HARD HOLD. IMPLEMENTATION PRESENT FOR REVIEW ONLY. DO NOT MERGE OR DEPLOY.**
 
 Depends on:
 - final #615;
-- #621 durable snapshot adapter.
+- #625 canonical BREACH identity/assembly;
+- #621 durable snapshot adapter;
+- #327 durable job/snapshot substrate.
 
 ## Existing runtime seam to reuse
 
-Merged #330 already wired BREACH intelligence dispatch at the existing `_on_entry_trigger()` seam.
+Current main calls the bridge after BREACH risk revalidation and approved-plan
+recovery inside `_on_entry_trigger()`. The historical #330 implementation is
+not imported or resurrected.
 
-Do not create a second trigger callback, second watcher, second selector path, or second execution engine.
+Do not create a second trigger callback, watcher, selector path, or execution
+engine. The bridge does not call `contract_selector.select()`.
 
-#622 owns only the tiny bridge that enriches the already-existing BREACH snapshot with #614/#615 evidence.
+#622 owns only the tiny bridge that freezes the already-confirmed identity and
+attached #614 evidence, then hands it to the bounded sideband worker. The
+worker calls #615, #625, and #621; #327 remains the durable persistence owner.
 
 ## Critical latency invariant
 
-The hot path must remain:
+The callback path must remain:
 
-`confirmed breach -> already-available/cached/frozen evidence -> #615 freeze -> existing BREACH snapshot -> existing selector path`
+`confirmed breach -> immutable local artifact -> nonblocking handoff -> existing selector/submission path`
+
+The background sideband is:
+
+`frozen artifact -> #615 -> #625 -> #621 -> #327`
 
 It must never become:
 
 `confirmed breach -> provider/history fetch -> wait -> rebuild all timeframes -> #615 -> selector`
 
-No synchronous market-history transport may be introduced before selector execution.
+No synchronous market-history transport, #615 freeze, database enqueue, or
+snapshot write may be introduced before selector execution.
 
 No `Future.result()`, join, sleep, polling wait, or blocking worker handoff may be added.
 
 ## Evidence availability behavior
 
-When exact #614 evidence is already available/cached/frozen:
-- consume it;
-- run #615 freezer;
-- append/persist observe-only structure through #621/#330 snapshot authority.
+When exact #614 evidence is already attached to the confirmed watcher/plan:
+- freeze a deep-copied, bounded runtime artifact;
+- hand it off without waiting;
+- run #615 in the worker;
+- assemble through #625 and enqueue through #621 into #327.
 
 When evidence is missing, stale, unavailable, cache-missed, malformed, or late:
 - record honest UNKNOWN/MISSING/non-authoritative state;
@@ -84,6 +97,9 @@ Stale generation or identity mismatch:
 - may prevent intelligence enrichment;
 - must not mutate the current trade lifecycle;
 - must not attach evidence to another opportunity.
+
+An absent or invalid current materialization generation is treated as an
+unproven sideband identity and is not handed off.
 
 ## Performance budget
 
@@ -150,3 +166,14 @@ After implementation require:
 - final proof that no synchronous network/history read was introduced.
 
 No merge until independent audit clears exact final SHA.
+
+## Implementation surface
+
+- `ap/intelligence_breach_runtime_bridge.py` — immutable artifact, bounded
+  duplicate guard, nonblocking handoff, and background #615/#625/#621 chain;
+- `ap_execution_core.py` — one diagnostic-only call at the existing confirmed
+  BREACH seam;
+- `tests/test_p1_435d_breach_runtime_bridge.py` — identity, timing,
+  evidence-fallback, failure, isolation, and authority tests;
+- `.github/workflows/p0_regression.yml` — focused test enrolled in both
+  exact-head and merge-ref inventories.

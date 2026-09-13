@@ -5256,6 +5256,43 @@ class APExecutionCore:
             _terminalize_breach_failure("approved_plan_missing_after_revalidation")
             return
 
+        # ── PR #622: observe-only BREACH sideband ───────────────────────────
+        # Freeze only selected identity/evidence fields on this thread, then
+        # hand the immutable artifact to the bounded intelligence executor.
+        # The result is diagnostic only: it cannot change this callback's
+        # disposition, and the existing selector/submission path continues.
+        try:
+            from ap.intelligence_breach_runtime_bridge import (
+                submit_breach_intelligence_nonblocking as _submit_breach_intel,
+            )
+            _bridge_result = _submit_breach_intel(
+                sig,
+                approved_plan,
+                watched,
+                client_id=_breach_client_id,
+                execution_mode=(
+                    getattr(approved_plan, "execution_mode", None)
+                    or getattr(approved_plan, "mode", None)
+                    or sig.get("execution_mode")
+                    or sig.get("mode")
+                    or getattr(self, "execution_mode", None)
+                    or getattr(self, "mode", None)
+                ),
+                local_order_id=queue_local_order_id,
+                materialization_generation=_mat_generation,
+            )
+            if _bridge_result.get("handoff_status") not in {"ACCEPTED", "DUPLICATE"}:
+                log.debug(
+                    "[%s] BREACH intelligence sideband status=%s reason=%s",
+                    ticker,
+                    _bridge_result.get("handoff_status"),
+                    _bridge_result.get("fallback_reason"),
+                )
+        except Exception as _bridge_exc:
+            # Intelligence is never a trading authority or a callback gate.
+            log.debug("[%s] BREACH intelligence sideband non-critical: %s", ticker, _bridge_exc)
+        # ── End PR #622 observe-only BREACH sideband ─────────────────────────
+
         # ── Intelligence PR 1: dispatch immediately after plan is confirmed ──────
         # Fires before any post-plan terminal return (rejections, expiry, submit).
         # _ensure_intelligence_dispatched is idempotent — retries do not re-dispatch.
